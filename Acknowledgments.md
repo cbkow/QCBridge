@@ -27,6 +27,3 @@ lessons from projects that walked this ground first:
 - **[Blender](https://www.blender.org)** — whose Python API, extensions
   platform, and native `.blend` serializer are the ground this stands on.
 
-The full design history, decision log, and research notes live in the
-incubation repo:
-[QCview-BlenderAddon](https://github.com/cbkow/QCview-BlenderAddon).
