@@ -2,8 +2,6 @@
 
 A remote beauty window for Blender compatible with Windows and macOS. You work in Blender on your own machine; a second machine with a bigger GPU mirrors your scene and runs the full Cycles/Eevee preview. 
 
->  My MacBook is a great Blender box with lousy rendering compared to PC render nodes with better GPU hardware. This was a workaround developed for a project where I needed a little more for live previews than my Mac hardware was capable of.
-
 It's one extension with two roles. Install it on both machines, set one to **Host** and one to **Replica**, connect over your LAN or VPN, and start a session on each end. From there it's hands-off: the replica loads whatever file the host has open, follows your camera, timeline, and edits — lighting, materials, node tweaks arrive in under a second; modeling changes in a couple — and reloads nothing along the way. Sync is strictly one-way; the replica never writes anything back, and never touches your project files.
 
 Viewing works two ways. The built-in stream sends the replica's viewport over SRT (HEVC 10-bit at a fixed bitrate) into [QCView](https://github.com/cbkow/QCView-Player) — one click on the host's **Open in QCView** button and the live render appears as a media item, ready for A/B comparison against approved renders. Or skip streaming entirely and look at the replica through Parsec, Jump, or any remote desktop you already use; the sync works the same either way.
