@@ -1,0 +1,10 @@
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# Build/dev artifacts
+__pycache__/
+*.pyc
+.venv/
+dist/
+.pytest_cache/

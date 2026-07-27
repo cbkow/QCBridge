@@ -1,0 +1,32 @@
+schema_version = "1.0.0"
+id = "qcbridge"
+version = "0.1.0"
+name = "QC Bridge"
+tagline = "Remote beauty monitor: one-way scene sync + SRT pixel stream"
+maintainer = "Chris Bialkowski <chris@bialkow.ski>"
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+website = "https://github.com/cbkow/QCBridge"
+type = "add-on"
+blender_version_min = "4.5.0"
+platforms = ["windows-x64", "macos-x64", "macos-arm64"]
+wheels = [
+  "./wheels/pyzmq-26.2.1-cp311-cp311-macosx_10_15_universal2.whl",
+  "./wheels/pyzmq-26.2.1-cp311-cp311-win_amd64.whl",
+  "./wheels/pyzmq-26.2.1-cp312-cp312-macosx_10_15_universal2.whl",
+  "./wheels/pyzmq-26.2.1-cp312-cp312-win_amd64.whl",
+  "./wheels/pyzmq-26.2.1-cp313-cp313-macosx_10_15_universal2.whl",
+  "./wheels/pyzmq-26.2.1-cp313-cp313-win_amd64.whl",
+]
+
+[permissions]
+network = "One-way scene sync and SRT pixel stream inside the VPN"
+files = "Write session scratch files in temp directories"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  ".*",
+  "*.zip",
+]

@@ -1,0 +1,22 @@
+QCBridge — third-party notices
+==============================
+
+QCBridge itself is GPL-3.0-or-later (see LICENSE).
+
+1. Bundled Python wheels (shipped inside the extension zip, wheels/)
+--------------------------------------------------------------------
+pyzmq — BSD-3-Clause
+  https://github.com/zeromq/pyzmq
+  License text: LICENSES/BSD-3-Clause.txt
+  The pyzmq binary wheels statically bundle libzmq (ZeroMQ), licensed
+  MPL-2.0: https://github.com/zeromq/libzmq — https://www.mozilla.org/MPL/2.0/
+
+2. External tools (invoked at runtime, NOT distributed with QCBridge)
+---------------------------------------------------------------------
+FFmpeg — GPL/LGPL (build-dependent)
+  https://ffmpeg.org
+  The Replica role spawns a user-provided or QCView-provided ffmpeg binary
+  for screen capture, HEVC encode, and SRT output. No FFmpeg code or binary
+  is included in this distribution.
+libsrt (via FFmpeg) — MPL-2.0
+  https://github.com/Haivision/srt
