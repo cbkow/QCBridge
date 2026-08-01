@@ -12,6 +12,7 @@ the dirty set and debouncer keep absorbing, bounded by scene size.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -79,6 +80,9 @@ class HostSync:
         self.sent_t1 = 0
         self.sent_t2 = 0
         self.t2_unsupported = 0
+        self.bake_note = ""  # a sim bake appeared/vanished: only tier 3
+                             # carries cache data (probed 5.2) — panel nags
+                             # for Force Resync until one ships
         self._uuid_to_db: dict[str, bpy.types.ID] = {}
         self._vis_state: dict[str, tuple] = {}  # uuid → visibility vector
         self._last_sweep = 0.0
@@ -91,7 +95,12 @@ class HostSync:
         property, and even hide_viewport fires nothing for the object it
         disables (measured 5.2 — plausibly because the object leaves the
         depsgraph). Sample all three flags on the sweep cadence and mark
-        tier-1 dirty on change; the normal flush diffs and ships them."""
+        tier-1 dirty on change; the normal flush diffs and ships them.
+
+        Point-cache state rides the same sweep for the same reason: a bake
+        finishing (job thread) or Delete Bake gives no dependable event for
+        the owning object; the flush diff sees "~pcache" change and
+        escalates to tier 2 so the baked cache travels in the resend."""
         now = time.monotonic()
         for obj in bpy.data.objects:
             uuid = self.registry.uuid_for(obj.session_uid)
@@ -101,8 +110,22 @@ class HostSync:
                 eye = obj.hide_get()
             except RuntimeError:
                 eye = None  # not in the active view layer
-            vector = (eye, obj.hide_viewport, obj.hide_render)
-            if self._vis_state.get(uuid) != vector:
+            vector = (
+                eye, obj.hide_viewport, obj.hide_render,
+                _pcache_signature(obj),
+            )
+            old = self._vis_state.get(uuid)
+            if old != vector:
+                if old is not None and len(old) == 4:
+                    # A bake appearing/disappearing needs tier 3: the tier-2
+                    # partial blend does NOT contain cache data (probed —
+                    # only the full save does). Settings still resend via
+                    # the "~pcache" escalation; the bake itself waits on a
+                    # manual Force Resync (resync stays manual, decision #8).
+                    old_on = {row[0] for row in old[3] if row[1]}
+                    new_on = {row[0] for row in vector[3] if row[1]}
+                    if old_on != new_on:
+                        self.bake_note = f"sim bake changed ({obj.name})"
                 self._vis_state[uuid] = vector
                 self.dirty.mark(uuid, Tier.T1)
                 self.debounce.touch(uuid, now)
@@ -160,7 +183,8 @@ class HostSync:
                         except RuntimeError:
                             eye = None
                         self._vis_state[uuid] = (
-                            eye, db.hide_viewport, db.hide_render
+                            eye, db.hide_viewport, db.hide_render,
+                            _pcache_signature(db),
                         )
 
     # ── depsgraph handler (main thread) ──────────────────────────────────────
@@ -209,6 +233,7 @@ class HostSync:
         blob_id = f"boot.{self.sent_boot}.{self.seq + 1}"
         self._boot_outbox.extend(protocol.chunk_blob("boot", blob_id, data, meta=meta))
         self.sent_boot += 1
+        self.bake_note = ""  # the full file carries every baked cache
         if _DEBUG:
             print(f"qcb boot queued ({len(data)} bytes)", flush=True)
 
@@ -359,6 +384,127 @@ def _coerce(value):
         return None
 
 
+# Identity/state props excluded from settings digests: identity rides the
+# signature columns next to the digest; point-cache state has its own
+# "~pcache" signature (and its info string churns during plain playback).
+_DIGEST_SKIP = {"rna_type", "name", "type", "show_expanded", "is_active", "point_cache"}
+
+
+def _digest_value(value):
+    if isinstance(value, bpy.types.ID):
+        return ("id", value.session_uid)  # identity, rename-proof
+    if isinstance(value, set):  # enum-flag props iterate unordered
+        return tuple(sorted(value))
+    return _round5(_coerce(value))
+
+
+def _round5(value):
+    if isinstance(value, float):
+        return round(value, 5)
+    if isinstance(value, list):
+        return [_round5(v) for v in value]
+    return value
+
+
+def _settings_digest(struct, depth: int = 0) -> str:
+    """Stable hash of a modifier's/constraint's settings, one value per RNA
+    property, descending into non-ID sub-structs (ClothSettings and friends)
+    and recording ID pointers by identity. Folded into the "~modifiers" /
+    "~constraints" signatures so PROPERTY edits — cloth stiffness, a Track
+    To's influence, a boolean's target — escalate to a tier-2 resend
+    (previously only stack shape did; field report 2026-08-01)."""
+    parts: list = []
+    for prop in struct.bl_rna.properties:
+        ident = prop.identifier
+        if ident in _DIGEST_SKIP:
+            continue
+        if prop.type == "POINTER":
+            try:
+                value = getattr(struct, ident)
+            except AttributeError:
+                continue
+            if value is None:
+                parts.append((ident, None))
+            elif isinstance(value, bpy.types.ID):
+                parts.append((ident, value.session_uid))
+            elif depth < 2:
+                parts.append((ident, _settings_digest(value, depth + 1)))
+        elif prop.type in {"BOOLEAN", "INT", "FLOAT", "ENUM", "STRING"}:
+            if prop.is_readonly:
+                continue  # derived state (is_bound, …), not a setting
+            try:
+                value = getattr(struct, ident)
+            except AttributeError:
+                continue
+            parts.append((ident, _digest_value(value)))
+    if depth == 0:
+        try:
+            parts.append(("_idprops", [
+                (key, _digest_value(val)) for key, val in struct.items()
+            ]))
+        except TypeError:
+            pass  # modifiers don't support classic IDProperties on 5.2
+        if isinstance(struct, bpy.types.NodesModifier):
+            parts.append(("_gn_inputs", _gn_input_values(struct)))
+    return hashlib.md5(repr(parts).encode()).hexdigest()[:16]
+
+
+def _gn_input_values(mod) -> list:
+    """Geometry Nodes modifier input values, 5.2 storage: NOT classic
+    idprops (items() raises) and NOT RNA — each socket is an IDPropertyGroup
+    behind mod.properties.inputs[<socket identifier>]. Probed: a panel input
+    tweak fires only the OBJECT's depsgraph update, so unless these values
+    reach the digest, the edit syncs nothing. Tree-side edits fire on the
+    GeometryNodeTree ID and resend through the existing tier-2 path."""
+    if mod.node_group is None:
+        return []
+    values = []
+    try:
+        inputs = mod.properties.inputs
+        for item in mod.node_group.interface.items_tree:
+            ident = getattr(item, "identifier", "")
+            if getattr(item, "in_out", None) != "INPUT" or not ident:
+                continue
+            try:
+                group = inputs[ident]
+            except KeyError:
+                continue
+            raw = group.to_dict() if hasattr(group, "to_dict") else None
+            if isinstance(raw, dict):
+                values.append((ident, sorted(
+                    (key, _digest_value(val)) for key, val in raw.items()
+                )))
+    except (AttributeError, TypeError):
+        pass  # storage shape differs on this Blender; tree edits still resend
+    return values
+
+
+def _pcache_signature(obj: bpy.types.Object) -> list:
+    """Point-cache state per sim on this object (cloth, soft body, particles,
+    dynamic paint surfaces). Bake/Delete-Bake changes exactly these fields —
+    deliberately NOT the cache info string, which changes on every frame of
+    plain playback caching and would turn scrubbing into a resend storm.
+    Unbaked live sims stay out of scope: only a baked cache is state the
+    resend can faithfully carry."""
+    sig = []
+
+    def add(tag, pc):
+        if pc is not None:
+            sig.append([
+                tag, pc.is_baked, pc.use_disk_cache, pc.frame_start, pc.frame_end
+            ])
+
+    for m in obj.modifiers:
+        add(m.name, getattr(m, "point_cache", None))
+        canvas = getattr(m, "canvas_settings", None)
+        if canvas is not None:
+            for surf in canvas.canvas_surfaces:
+                add(f"{m.name}/{surf.name}", getattr(surf, "point_cache", None))
+    for psys in obj.particle_systems:
+        add(f"psys/{psys.name}", psys.point_cache)
+    return sig
+
+
 def build_snapshot(db: bpy.types.ID) -> dict:
     """Tracked values plus "~" pseudo-paths: structure signatures that are
     never sent as tier-1 writes — a change in one escalates to tier 2."""
@@ -373,8 +519,29 @@ def build_snapshot(db: bpy.types.ID) -> dict:
             snapshot[path] = value
     if isinstance(db, bpy.types.Object):
         snapshot["~modifiers"] = [
-            [m.name, m.type, m.show_viewport] for m in db.modifiers
+            [m.name, m.type, m.show_viewport, _settings_digest(m)]
+            for m in db.modifiers
         ]
+        # Parenting is invisible to the tier-1 table: Ctrl+P stores the kept
+        # offset in matrix_parent_inverse and leaves loc/rot/scale alone, so
+        # the diff saw nothing (field report 2026-08-01). Parent identity is
+        # the session_uid — rename-proof; the wire never sees it (a change
+        # escalates to tier 2, where libraries.write carries the parent as a
+        # dependency and the replica remaps by stamped uuid).
+        snapshot["~parent"] = None if db.parent is None else [
+            db.parent.session_uid,
+            db.parent_type,
+            db.parent_bone,
+            list(db.parent_vertices),
+            [round(v, 6) for row in db.matrix_parent_inverse for v in row],
+        ]
+        # Constraints (camera rigs: Track To on a null, etc.) — the digest
+        # covers targets, influence and per-type settings, so tweaks resend,
+        # not just stack add/remove.
+        snapshot["~constraints"] = [
+            [c.name, c.type, _settings_digest(c)] for c in db.constraints
+        ]
+        snapshot["~pcache"] = _pcache_signature(db)
         try:
             # The eye toggle: per-view-layer state, not an RNA property —
             # rides as "@hide" and is applied via hide_set() on the replica.

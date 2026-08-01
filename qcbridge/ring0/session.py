@@ -441,6 +441,8 @@ def status_text() -> str:
                 f" (gaps {peer.get('gaps', 0)}, unknown {peer.get('unknown', 0)},"
                 f" errors {peer.get('errors', 0)}, unsent {sync.t2_unsupported})"
             )
+        if getattr(sync, "bake_note", ""):
+            bits.append(f"⚠ {sync.bake_note} — Force Resync ships it")
     if state["role"] == "REPLICA":
         bits.append(_replica_overlay_text())
         bits.append(state.get("ffmpeg_note", ""))
