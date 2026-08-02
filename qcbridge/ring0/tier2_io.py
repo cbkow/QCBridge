@@ -38,6 +38,11 @@ _COLLECTIONS = (
     # riding a blob as an unlisted dependency would append as a .001
     # duplicate instead of remapping over its stale predecessor.
     ("actions", bpy.types.Action),
+    ("lattices", bpy.types.Lattice),
+    ("armatures", bpy.types.Armature),
+    # NOTE no shape_keys entry: libraries.load has no shape_keys namespace
+    # (probed 5.2) — Keys always ride their owner's blob and are paired by
+    # the dedicated post-pass in apply_blob below.
 )
 
 
@@ -147,6 +152,31 @@ def apply_blob(
             except Exception:
                 errors += 1
         primary_name = primary_name or new_db.name
+    # Shape-key post-pass: a Key arrives implicitly with its owner (it
+    # cannot be listed in data_to — no shape_keys namespace, probed 5.2) as
+    # a "<name>.001" copy, while the replica's previous Key is orphaned by
+    # the stale owner's removal above. Pair by stamp, take over the old
+    # name, drop the orphan — without this every resend of a keyed mesh
+    # leaks a duplicate Key.
+    for new_db, _, _ in pairs:
+        new_key = getattr(new_db, "shape_keys", None)
+        if new_key is None:
+            continue
+        uuid = new_key.get(UUID_PROP)
+        old_key = None
+        if uuid:
+            for candidate in bpy.data.shape_keys:
+                if candidate is not new_key and candidate.get(UUID_PROP) == uuid:
+                    old_key = candidate
+                    break
+        if old_key is not None:
+            try:
+                old_name = old_key.name
+                old_key.user_remap(new_key)
+                bpy.data.batch_remove((old_key,))
+                new_key.name = old_name
+            except Exception:
+                errors += 1
     # The replica works from a temp copy of the project (tier-3), so arrived
     # relative paths need the same localize pass as bootstrap.
     _f, _u, path_errors = bootstrap.localize_paths(

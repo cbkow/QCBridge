@@ -43,6 +43,7 @@ _TYPE_KEYS = {
     bpy.types.Material: "MATERIAL",
     bpy.types.World: "WORLD",
     bpy.types.Collection: "COLLECTION",
+    bpy.types.Key: "KEY",
 }
 
 
@@ -61,7 +62,8 @@ def _layer_collections():
 # Collections swept for deletions (only types we stamp/track).
 _SWEPT_COLLECTIONS = (
     "objects", "lights", "cameras", "materials", "worlds", "scenes", "meshes",
-    "curves", "images", "node_groups", "collections", "actions",
+    "curves", "images", "node_groups", "collections", "actions", "shape_keys",
+    "lattices", "armatures",
 )
 
 
@@ -106,17 +108,10 @@ class HostSync:
             uuid = self.registry.uuid_for(obj.session_uid)
             if uuid is None:
                 continue
-            try:
-                eye = obj.hide_get()
-            except RuntimeError:
-                eye = None  # not in the active view layer
-            vector = (
-                eye, obj.hide_viewport, obj.hide_render,
-                _pcache_signature(obj),
-            )
+            vector = _object_sweep_vector(obj)
             old = self._vis_state.get(uuid)
             if old != vector:
-                if old is not None and len(old) == 4:
+                if old is not None and len(old) >= 4:
                     # A bake appearing/disappearing needs tier 3: the tier-2
                     # partial blend does NOT contain cache data (probed —
                     # only the full save does). Settings still resend via
@@ -178,14 +173,7 @@ class HostSync:
                     snapshot = build_snapshot(db)
                     self.shadow.diff_and_update(uuid, snapshot)
                     if isinstance(db, bpy.types.Object):
-                        try:
-                            eye = db.hide_get()
-                        except RuntimeError:
-                            eye = None
-                        self._vis_state[uuid] = (
-                            eye, db.hide_viewport, db.hide_render,
-                            _pcache_signature(db),
-                        )
+                        self._vis_state[uuid] = _object_sweep_vector(db)
 
     # ── depsgraph handler (main thread) ──────────────────────────────────────
 
@@ -313,6 +301,20 @@ class HostSync:
         db = self._uuid_to_db.get(uuid)
         if db is None:
             return
+        if isinstance(db, bpy.types.Key):
+            # A Key can't travel alone — libraries.load exposes no
+            # shape_keys namespace (probed 5.2); the owner's blob carries
+            # it. Refresh the Key's shadow first so tier-1 doesn't re-diff
+            # the same structural change forever.
+            self.shadow.diff_and_update(uuid, build_snapshot(db))
+            owner = db.user
+            if owner is None:
+                return
+            owner_uuid = identity.ensure_uuid(owner, self.registry)
+            self._uuid_to_db[owner_uuid] = owner
+            if owner_uuid != uuid:
+                self._flush_t2(owner_uuid)
+            return
         try:
             data = tier2_io.serialize(db)
         except ReferenceError:
@@ -382,7 +384,7 @@ def _is_syncable_id(db: bpy.types.ID) -> bool:
     # snapped it back on the next scrub).
     return isinstance(
         db, (bpy.types.Mesh, bpy.types.Curve, bpy.types.NodeTree,
-             bpy.types.Action)
+             bpy.types.Action, bpy.types.Lattice, bpy.types.Armature)
     )
 
 
@@ -494,6 +496,64 @@ def _gn_input_values(mod) -> list:
     return values
 
 
+_BBONE_PROPS = (
+    "bbone_curveinx", "bbone_curveinz", "bbone_curveoutx", "bbone_curveoutz",
+    "bbone_easein", "bbone_easeout", "bbone_rollin", "bbone_rollout",
+    "bbone_scalein", "bbone_scaleout",
+)
+
+
+def _pose_digest(pose, full: bool) -> str:
+    """Armature pose as one hash. full=True (flush snapshot) covers
+    everything the tier-2 object blob would change; full=False is the sweep
+    variant — transforms + bone idprops only, cheap enough for 0.5 s cadence
+    and exactly the edits that fire no depsgraph event (bone rig sliders).
+    Constraint/bbone edits DO fire (probed), so the flush digest catches
+    them without sweep help."""
+    parts = []
+    for pb in pose.bones:
+        entry = [
+            pb.name,
+            [round(v, 5) for row in pb.matrix_basis for v in row],
+            [(k, _digest_value(v)) for k, v in sorted(
+                pb.items(), key=lambda kv: kv[0])],
+        ]
+        if full:
+            entry.append(pb.rotation_mode)
+            entry.append([_coerce(getattr(pb, n, None)) for n in _BBONE_PROPS])
+            entry.append(
+                [[c.name, c.type, _settings_digest(c)] for c in pb.constraints]
+            )
+        parts.append(entry)
+    return hashlib.md5(repr(parts).encode()).hexdigest()[:16]
+
+
+def _idprops_digest(struct) -> str:
+    parts = [
+        (k, _digest_value(v))
+        for k, v in sorted(struct.items(), key=lambda kv: kv[0])
+        if k != identity.UUID_PROP and not k.startswith("_")
+    ]
+    return hashlib.md5(repr(parts).encode()).hexdigest()[:16]
+
+
+def _object_sweep_vector(obj: bpy.types.Object) -> tuple:
+    """Everything sampled on the sweep because no reliable depsgraph event
+    exists for it: visibility (original case), point-cache state, custom
+    properties (raw idprop writes fire nothing — probed), and the light
+    pose digest for armatures (bone idprop sliders, same silence)."""
+    try:
+        eye = obj.hide_get()
+    except RuntimeError:
+        eye = None  # not in the active view layer
+    return (
+        eye, obj.hide_viewport, obj.hide_render,
+        _pcache_signature(obj),
+        _idprops_digest(obj),
+        _pose_digest(obj.pose, full=False) if obj.pose is not None else None,
+    )
+
+
 def _anim_signature(anim) -> list | None:
     """Animation linkage on one ID: which action, NLA shape, and the driver
     set. Values inside the action are NOT here — those edits fire on the
@@ -591,12 +651,39 @@ def build_snapshot(db: bpy.types.ID) -> dict:
             [c.name, c.type, _settings_digest(c)] for c in db.constraints
         ]
         snapshot["~pcache"] = _pcache_signature(db)
+        # Custom properties: rig-control sliders live here. json.dumps in
+        # the path so names with dots/quotes survive the replica's parse
+        # (db[json.loads(path[1:-1])]). Add/remove changes the path set →
+        # structural escalation for free. Non-coercible values (nested
+        # groups) are skipped — documented limitation.
+        for prop_name, prop_value in db.items():
+            if prop_name == identity.UUID_PROP or prop_name.startswith("_"):
+                continue
+            value = _coerce(prop_value)
+            if value is not None:
+                snapshot[f"[{json.dumps(prop_name)}]"] = value
+        if db.pose is not None:
+            # Full pose digest: any pose change (bone transforms, per-bone
+            # constraints/bbone/idprops) escalates to a tier-2 resend of the
+            # armature OBJECT — pose lives in the Object block, and armature
+            # blobs are bones-only light. The sweep watches a LIGHT variant
+            # (transforms+idprops): bone-slider idprop edits fire no
+            # depsgraph event at all (probed 5.2).
+            snapshot["~pose"] = _pose_digest(db.pose, full=True)
         try:
             # The eye toggle: per-view-layer state, not an RNA property —
             # rides as "@hide" and is applied via hide_set() on the replica.
             snapshot["@hide"] = db.hide_get()
         except RuntimeError:
             pass  # not in the active view layer
+    if isinstance(db, bpy.types.Key):
+        # Shape-key sliders: tier-1 deltas for instant feedback (the owning
+        # mesh fires on the same edit and resends anyway — the blob just
+        # trails these by its transfer time).
+        for kb in db.key_blocks:
+            base = f"key_blocks[{json.dumps(kb.name)}]"
+            snapshot[f"{base}.value"] = kb.value
+            snapshot[f"{base}.mute"] = kb.mute
     if isinstance(db, bpy.types.Scene):
         # Active camera is a pointer — rides as a name, applied by setter.
         snapshot["@scene_camera"] = db.camera.name if db.camera else ""

@@ -26,7 +26,8 @@ _FRAME_MIN_INTERVAL = 0.1
 
 _SCANNED_COLLECTIONS = (
     "objects", "lights", "cameras", "materials", "worlds", "scenes", "meshes",
-    "curves", "node_groups", "images", "collections", "actions",
+    "curves", "node_groups", "images", "collections", "actions", "shape_keys",
+    "lattices", "armatures",
 )
 
 _transport = None
@@ -231,6 +232,12 @@ def _write_rna(db, path: str, value) -> None:
             lc.exclude = bool(value)
         else:
             lc.hide_viewport = bool(value)
+        return
+    if path.startswith("["):
+        # Custom property — the host json.dumps'd the name into the path,
+        # so dots/quotes in prop names round-trip exactly. Checked before
+        # the dotted-path split below for that same reason.
+        db[json.loads(path[1:-1])] = value
         return
     if "." in path:
         parent_path, attr = path.rsplit(".", 1)

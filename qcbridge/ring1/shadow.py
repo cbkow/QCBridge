@@ -78,6 +78,10 @@ TRACKED: dict[str, tuple[str, ...]] = {
     # (outliner checkbox/eye) rides as "@lc_exclude"/"@lc_hide", and
     # membership as a "~members" structure signature (ring0 emits all).
     "COLLECTION": ("hide_viewport", "hide_render"),
+    # Shape keys: all paths are dynamic (key_blocks["Name"].value/.mute —
+    # ring0 emits them per block); block add/remove/rename changes the path
+    # set and escalates structurally like node edits.
+    "KEY": (),
 }
 
 
