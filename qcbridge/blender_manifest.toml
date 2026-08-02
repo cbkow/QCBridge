@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "qcbridge"
-version = "0.1.1"
+version = "0.1.2"
 name = "QC Bridge"
 tagline = "Remote beauty monitor: one-way scene sync + SRT pixel stream"
 maintainer = "Chris Bialkowski <chris@bialkow.ski>"

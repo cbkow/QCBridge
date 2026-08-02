@@ -26,7 +26,7 @@ _FRAME_MIN_INTERVAL = 0.1
 
 _SCANNED_COLLECTIONS = (
     "objects", "lights", "cameras", "materials", "worlds", "scenes", "meshes",
-    "node_groups", "images", "collections",
+    "curves", "node_groups", "images", "collections", "actions",
 )
 
 _transport = None

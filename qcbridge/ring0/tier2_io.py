@@ -34,6 +34,10 @@ _COLLECTIONS = (
     ("images", bpy.types.Image),
     ("node_groups", bpy.types.NodeTree),
     ("collections", bpy.types.Collection),
+    # Actions must be listed for PAIRING, not just transport: an action
+    # riding a blob as an unlisted dependency would append as a .001
+    # duplicate instead of remapping over its stale predecessor.
+    ("actions", bpy.types.Action),
 )
 
 

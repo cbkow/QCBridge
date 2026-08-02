@@ -61,7 +61,7 @@ def _layer_collections():
 # Collections swept for deletions (only types we stamp/track).
 _SWEPT_COLLECTIONS = (
     "objects", "lights", "cameras", "materials", "worlds", "scenes", "meshes",
-    "curves", "images", "node_groups", "collections",
+    "curves", "images", "node_groups", "collections", "actions",
 )
 
 
@@ -277,7 +277,15 @@ class HostSync:
             return
         diff = self.shadow.diff_and_update(uuid, snapshot)
         if diff is None:
-            return  # first contact: peer has this state via tier-2/3
+            # First contact AFTER the initial scan (which primes every
+            # scan-time shadow): a datablock created mid-session, which the
+            # peer has never seen — "nothing to diff" must mean "send it
+            # whole", not silence. Found live: a new camera + rail linked
+            # straight into the scene MASTER collection synced nothing —
+            # master-collection membership is embedded in the Scene and
+            # rides no collection datablock's "~members" resend.
+            self._flush_t2(uuid)
+            return
         if diff["structural"]:
             # Node add/remove, link rewiring, modifier-stack change — not
             # expressible as property writes; escalate (decision #5: the
@@ -367,8 +375,15 @@ def _type_key(db: bpy.types.ID) -> str | None:
 
 def _is_syncable_id(db: bpy.types.ID) -> bool:
     # Data-level ids that tier-2 will resend wholesale (meshes, curves, node
-    # groups, images…): stamp + mark, no tier-1 table.
-    return isinstance(db, (bpy.types.Mesh, bpy.types.Curve, bpy.types.NodeTree))
+    # groups, images…): stamp + mark, no tier-1 table. Actions belong here:
+    # keyframe edits fire on the Action ID (probed 5.2) — without this, a
+    # retimed rig animation never crossed, and an object-key edit HALF-synced
+    # (the current-frame pose rode tier 1, then the replica's stale action
+    # snapped it back on the next scrub).
+    return isinstance(
+        db, (bpy.types.Mesh, bpy.types.Curve, bpy.types.NodeTree,
+             bpy.types.Action)
+    )
 
 
 def _coerce(value):
@@ -479,6 +494,33 @@ def _gn_input_values(mod) -> list:
     return values
 
 
+def _anim_signature(anim) -> list | None:
+    """Animation linkage on one ID: which action, NLA shape, and the driver
+    set. Values inside the action are NOT here — those edits fire on the
+    Action ID and resend through tier 2 like any datablock."""
+    if anim is None:
+        return None
+    drivers = [
+        (
+            fc.data_path, fc.array_index, fc.driver.type,
+            fc.driver.expression,
+            [
+                (var.name, var.type, [
+                    (t.id.session_uid if t.id else None, t.data_path)
+                    for t in var.targets
+                ])
+                for var in fc.driver.variables
+            ],
+        )
+        for fc in anim.drivers
+    ]
+    return [
+        anim.action.session_uid if anim.action else None,
+        len(anim.nla_tracks),
+        drivers,
+    ]
+
+
 def _pcache_signature(obj: bpy.types.Object) -> list:
     """Point-cache state per sim on this object (cloth, soft body, particles,
     dynamic paint surfaces). Bake/Delete-Bake changes exactly these fields —
@@ -509,6 +551,13 @@ def build_snapshot(db: bpy.types.ID) -> dict:
     """Tracked values plus "~" pseudo-paths: structure signatures that are
     never sent as tier-1 writes — a change in one escalates to tier 2."""
     snapshot: dict[str, object] = {}
+    if hasattr(db, "animation_data"):
+        # Action ASSIGNMENT and driver changes fire only on the owning ID
+        # (probed 5.2) — signature them so they escalate; the tier-2 blob
+        # carries animation_data and the action rides as a dependency.
+        # Keyframe edits inside an existing action fire on the Action ID
+        # itself, which is now a syncable tier-2 type of its own.
+        snapshot["~anim"] = _anim_signature(db.animation_data)
     type_key = _type_key(db)
     for path in TRACKED.get(type_key, ()):
         try:
