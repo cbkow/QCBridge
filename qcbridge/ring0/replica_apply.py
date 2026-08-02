@@ -383,7 +383,19 @@ def _target_view():
     return best
 
 
-def _apply_hot(packed: bytes) -> None:
+def _camera_view_bound(rv3d, cam) -> bool:
+    """Is the region genuinely looking through cam? In camera view the view
+    matrix is the camera's inverted (orthonormal) world matrix; zoom/offset
+    are 2D projection params and don't enter it."""
+    expect = cam.matrix_world.normalized().inverted()
+    return all(
+        abs(a - b) <= 1e-3
+        for row_have, row_want in zip(rv3d.view_matrix, expect)
+        for a, b in zip(row_have, row_want)
+    )
+
+
+def _apply_hot(packed: bytes, reassert: bool = False) -> None:
     global _last_frame_apply
     state = protocol.unpack_hot(packed)
     if state is None:
@@ -393,6 +405,8 @@ def _apply_hot(packed: bytes) -> None:
         return
     space = area.spaces.active
     rv3d = space.region_3d
+    if rv3d is None:
+        return  # region mid-rebuild (kiosk maximize/fullscreen transition)
     if _shot["on"]:
         # Shot mode: the replica holds the fitted camera frame — host
         # navigation is deliberately ignored; only time still follows.
@@ -417,7 +431,26 @@ def _apply_hot(packed: bytes) -> None:
         # matrix would fight it. Zoom = host's zoom + the remote nudge
         # offset, so the replica can be punched in/out independently while
         # still following. Passepartout draws overlays-off (probed).
-        if rv3d.view_perspective != "CAMERA":
+        cam = bpy.context.scene.camera
+        if cam is None:
+            # Nothing to look through (pre-bootstrap scene): writing the
+            # enum now would set "CAMERA" with no camera bound — a state
+            # the != guard then treats as done forever. Field symptom:
+            # replica starts outside camera view until manually toggled
+            # out-and-in (Num0 twice). Leave the view; the 1 s re-assert
+            # retries after the bootstrap lands a scene camera.
+            pass
+        elif rv3d.view_perspective != "CAMERA":
+            rv3d.view_perspective = "CAMERA"
+            changed = True
+        elif reassert and not _camera_view_bound(rv3d, cam):
+            # Enum says CAMERA but the region isn't looking through the
+            # scene camera (the write landed during a kiosk relayout or
+            # against a camera-less scene). The manual fix was Num0
+            # out+in — do exactly that, atomically within this tick.
+            # Only on the re-assert path: while packets differ (host
+            # navigating) a transient mismatch is normal, not desync.
+            rv3d.view_perspective = "PERSP"
             rv3d.view_perspective = "CAMERA"
             changed = True
         zoom = max(-30.0, min(600.0, state.cam_zoom + _zoom_offset))
@@ -512,10 +545,23 @@ def _handle_goodbye() -> None:
 
 
 def _tick():
-    global _last_hot, _last_hot_applied
     transport = _transport  # capture once: stop()/teardown can null the
     if transport is None:   # global mid-tick (seen as a quit-time traceback)
         return None  # unregister
+    # One exception must cost one tick, not the replica: an unguarded raise
+    # (e.g. a space dying mid-kiosk-relayout) would unregister this timer —
+    # hot, cold, kiosk and shot all silently stop while the host looks
+    # connected. Same hardening the host flush timer has.
+    try:
+        return _tick_inner(transport)
+    except Exception as exc:
+        stats["apply_errors"] += 1
+        stats["last_error"] = f"tick: {exc!r}"
+        return _TICK
+
+
+def _tick_inner(transport):
+    global _last_hot, _last_hot_applied
     if _host_goodbye:
         _handle_goodbye()
     if _new_session:
@@ -534,7 +580,7 @@ def _tick():
         # the dedup above rightly skips. Re-assert the last state on a 1 s
         # cadence; the writes are idempotent, so a correct view is
         # untouched and a disturbed one converges within a second.
-        _apply_hot(_last_hot)
+        _apply_hot(_last_hot, reassert=True)
         _last_hot_applied = start
     if _pending_t2 is not None:
         _apply_pending_t2()  # indivisible, labeled — may blow the budget
