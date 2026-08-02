@@ -271,6 +271,7 @@ def _apply_t1(header: dict, payload: bytes) -> None:
 
 
 def _apply_tombstone(header: dict) -> None:
+    global _last_hot
     db = _resolve(header["uuid"])
     if db is None:
         return
@@ -279,10 +280,11 @@ def _apply_tombstone(header: dict) -> None:
     except Exception:
         stats["apply_errors"] += 1
     _uuid_map.pop(header["uuid"], None)
+    _last_hot = None  # same camera-view risk as a t2 apply (see above)
 
 
 def _apply_pending_t2() -> None:
-    global _pending_t2, _project_dir_local
+    global _pending_t2, _project_dir_local, _last_hot
     header, blob = _pending_t2
     _pending_t2 = None
     blob_tag = header["blob"]["id"].replace(".", "-")
@@ -309,6 +311,18 @@ def _apply_pending_t2() -> None:
         stats["last_error"] = f"{header.get('kind')} {header.get('name')}: {exc!r}"
     finally:
         stats["applying"] = ""
+        # A t2/boot apply can replace the very camera the viewport is
+        # looking through — batch_remove knocks the view out of CAMERA
+        # perspective. A static host view means every hot packet is
+        # identical, so without busting the dedup the view would stay
+        # broken until someone presses Num0 on the replica (field report
+        # 2026-08-02 — the documented _last_hot gotcha). Shot mode re-fits
+        # for the same reason: its zoom was measured against the old
+        # camera datablock.
+        _last_hot = None
+        if _shot["on"]:
+            _shot["fit_pending"] = True
+            _shot["measure_at"] = time.monotonic() + 0.3
 
 
 def _process_cold(deadline: float) -> None:
