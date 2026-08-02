@@ -52,7 +52,38 @@ state = {
     "ffmpeg_note": "",     # which resolution rung provided ffmpeg (replica)
     "peer_stream": {},     # host: the replica's stream descriptor from hello
     "shot_mode": False,    # host: replica holds the fitted camera frame
+    "peer_addon": None,    # peer's addon version ("" = pre-0.1.5 peer)
 }
+
+
+def _addon_version() -> str:
+    """Our version, from the shipped manifest (the one version site)."""
+    global _ADDON_VERSION
+    if _ADDON_VERSION is None:
+        try:
+            import tomllib
+            from pathlib import Path
+
+            manifest = Path(__file__).resolve().parent.parent / "blender_manifest.toml"
+            _ADDON_VERSION = tomllib.loads(manifest.read_text())["version"]
+        except Exception:
+            _ADDON_VERSION = "?"
+    return _ADDON_VERSION
+
+
+_ADDON_VERSION: str | None = None
+
+
+def _version_warning() -> str:
+    peer = state.get("peer_addon")
+    if state.get("peer_epoch") is None or peer is None:
+        return ""  # nothing paired yet
+    if peer != _addon_version():
+        return (
+            f"⚠ peer runs {peer or 'pre-0.1.5'}, this end {_addon_version()}"
+            " — update both ends"
+        )
+    return ""
 
 
 def running() -> bool:
@@ -103,6 +134,7 @@ def stop() -> None:
     state.update(
         role=None, transport=None, peer_epoch=None, note="", sync=None,
         prefs=None, ffmpeg_note="", peer_stream={}, shot_mode=False,
+        peer_addon=None,
     )
 
 
@@ -132,7 +164,10 @@ def _start_host(prefs) -> None:
     state["note"] = address_error or "connecting"
 
     token = prefs.token
-    hello = protocol.make_hello(token, state["epoch"], bpy.app.version_string)
+    hello = protocol.make_hello(
+        token, state["epoch"], bpy.app.version_string,
+        addon_version=_addon_version(),
+    )
 
     # Fire-and-poll — this timer runs on Blender's main thread, and a dead
     # peer must never freeze the UI (it did: a blocking 3 s request per
@@ -154,6 +189,7 @@ def _start_host(prefs) -> None:
             if reply.get("ok"):
                 state["peer_epoch"] = reply.get("epoch")
                 state["peer_stream"] = reply.get("stream") or {}
+                state["peer_addon"] = reply.get("addon", "")
                 state["note"] = "connected"
                 # Fresh handshake = fresh epoch pairing → full bootstrap
                 # (decision #16; same-epoch transport blips reconnect
@@ -203,6 +239,8 @@ def _start_replica(prefs) -> None:
         "latency_ms": getattr(prefs, "srt_latency_ms", 300),
     }
 
+    our_version = _addon_version()  # captured: the handler runs on IO thread
+
     def _handler(msg: dict) -> dict:  # IO thread: strings only, no bpy
         if msg.get("kind") == "hello":
             ok, reason = protocol.check_hello(msg, token)
@@ -210,10 +248,12 @@ def _start_replica(prefs) -> None:
                 if state["peer_epoch"] != msg.get("epoch"):
                     replica_apply.notify_new_session()
                 state["peer_epoch"] = msg.get("epoch")
+                state["peer_addon"] = msg.get("addon", "")
                 state["note"] = "host connected"
             return {
                 "kind": "hello_reply", "ok": ok, "reason": reason,
                 "epoch": epoch, "stream": stream_info,
+                "addon": our_version,
             }
         if msg.get("kind") == "goodbye":
             replica_apply.notify_host_goodbye()  # flag only; handled on tick
@@ -404,6 +444,8 @@ def _replica_overlay_text() -> str:
     now = _time.time()
     clock = _time.strftime("%H:%M:%S", _time.localtime(now)) + f".{int(now * 10) % 10}"
     bits = [f"● live · seq {stats['seq']} · {clock}"]
+    if _version_warning():
+        bits.append("⚠ version mismatch")
     if stats["gaps"]:
         bits.append(f"⚠ {stats['gaps']} gaps")
     if stats["apply_errors"]:
@@ -418,7 +460,12 @@ def status_text() -> str:
         return "idle"
     transport = state["transport"]
     alive = "●" if (transport and transport.peer_alive) else "○"
-    bits = [f"{state['role'].lower()} {alive}", state["note"]]
+    bits = [f"{state['role'].lower()} {alive}", state["note"], _version_warning()]
+    sync_ = state.get("sync")
+    if sync_ is not None and getattr(sync_, "sync_errors", 0):
+        bits.append(
+            f"⚠ {sync_.sync_errors} sync errors ({sync_.last_sync_error})"
+        )
     if state["paused"]:
         bits.append("paused")
     sync = state.get("sync")

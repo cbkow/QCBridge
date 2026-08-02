@@ -35,6 +35,14 @@ def ensure_uuid(datablock: bpy.types.ID, registry: IdentityRegistry) -> str:
     stamped = datablock.get(UUID_PROP, "")
     if stamped and registry.claim(stamped, datablock.session_uid) == "ok":
         return stamped
+    if not stamped:
+        # Undo can rewind the stamp write while the runtime datablock (same
+        # session_uid) lives on — minting fresh would orphan the replica's
+        # copy and resend everything as first-contact. Reclaim instead.
+        existing = registry.uuid_for(datablock.session_uid)
+        if existing:
+            datablock[UUID_PROP] = existing
+            return existing
     # First contact (no stamp) or a duplicate carrying a copied stamp.
     fresh = _uuid.uuid4().hex
     datablock[UUID_PROP] = fresh

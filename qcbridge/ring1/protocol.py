@@ -98,13 +98,19 @@ def srt_passphrase(token: str) -> str:
     return hashlib.sha256(f"qcb-srt:{token}".encode()).hexdigest()[:32]
 
 
-def make_hello(token: str, epoch: str, blender_version: str) -> dict:
+def make_hello(
+    token: str, epoch: str, blender_version: str, addon_version: str = ""
+) -> dict:
     return {
         "kind": "hello",
         "token": token,
         "epoch": epoch,
         "protocol": PROTOCOL_VERSION,
         "blender": blender_version,
+        # Informational, never gates the handshake: mismatched ends mostly
+        # WORK but degrade confusingly (e.g. unknown tier-1 path shapes
+        # surface as apply errors) — both panels warn instead (2026-08-02).
+        "addon": addon_version,
     }
 
 

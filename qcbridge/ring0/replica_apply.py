@@ -32,6 +32,8 @@ _SCANNED_COLLECTIONS = (
 
 _transport = None
 _last_hot: bytes | None = None
+_last_hot_applied = 0.0
+_REASSERT_S = 1.0
 _last_frame_apply = 0.0
 _last_redraw_poke = 0.0
 
@@ -368,11 +370,17 @@ def _process_cold(deadline: float) -> None:
 
 
 def _target_view():
+    """The largest 3D viewport — mirror of host_hot's pick, so a multi-area
+    replica layout follows in the viewport the operator actually watches."""
+    best = None
+    best_size = -1
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
             if area.type == "VIEW_3D":
-                return area
-    return None
+                size = area.width * area.height
+                if size > best_size:
+                    best, best_size = area, size
+    return best
 
 
 def _apply_hot(packed: bytes) -> None:
@@ -398,6 +406,12 @@ def _apply_hot(packed: bytes) -> None:
             scene.frame_set(state.frame)
             _last_frame_apply = now
         return
+    # Compare-before-write throughout: this runs on the 1 s re-assert loop
+    # with a usually-correct view, and a view3d RNA write restarts Cycles
+    # viewport sampling even when the value is identical — the converged
+    # beauty must stay converged (the 10 Hz redraw poke is a blit precisely
+    # because of that).
+    changed = False
     if state.camera:
         # Camera view: the camera object defines the view — setting the
         # matrix would fight it. Zoom = host's zoom + the remote nudge
@@ -405,18 +419,41 @@ def _apply_hot(packed: bytes) -> None:
         # still following. Passepartout draws overlays-off (probed).
         if rv3d.view_perspective != "CAMERA":
             rv3d.view_perspective = "CAMERA"
-        rv3d.view_camera_zoom = max(-30.0, min(600.0, state.cam_zoom + _zoom_offset))
-        rv3d.view_camera_offset[0] = state.cam_offset[0]
-        rv3d.view_camera_offset[1] = state.cam_offset[1]
+            changed = True
+        zoom = max(-30.0, min(600.0, state.cam_zoom + _zoom_offset))
+        if abs(rv3d.view_camera_zoom - zoom) > 1e-6:
+            rv3d.view_camera_zoom = zoom
+            changed = True
+        if (
+            abs(rv3d.view_camera_offset[0] - state.cam_offset[0]) > 1e-6
+            or abs(rv3d.view_camera_offset[1] - state.cam_offset[1]) > 1e-6
+        ):
+            rv3d.view_camera_offset[0] = state.cam_offset[0]
+            rv3d.view_camera_offset[1] = state.cam_offset[1]
+            changed = True
     else:
         rows = [state.view_matrix[i : i + 4] for i in range(0, 16, 4)]
-        rv3d.view_matrix = Matrix(rows)
+        matrix = Matrix(rows)
+        # readback can differ in the last bits from what was written —
+        # tolerance compare, or the guard would never hold
+        if any(
+            abs(a - b) > 1e-6
+            for ra, rb in zip(rv3d.view_matrix, matrix)
+            for a, b in zip(ra, rb)
+        ):
+            rv3d.view_matrix = matrix
+            changed = True
         perspective = "PERSP" if state.is_persp else "ORTHO"
         if rv3d.view_perspective != perspective:
             rv3d.view_perspective = perspective
-    space.lens = state.lens
-    space.clip_start = state.clip_start
-    space.clip_end = state.clip_end
+            changed = True
+    for attr, value in (
+        ("lens", state.lens), ("clip_start", state.clip_start),
+        ("clip_end", state.clip_end),
+    ):
+        if abs(getattr(space, attr) - value) > 1e-6:
+            setattr(space, attr, value)
+            changed = True
 
     scene = bpy.context.scene
     now = time.monotonic()
@@ -426,7 +463,9 @@ def _apply_hot(packed: bytes) -> None:
     ):
         scene.frame_set(state.frame)
         _last_frame_apply = now
-    area.tag_redraw()
+        changed = True
+    if changed:
+        area.tag_redraw()
 
 
 def notify_host_goodbye() -> None:
@@ -457,8 +496,9 @@ def _handle_goodbye() -> None:
     viewport out of RENDERED), restore a usable UI, stop the encoder. The
     replica keeps listening — the next host session bootstraps it straight
     back to work, no hands on this machine."""
-    global _host_goodbye
+    global _host_goodbye, _last_hot
     _host_goodbye = False
+    _last_hot = None  # stop the periodic re-assert: no session to follow
     import os, time
     if os.environ.get("QCB_DEBUG"):
         print(f"[{time.monotonic():.1f}] qcb GOODBYE handled", flush=True)
@@ -472,7 +512,7 @@ def _handle_goodbye() -> None:
 
 
 def _tick():
-    global _last_hot
+    global _last_hot, _last_hot_applied
     transport = _transport  # capture once: stop()/teardown can null the
     if transport is None:   # global mid-tick (seen as a quit-time traceback)
         return None  # unregister
@@ -485,6 +525,17 @@ def _tick():
     if packed is not None and packed != _last_hot:
         _apply_hot(packed)
         _last_hot = packed
+        _last_hot_applied = start
+    elif _last_hot is not None and start - _last_hot_applied >= _REASSERT_S:
+        # Self-healing follow (kiosk-verify pattern): a kiosk relayout, a
+        # manual view nudge on this machine, or an early packet landing
+        # before the bootstrap's scene camera existed all leave the view
+        # wrong while a STATIC host emits byte-identical packets — which
+        # the dedup above rightly skips. Re-assert the last state on a 1 s
+        # cadence; the writes are idempotent, so a correct view is
+        # untouched and a disturbed one converges within a second.
+        _apply_hot(_last_hot)
+        _last_hot_applied = start
     if _pending_t2 is not None:
         _apply_pending_t2()  # indivisible, labeled — may blow the budget
     _process_cold(start + _BUDGET_S)
@@ -503,9 +554,11 @@ def _tick():
 
 
 def start(transport, mappings=()) -> None:
-    global _transport, _last_hot, _seq_tracker, _reassembler, _mappings, _pending_t2
+    global _transport, _last_hot, _last_hot_applied, _seq_tracker, \
+        _reassembler, _mappings, _pending_t2
     _transport = transport
     _last_hot = None
+    _last_hot_applied = 0.0
     _seq_tracker = protocol.SeqTracker()
     _reassembler = protocol.Reassembler()
     _inbox.clear()

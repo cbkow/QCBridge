@@ -169,7 +169,10 @@ def apply_blob(
                 if candidate is not new_key and candidate.get(UUID_PROP) == uuid:
                     old_key = candidate
                     break
-        if old_key is not None:
+        # Only touch ORPHANED predecessors: if the old Key still has a live
+        # owner, the arriving mesh failed to pair with its stale copy and
+        # removing the Key would strip a live mesh's shapes.
+        if old_key is not None and getattr(old_key, "user", None) is None:
             try:
                 old_name = old_key.name
                 old_key.user_remap(new_key)
@@ -183,6 +186,13 @@ def apply_blob(
         [db for db, _, _ in pairs], local_project_dir, mappings
     )
     errors += path_errors
+    # A blob can drag in a Library reference (local object parented or
+    # constrained to linked data) — its filepath arrives host-form and the
+    # linked dependency is dead until localized, same as at bootstrap.
+    _f, _u, lib_errors = bootstrap.localize_paths(
+        bpy.data.libraries, local_project_dir, mappings
+    )
+    errors += lib_errors
     # New objects aren't linked into any scene collection by append-into-data;
     # link the ones that ended up orphaned.
     for new_db, old_db, _ in pairs:

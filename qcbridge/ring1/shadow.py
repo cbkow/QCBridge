@@ -22,6 +22,7 @@ from __future__ import annotations
 # Fixed tracked paths by datablock type key (ring0 maps bpy types to these).
 TRACKED: dict[str, tuple[str, ...]] = {
     "OBJECT": (
+        "name",
         "location",
         "rotation_euler",
         "rotation_quaternion",
@@ -32,6 +33,7 @@ TRACKED: dict[str, tuple[str, ...]] = {
         "hide_render",
     ),
     "LIGHT": (
+        "name",
         "type",
         "color",
         "energy",
@@ -40,6 +42,7 @@ TRACKED: dict[str, tuple[str, ...]] = {
         "spot_blend",
     ),
     "CAMERA": (
+        "name",
         "lens",
         "clip_start",
         "clip_end",
@@ -56,6 +59,7 @@ TRACKED: dict[str, tuple[str, ...]] = {
     # finding), render format (the one legitimate stream-restart trigger,
     # decision #12), viewport denoise (synced preference, 2026-07-24).
     "SCENE": (
+        "name",
         "render.engine",
         "render.resolution_x",
         "render.resolution_y",
@@ -72,16 +76,16 @@ TRACKED: dict[str, tuple[str, ...]] = {
     ),
     # MATERIAL / WORLD have no useful fixed paths — their snapshot is the
     # node-socket walk (dynamic paths) plus these:
-    "MATERIAL": ("blend_method",),
-    "WORLD": (),
+    "MATERIAL": ("name", "blend_method"),
+    "WORLD": ("name",),
     # Collections: the datablock-level toggles; the view-layer pair
     # (outliner checkbox/eye) rides as "@lc_exclude"/"@lc_hide", and
     # membership as a "~members" structure signature (ring0 emits all).
-    "COLLECTION": ("hide_viewport", "hide_render"),
+    "COLLECTION": ("name", "hide_viewport", "hide_render"),
     # Shape keys: all paths are dynamic (key_blocks["Name"].value/.mute —
     # ring0 emits them per block); block add/remove/rename changes the path
     # set and escalates structurally like node edits.
-    "KEY": (),
+    "KEY": ("name",),
 }
 
 

@@ -85,10 +85,20 @@ class HostSync:
         self.bake_note = ""  # a sim bake appeared/vanished: only tier 3
                              # carries cache data (probed 5.2) — panel nags
                              # for Force Resync until one ships
+        self.sync_errors = 0
+        self.last_sync_error = ""
+        # Nothing marks until the first bootstrap is serialized: every edit
+        # and every depsgraph batch before that moment — the file-open
+        # flood, pre-session edits, our own uuid stamping — is inside the
+        # bootstrap by construction, so marking it would only replay it as
+        # a tier-2 storm right after connect (field report 2026-08-02:
+        # startup takes several toggles to settle).
+        self._suppress_marks = True
         self._uuid_to_db: dict[str, bpy.types.ID] = {}
         self._vis_state: dict[str, tuple] = {}  # uuid → visibility vector
         self._last_sweep = 0.0
         self._in_handler = False
+        self._drop_next_batch = False
         self._initial_scan()
 
     def _sweep_visibility(self) -> None:
@@ -155,6 +165,11 @@ class HostSync:
         self._boot_outbox.clear()
         self._initial_scan()
         self.send_bootstrap()
+        # send_bootstrap serialized the NEW file just now (inside
+        # load_post), but the whole-scene depsgraph flood for that file
+        # evaluates AFTER load_post returns — one batch, fully covered by
+        # the bootstrap we just queued. Drop exactly it.
+        self._drop_next_batch = True
 
     def _initial_scan(self) -> None:
         """Stamp + register + shadow-prime every syncable datablock at session
@@ -180,6 +195,11 @@ class HostSync:
     def on_depsgraph(self, scene, depsgraph) -> None:
         if self._in_handler:
             return
+        if self._drop_next_batch:
+            self._drop_next_batch = False
+            return
+        if self._suppress_marks:
+            return  # everything pre-bootstrap-serialize rides the bootstrap
         self._in_handler = True
         try:
             now = time.monotonic()
@@ -222,10 +242,25 @@ class HostSync:
         self._boot_outbox.extend(protocol.chunk_blob("boot", blob_id, data, meta=meta))
         self.sent_boot += 1
         self.bake_note = ""  # the full file carries every baked cache
+        self.t2_unsupported = 0  # ditto anything we couldn't resend
+        self._suppress_marks = False  # deltas are real from here on
         if _DEBUG:
             print(f"qcb boot queued ({len(data)} bytes)", flush=True)
 
     def flush_tick(self) -> float:
+        # One bad datablock must cost one tick, not the session: an
+        # exception here would unregister the persistent timer and host
+        # sync would silently stop while the hot channel keeps flowing.
+        try:
+            return self._flush_tick_inner()
+        except Exception as exc:
+            self.sync_errors += 1
+            self.last_sync_error = repr(exc)
+            if _DEBUG:
+                print(f"qcb flush ERROR {exc!r}", flush=True)
+            return _FLUSH_TICK
+
+    def _flush_tick_inner(self) -> float:
         now = time.monotonic()
         while self._boot_outbox:
             header, payload = self._boot_outbox[0]
@@ -236,6 +271,8 @@ class HostSync:
             else:
                 self.seq -= 1
                 return _FLUSH_TICK  # backpressure: try again next tick
+        if self._suppress_marks:
+            return _FLUSH_TICK  # pre-handshake: the bootstrap will cover it
         if now - self._last_sweep >= _SWEEP_INTERVAL:
             self._sweep_deletions()
             self._last_sweep = now
@@ -272,7 +309,7 @@ class HostSync:
             # straight into the scene MASTER collection synced nothing —
             # master-collection membership is embedded in the Scene and
             # rides no collection datablock's "~members" resend.
-            self._flush_t2(uuid)
+            self._flush_t2(uuid, snapshot)
             return
         if diff["structural"]:
             # Node add/remove, link rewiring, modifier-stack change — not
@@ -281,7 +318,7 @@ class HostSync:
             # already debounce-ready, and no further event may ever touch it.
             if _DEBUG:
                 print(f"qcb escalate T2 {db.name}", flush=True)
-            self._flush_t2(uuid)
+            self._flush_t2(uuid, snapshot)
             return
         changes = diff["changes"]
         if not changes:
@@ -297,7 +334,10 @@ class HostSync:
             self.seq -= 1
             self.dirty.requeue(uuid, Tier.T1)
 
-    def _flush_t2(self, uuid: str) -> None:
+    def _flush_t2(self, uuid: str, snapshot: dict | None = None) -> None:
+        """snapshot — the caller's already-built build_snapshot(db), when it
+        has one (pose digests on heavy rigs make building it twice a real
+        main-thread cost)."""
         db = self._uuid_to_db.get(uuid)
         if db is None:
             return
@@ -306,10 +346,12 @@ class HostSync:
             # shape_keys namespace (probed 5.2); the owner's blob carries
             # it. Refresh the Key's shadow first so tier-1 doesn't re-diff
             # the same structural change forever.
-            self.shadow.diff_and_update(uuid, build_snapshot(db))
+            self.shadow.diff_and_update(
+                uuid, snapshot if snapshot is not None else build_snapshot(db)
+            )
             owner = db.user
-            if owner is None:
-                return
+            if owner is None or not identity.is_stampable(owner):
+                return  # linked-library owner: never stamped (decision #15)
             owner_uuid = identity.ensure_uuid(owner, self.registry)
             self._uuid_to_db[owner_uuid] = owner
             if owner_uuid != uuid:
@@ -327,7 +369,9 @@ class HostSync:
                 print(f"qcb t2 UNSUPPORTED {type(db).__name__}:{db.name}", flush=True)
             return
         # Refresh the shadow so tier-1 doesn't re-send state the blob carries.
-        self.shadow.diff_and_update(uuid, build_snapshot(db))
+        self.shadow.diff_and_update(
+            uuid, snapshot if snapshot is not None else build_snapshot(db)
+        )
         blob_id = f"{uuid}.{self.seq + 1}"
         meta = {"uuid": uuid, "name": db.name, "coll": tier2_io.collection_of(db)}
         for header, payload in protocol.chunk_blob("t2", blob_id, data, meta=meta):
@@ -350,9 +394,22 @@ class HostSync:
     def _sweep_deletions(self) -> None:
         self._sweep_visibility()
         live = set()
+        now = time.monotonic()
         for coll_name in _SWEPT_COLLECTIONS:
             for db in getattr(bpy.data, coll_name):
                 live.add(db.session_uid)
+                if (
+                    identity.is_stampable(db)
+                    and db.get(identity.UUID_PROP)
+                    and self.registry.uuid_for(db.session_uid) is None
+                ):
+                    # Stamped but unregistered: undo resurrected a datablock
+                    # we already tombstoned (or restored pre-session state).
+                    # Re-adopt and resend — no depsgraph event is coming.
+                    uuid = identity.ensure_uuid(db, self.registry)
+                    self._uuid_to_db[uuid] = db
+                    self.dirty.mark(uuid, Tier.T2)
+                    self.debounce.touch(uuid, now)
         dead = [
             uuid
             for uuid, db in list(self._uuid_to_db.items())
@@ -413,6 +470,12 @@ def _digest_value(value):
     if isinstance(value, set):  # enum-flag props iterate unordered
         return tuple(sorted(value))
     return _round5(_coerce(value))
+
+
+def _contains_none(value) -> bool:
+    if isinstance(value, list):
+        return any(v is None or _contains_none(v) for v in value)
+    return False
 
 
 def _round5(value):
@@ -548,9 +611,11 @@ def _object_sweep_vector(obj: bpy.types.Object) -> tuple:
         eye = None  # not in the active view layer
     return (
         eye, obj.hide_viewport, obj.hide_render,
-        _pcache_signature(obj),
+        _pcache_signature(obj),  # bake_note logic indexes [3] — keep it there
         _idprops_digest(obj),
         _pose_digest(obj.pose, full=False) if obj.pose is not None else None,
+        obj.name,  # renames fire no depsgraph event; name-keyed setters
+                   # (@scene_camera) die on stale names without this
     )
 
 
@@ -660,7 +725,9 @@ def build_snapshot(db: bpy.types.ID) -> dict:
             if prop_name == identity.UUID_PROP or prop_name.startswith("_"):
                 continue
             value = _coerce(prop_value)
-            if value is not None:
+            if value is not None and not _contains_none(value):
+                # a None inside an array would make the replica's idprop
+                # assignment raise per-apply — skip, don't half-send
                 snapshot[f"[{json.dumps(prop_name)}]"] = value
         if db.pose is not None:
             # Full pose digest: any pose change (bone transforms, per-bone
