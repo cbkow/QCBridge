@@ -1,4 +1,11 @@
-"""Probe smoke replica: stream on, strip on (QCB_PROBE=1 from the launcher)."""
+"""Probe smoke replica: strip on (QCB_PROBE=1 from the launcher).
+
+Env: QCB_SMOKE_BIND (127.0.0.1), QCB_SMOKE_TOKEN (smoketok), QCB_SMOKE_STREAM
+(1 = addon's own SRT stream, 0 = none, e.g. when an external kyber pipeline
+captures), QCB_SMOKE_SRT_LATENCY (60), QCB_SMOKE_RUNG (hevc_10_420_50),
+QCB_SMOKE_FFMPEG, QCB_SMOKE_KIOSK (0), QCB_SMOKE_CYCLES_DEVICE (OPTIX/CUDA/METAL). The replica viewport is always
+Rendered shading (kiosk.prepare_viewport); the engine comes from the host.
+Ports 19990-19992 control/hot/cold, 19998 SRT."""
 import json, os, sys, time  # noqa: E401
 from types import SimpleNamespace
 import bpy
@@ -9,13 +16,24 @@ sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(OUT, "pysite"))
 from qcbridge.ring0 import pixel_path, replica_apply, session  # noqa: E402
 
+E = os.environ.get
 prefs = SimpleNamespace(
-    role="REPLICA", replica_address="", bind_address="127.0.0.1",
-    port_control=19990, port_hot=19991, port_cold=19992, token="smoketok",
-    enable_stream=True, srt_port=19998, srt_url="", srt_latency_ms=60,
-    encoder_rung="hevc_10_420_50", ffmpeg_path="", replica_kiosk=False,
+    role="REPLICA", replica_address="", bind_address=E("QCB_SMOKE_BIND", "127.0.0.1"),
+    port_control=19990, port_hot=19991, port_cold=19992, token=E("QCB_SMOKE_TOKEN", "smoketok"),
+    enable_stream=E("QCB_SMOKE_STREAM", "1") == "1", srt_port=19998, srt_url="",
+    srt_latency_ms=int(E("QCB_SMOKE_SRT_LATENCY", "60")),
+    encoder_rung=E("QCB_SMOKE_RUNG", "hevc_10_420_50"), ffmpeg_path=E("QCB_SMOKE_FFMPEG", ""),
+    replica_kiosk=E("QCB_SMOKE_KIOSK", "0") == "1",
     path_mappings=[],
 )
+# Factory startup = Cycles on CPU. QCB_SMOKE_CYCLES_DEVICE=OPTIX|CUDA|METAL
+# enables the GPU backend here; the host sets scene.cycles.device = GPU.
+if E("QCB_SMOKE_CYCLES_DEVICE"):
+    cprefs = bpy.context.preferences.addons["cycles"].preferences
+    cprefs.compute_device_type = E("QCB_SMOKE_CYCLES_DEVICE")
+    cprefs.refresh_devices()
+    for dev in cprefs.devices:
+        dev.use = dev.type == E("QCB_SMOKE_CYCLES_DEVICE")
 session.start(prefs)
 
 def _dump():

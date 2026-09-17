@@ -2,7 +2,9 @@
 
 `blender-smoke/run_probe_smoke.sh`: two factory-startup Blender 5.2 windows
 on chris's MacBook Pro (3024x1964 Retina). Host orbits the default cube at
-45°/s in solid shading and stamps hot packets; replica draws the strip,
+45°/s and stamps hot packets; the replica viewport is Rendered shading with the
+factory-default EEVEE engine (kiosk.prepare_viewport — NOT solid, as first
+labeled; JSONL labels still say "solid"); replica draws the strip,
 captures the WHOLE display with avfoundation, VideoToolbox HEVC Main10 50M,
 SRT listener latency 60. `probe_reader.py --crop 1400:256:0:1634` on the
 same Mac. Latency = host stamp at hot-sample time → decoded frame in the
@@ -11,10 +13,10 @@ the stamp). Raw rows: `runs.jsonl`.
 
 | Label | Hot Hz | Capture fps | SRT latency | p50 | p95 | Frames / scored / stale / failed | Notes |
 | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| mac-blender-solid-hot60-cap60-srt60 | 60 | 60 | 60 | 279 | 288 | 1201 / 420 / 238 / 543 | edge-locked strip (fixed after) |
-| mac-blender-solid-hot60-cap60-srt60 | 60 | 60 | 60 | 258 | 267 | 1200 / 653 / 375 / 172 | load avg ~7 (cargo build) |
-| mac-blender-solid-hot60-cap60-srt60 | 60 | 60 | 60 | 274 | 283 | 1201 / 763 / 438 / 0 | clean decode; load avg ~6 |
-| mac-blender-solid-hot30-cap30-srt60 | 30 | 30 | 60 | 272 | 281 | 1200 / 458 / 742 / 0 | load avg ~5 |
+| mac-blender-eevee-hot60-cap60-srt60 | 60 | 60 | 60 | 279 | 288 | 1201 / 420 / 238 / 543 | edge-locked strip (fixed after) |
+| mac-blender-eevee-hot60-cap60-srt60 | 60 | 60 | 60 | 258 | 267 | 1200 / 653 / 375 / 172 | load avg ~7 (cargo build) |
+| mac-blender-eevee-hot60-cap60-srt60 | 60 | 60 | 60 | 274 | 283 | 1201 / 763 / 438 / 0 | clean decode; load avg ~6 |
+| mac-blender-eevee-hot30-cap30-srt60 | 30 | 30 | 60 | 272 | 281 | 1200 / 458 / 742 / 0 | load avg ~5 |
 
 A cargo release build (Kyber spike) was running in parallel for all rows:
 treat absolute numbers as ±15 ms until rerun on a quiet machine.
@@ -31,7 +33,7 @@ treat absolute numbers as ±15 ms until rerun on a quiet machine.
   is dominated by fixed costs (VT, SRT), not sampling phase. Revisit once
   those drop — the plan's "move everything to 60 Hz" is not the first lever.
 - **Replica draws ~38 new stamps/s at 60 Hz** (763 scored in 20 s): Blender's
-  viewport redraw, not the sampler, caps update rate in solid mode.
+  viewport redraw (EEVEE rendered), not the sampler, caps update rate.
 
 ## Bug found and fixed on this branch
 
