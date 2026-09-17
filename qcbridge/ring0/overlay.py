@@ -46,16 +46,17 @@ def _draw_rects(shader, rects, color) -> None:
 
 
 def _draw_probe_strip() -> None:
-    """Parity probe strip, top-left of the region: opaque black backdrop one
-    block wide on every side, white blocks for 1-bits (ring1/probe.py)."""
+    """Parity probe strip, bottom-left of the region just above the status
+    text (the top is under the header when not in kiosk): opaque black
+    backdrop one block wide on every side, white blocks for 1-bits."""
     region = bpy.context.region
     if _probe_stamp is None or region is None:
         return
     b = probe.BLOCK_PX
     bits = probe.encode_bits(*_probe_stamp)
     x = b  # backdrop starts at the region edge
-    top = region.height - b
-    y0, y1 = top - b, top
+    y0 = 48 + b  # clears the status text box (y 4..~36)
+    y1 = y0 + b
     backdrop = [(0, y0 - b, x + len(bits) * b + b, y1 + b)]
     ones = [
         (x + i * b, y0, x + (i + 1) * b, y1) for i, bit in enumerate(bits) if bit

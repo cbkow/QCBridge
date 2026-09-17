@@ -54,7 +54,9 @@ def main() -> None:
     src.add_argument("--stdin", action="store_true", help="Annex-B HEVC on stdin")
     ap.add_argument("--latency", type=int, default=120, help="SRT latency, ms")
     ap.add_argument("--token", default="")
-    ap.add_argument("--band", type=int, default=64, help="rows from the top to scan")
+    ap.add_argument("--band", type=int, default=128, help="rows from the bottom to scan")
+    ap.add_argument("--crop", default="", help="W:H:X:Y region to scan instead of the top band "
+                    "(e.g. a replica window inside a full-display capture)")
     ap.add_argument("--hwaccel", default="auto", help="auto | none | videotoolbox | d3d11va ...")
     ap.add_argument("--seconds", type=float, default=0)
     ap.add_argument("--out", default="", help="JSONL per scored frame")
@@ -76,7 +78,8 @@ def main() -> None:
     else:
         host, port = args.srt.rsplit(":", 1)
         cmd += ["-i", srt_url(host, int(port), "caller", args.latency, args.token)]
-    cmd += ["-map", "0:v:0", "-fps_mode", "passthrough", "-vf", f"crop=iw:{args.band}:0:0,format=gray",
+    crop = args.crop or f"iw:{args.band}:0:ih-{args.band}"
+    cmd += ["-map", "0:v:0", "-fps_mode", "passthrough", "-vf", f"crop={crop},format=gray",
             "-f", "rawvideo", "-"]
     print(" ".join(cmd), file=sys.stderr, flush=True)
     proc = subprocess.Popen(cmd, stdin=None if args.stdin else subprocess.DEVNULL,
@@ -129,7 +132,22 @@ def main() -> None:
                     row = buf[y * width: (y + 1) * width]
                     x0 = probe.find_strip(row)
                     if x0 is not None:
+                        # Center vertically too: edge rows blur under 4:2:0.
+                        def ok(yy: int) -> bool:
+                            if not 0 <= yy < band:
+                                return False
+                            r = buf[yy * width: (yy + 1) * width]
+                            return probe.decode_bits(probe.sample_row(r, x0)) is not None
+                        lo = hi = y
+                        while ok(lo - 1):
+                            lo -= 1
+                        while ok(hi + 1):
+                            hi += 1
+                        y = (lo + hi) // 2
+                        row = buf[y * width: (y + 1) * width]
                         lock = (y, x0)
+                        print(f"strip locked at row {y}, x {x0} (in scanned region)",
+                              file=sys.stderr, flush=True)
                         decoded = probe.decode_bits(probe.sample_row(row, x0))
                         break
             if decoded is None:

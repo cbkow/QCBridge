@@ -41,11 +41,12 @@ def build_frame(width: int, height: int, bits: list[int], noise: bool) -> bytes:
     b = probe.BLOCK_PX
     frame = bytearray(os.urandom(width * height)) if noise else bytearray(width * height)
     band = 3 * b
-    frame[: band * width] = bytes(band * width)  # black backdrop row band
+    top = height - 48 - band  # same place as the addon: bottom-left, 48 px up
+    frame[top * width: (top + band) * width] = bytes(band * width)  # backdrop
     for i, bit in enumerate(bits):
         if bit:
             x = b + i * b
-            for y in range(b, 2 * b):
+            for y in range(top + b, top + 2 * b):
                 start = y * width + x
                 frame[start: start + b] = b"\xeb" * b
     return bytes(frame)
@@ -74,7 +75,8 @@ def main() -> None:
            "-r", str(args.fps), "-i", "-",
            *encoder_args(args.fps, args.bitrate, args.encoder)]
     if args.stdout:
-        cmd += ["-f", "hevc", "-"]
+        # AUD NALs mark access-unit boundaries for pipe consumers (kyber-pipe).
+        cmd += ["-bsf:v", "hevc_metadata=aud=insert", "-f", "hevc", "-"]
     else:
         host, port = args.srt_listen.rsplit(":", 1)
         cmd += ["-f", "mpegts", srt_url(host, int(port), "listener", args.latency, args.token)]

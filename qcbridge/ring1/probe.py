@@ -6,6 +6,9 @@ on the HOST machine decodes the strip and subtracts. QCView always runs next
 to the host, so both timestamps come from one machine clock in every OS
 pairing — no clock sync.
 
+The strip sits near the BOTTOM-left of the viewport (above the status
+text), so readers scan a bottom band by default.
+
 Strip layout (one row of square blocks, white = 1):
   8-bit marker | 32-bit host ms (mod 2**32) | 16-bit seq | 8-bit check
 Blocks are large on purpose: they must survive 4:2:0 HEVC at any rung.
@@ -93,7 +96,12 @@ def find_strip(row: bytes, block: int = BLOCK_PX) -> int | None:
         ):
             continue
         if decode_bits(sample_row(row, x0, block)) is not None:
-            return x0
+            # Every x0 inside the blocks decodes; the first one hugs a block
+            # edge, where compression blur flips bits. Lock on the middle.
+            last = x0
+            while last + 1 <= len(row) - span and decode_bits(sample_row(row, last + 1, block)):
+                last += 1
+            return (x0 + last) // 2
     return None
 
 

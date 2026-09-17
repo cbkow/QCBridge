@@ -49,6 +49,9 @@ def _tick():
             # motion (Cycles reset included), not a static redraw.
             step = Quaternion((0.0, 0.0, 1.0), _orbit_rad_s * _INTERVAL)
             rv3d.view_rotation = step @ rv3d.view_rotation
+            # view_matrix only refreshes on draw: the packet below carries
+            # the previous tick's rotation (≤ 1 host tick of unmeasured lag).
+            area.tag_redraw()
         matrix = rv3d.view_matrix
         state = protocol.HotState(
             frame=bpy.context.scene.frame_current,

@@ -76,6 +76,39 @@ def build_command(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> list
     return cmd
 
 
+# An SRT listener serves ONE viewer; when it leaves, the mux fails and
+# ffmpeg should exit so we respawn for the next one. On macOS the
+# avfoundation input thread can keep ffmpeg alive (ignoring SIGTERM) after
+# that error — found live 2026-09-17 — so a fatal output line arms a kill.
+_FATAL_OUTPUT = ("Error muxing a packet", "Error writing trailer", "Error closing file")
+_FATAL_GRACE_S = 2.0
+
+
+def is_fatal_output_line(line: str) -> bool:
+    return any(marker in line for marker in _FATAL_OUTPUT)
+
+
+def _pump_log(proc: subprocess.Popen, log) -> None:
+    """Copy ffmpeg's stderr to the log; kill a process that reported a fatal
+    output error but hasn't exited within the grace period."""
+    fatal_at = None
+    for raw in iter(proc.stderr.readline, b""):
+        log.write(raw)
+        log.flush()
+        if fatal_at is None and is_fatal_output_line(raw.decode(errors="replace")):
+            fatal_at = time.monotonic()
+            threading.Thread(
+                target=_kill_if_stuck, args=(proc,), name="qcb-pixel-reap", daemon=True
+            ).start()
+
+
+def _kill_if_stuck(proc: subprocess.Popen) -> None:
+    try:
+        proc.wait(timeout=_FATAL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
 def _supervise(cmd: list[str], log_path: Path) -> None:
     global _proc, _status
     while not _stop.is_set():
@@ -83,12 +116,19 @@ def _supervise(cmd: list[str], log_path: Path) -> None:
             log.write(f"\n--- spawn {time.ctime()} ---\n".encode())
             log.flush()
             try:
-                _proc = subprocess.Popen(cmd, stdout=log, stderr=log)
+                _proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
             except OSError as exc:
                 _status = f"ffmpeg spawn failed: {exc}"
                 return
             _status = "streaming"
+            pump = threading.Thread(
+                target=_pump_log, args=(_proc, log), name="qcb-pixel-log", daemon=True
+            )
+            pump.start()
             _proc.wait()
+            pump.join(timeout=2.0)
         if _stop.is_set():
             break
         _status = f"ffmpeg exited ({_proc.returncode}) — restarting"
