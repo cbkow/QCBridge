@@ -17,7 +17,7 @@ import bpy
 from mathutils import Matrix
 
 from ..ring1 import protocol
-from . import bootstrap, kiosk, pixel_path, tier2_io
+from . import bootstrap, kiosk, overlay, pixel_path, tier2_io
 from .identity import UUID_PROP
 
 _TICK = 0.015
@@ -568,6 +568,16 @@ def _tick_inner(transport):
         _handle_new_session()
     start = time.monotonic()
     packed = transport.poll_hot()
+    if packed is not None:
+        stamped = protocol.unpack_hot(packed)
+        if stamped is not None and stamped.t_host:
+            # Parity probe: the strip must show the newest stamp even on a
+            # static view, so it redraws on every stamped packet.
+            overlay.set_probe(stamped.t_host, stamped.probe_seq)
+            probe_area = _target_view()
+            if probe_area is not None:
+                probe_area.tag_redraw()
+        packed = protocol.hot_core(packed)
     if packed is not None and packed != _last_hot:
         _apply_hot(packed)
         _last_hot = packed

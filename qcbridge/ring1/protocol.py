@@ -24,6 +24,9 @@ _HOT_MAGIC = b"QCB2"
 FLAG_PERSP = 1 << 0
 FLAG_HOLD = 1 << 1  # reserved: follow/hold ships stage 3
 FLAG_CAMERA = 1 << 2  # host viewport is looking through the camera
+# Parity-spike probe (ring1/probe.py): optional trailing host wall clock +
+# seq. Absent unless QCB_PROBE=1, so production packets are unchanged.
+_HOT_PROBE = struct.Struct("<dI")
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,8 @@ class HotState:
     camera: bool = False       # view_perspective == 'CAMERA'
     cam_zoom: float = 0.0      # rv3d.view_camera_zoom
     cam_offset: tuple = (0.0, 0.0)
+    t_host: float = 0.0        # probe only: host time.time() at sampling
+    probe_seq: int = 0         # probe only
 
     def pack(self) -> bytes:
         flags = (
@@ -51,14 +56,23 @@ class HotState:
             _HOT_MAGIC, flags, self.frame,
             self.lens, self.clip_start, self.clip_end, *self.view_matrix,
             self.cam_zoom, self.cam_offset[0], self.cam_offset[1],
-        )
+        ) + (_HOT_PROBE.pack(self.t_host, self.probe_seq) if self.t_host else b"")
+
+
+def hot_core(data: bytes) -> bytes:
+    """The view/frame part of a hot packet — what dedup compares. Probe
+    stamps change every tick and must not defeat the static-view dedup."""
+    return data[: _HOT.size]
 
 
 def unpack_hot(data: bytes) -> HotState | None:
-    if len(data) != _HOT.size:
+    t_host, probe_seq = 0.0, 0
+    if len(data) == _HOT.size + _HOT_PROBE.size:
+        t_host, probe_seq = _HOT_PROBE.unpack(data[_HOT.size:])
+    elif len(data) != _HOT.size:
         return None
     (magic, flags, frame, lens, clip_start, clip_end,
-     *rest) = _HOT.unpack(data)
+     *rest) = _HOT.unpack(data[: _HOT.size])
     if magic != _HOT_MAGIC:
         return None
     matrix, cam = rest[:16], rest[16:]
@@ -68,6 +82,7 @@ def unpack_hot(data: bytes) -> HotState | None:
         is_persp=bool(flags & FLAG_PERSP), hold=bool(flags & FLAG_HOLD),
         camera=bool(flags & FLAG_CAMERA),
         cam_zoom=cam[0], cam_offset=(cam[1], cam[2]),
+        t_host=t_host, probe_seq=probe_seq,
     )
 
 

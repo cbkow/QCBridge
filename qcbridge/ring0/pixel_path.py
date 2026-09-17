@@ -19,6 +19,11 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    from ..ring1 import probe
+except ImportError:  # file-imported by tests with qcbridge/ on sys.path
+    from ring1 import probe
+
 _RESTART_BACKOFF = 2.0
 
 # Encoder rungs judged on a production scene (windows-v0-matrix/notes.md).
@@ -41,9 +46,10 @@ def build_command(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> list
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}passphrase={passphrase}&pbkeylen=16"
 
+    fps = probe.capture_fps()  # 30 unless the parity spike overrides it
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "warning"]
     if sys.platform == "win32":
-        cmd += ["-filter_complex", "ddagrab=output_idx=0:framerate=30:draw_mouse=0"]
+        cmd += ["-filter_complex", f"ddagrab=output_idx=0:framerate={fps}:draw_mouse=0"]
         if rung == "hevc_10_444_50":
             # True 4:4:4 needs the CPU path — NVENC silently downgrades 4:4:4
             # requests on GPU frames (verify receiver-side, always).
@@ -55,14 +61,14 @@ def build_command(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> list
         # for nothing we need; ull + bf 0 keep the encoder frame-in/frame-out.
         cmd += [
             "-preset", "p4", "-tune", "ull", "-delay", "0", "-bf", "0",
-            "-b:v", bitrate, "-g", "30",
+            "-b:v", bitrate, "-g", str(fps),
         ]
     elif sys.platform == "darwin":
         cmd += [
-            "-f", "avfoundation", "-capture_cursor", "0", "-framerate", "30",
+            "-f", "avfoundation", "-capture_cursor", "0", "-framerate", str(fps),
             "-i", "Capture screen 0",
             "-c:v", "hevc_videotoolbox", "-profile:v", "main10",
-            "-pix_fmt", "p010le", "-b:v", bitrate, "-g", "30", "-realtime", "1",
+            "-pix_fmt", "p010le", "-b:v", bitrate, "-g", str(fps), "-realtime", "1",
         ]
     else:
         raise RuntimeError("no capture path for this platform")
