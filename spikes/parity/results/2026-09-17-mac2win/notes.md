@@ -11,24 +11,31 @@ Path: Windows 192.168.40.199 → 192.168.40.1 → Mac 192.168.80.2, ping RTT
 ## Clock correction
 
 The sender stamps with the Mac clock and the reader subtracts on the Windows
-clock, so raw = true + (Windows − Mac).
-true = raw + (apple − windows) + (mac − apple), both measured against time.apple.com.
+clock, so raw = true + (windows − mac), i.e.
+**true = raw + (apple − windows) − (apple − mac)**, both offsets written as
+server − local, which is what `w32tm /stripchart` and `sntp` print.
 
-- Windows (`w32tm /stripchart`, remote − local, 3 samples right before each run):
-  +8.8 ms at 15:33 UTC (srt120), +9.1 ms at 15:52 UTC (srt20). Stable ±0.1 ms.
-- Mac (`sntp`, relayed): about −1 ± 5 ms (last two readings: +0.3, −2.1).
-  I applied it as given (true = raw + Win + Mac). Either sign convention
-  changes the result by ≤2 ms, which is inside the ±5 ms.
+- Sign verified at 16:03 UTC with a hand-rolled SNTP query from Windows
+  (offset = ((T2−T1)+(T3−T4))/2): +9.3…+9.4 ms, matching w32tm's +8.7 ms.
+  **The Windows clock is ~9 ms behind time.apple.com.**
+- Windows (`w32tm`, 3 samples right before each run): +8.8 ms at 15:33 UTC
+  (srt120), +9.1 ms at 15:52 UTC (srt20). Stable ±0.1 ms.
+- Mac (`sntp`, relayed): about −1 ms (last two readings: +0.3, −2.1), taken
+  as apple − mac = −1 (Mac ~1 ms ahead). Mac sntp scatter is ±5 ms, and it
+  dominates the uncertainty.
 
-| Label | SRT latency | Raw p50 | p95 | p99 | Win offset | Mac offset | Corrected p50 / p95 | Frames scored / failed / stale |
+| Label | SRT latency | Raw p50 | p95 | p99 | apple − win | apple − mac | Corrected p50 / p95 | Frames scored / failed / stale |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| mac2win-srt120 | 120 | 260 | 273 | 275 | +8.8 | −1 | **268 / 281** (±5) | 1802 / 0 / 0 |
-| mac2win-srt20 | 20 | 155 | 163 | 164 | +9.1 | −1 | **163 / 171** (±5) | 1802 / 0 / 0 |
+| mac2win-srt120 | 120 | 260 | 273 | 275 | +8.8 | −1 | **270 / 283** (±5) | 1802 / 0 / 0 |
+| mac2win-srt20 | 20 | 155 | 163 | 164 | +9.1 | −1 | **165 / 173** (±5) | 1802 / 0 / 0 |
+
+For the reverse direction (Windows sender, Mac reader) the sign flips:
+true = raw − (apple − windows) + (apple − mac).
 
 ## Readings
 
-- **Over the VPN vs Mac loopback (both corrected):** srt120 268 vs 251 (+17),
-  srt20 163 vs 151 (+12). That covers the ~4 ms one-way network path plus a
+- **Over the VPN vs Mac loopback (both corrected):** srt120 270 vs 251 (+19),
+  srt20 165 vs 151 (+14). That covers the ~4 ms one-way network path plus a
   different decoder (d3d11va on the Windows reader vs VT on the Mac). The
   VideoToolbox encoder's ~70 ms still dominates a Mac replica.
 - **srt120 step at ~18 s:** p50 by 6 s window: 256, 256, 258, **269, 269**.
