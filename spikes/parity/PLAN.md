@@ -73,6 +73,57 @@ Plank references for S6/S7:
 - **Repo:** github.com/instinctual/plank. Don't copy code without checking its
   license; the transport boundary is AGPL.
 
+## S5 design requirements (build the seams now, features later)
+
+S5 must leave room for the capabilities below, even though it ships none of
+them:
+
+1. **Hot lane = keyed latest-wins map**, not a single camera slot. Key =
+   property path (`obj.matrix`, `light.energy`); the replica applies the
+   newest value per key. Enables live in-progress drags.
+2. **Generic request/reply RPC on the reliable lane**, replica answers only —
+   never initiates. Used by health reporting, supervision and still capture.
+   **Requests originate in host Blender, never in QCView.**
+3. **Peer model is not hardcoded to one replica.** Per-peer dirty-set `sent`
+   tracking, epoch and bootstrap state, so several replicas remain possible
+   later (shelved, see below).
+4. **The helper owns replica Blender's lifecycle** (launch, kiosk, restart,
+   later addon update). On Windows it must run in the interactive user
+   session, not a service in session 0, or GUI + capture fail.
+5. **TLS pairing with trust-on-first-use fingerprints.** Pairing creates each
+   machine's certificate once and shows its fingerprint for confirmation. No
+   pin-or-error as in the spike.
+
+## Feature candidates after S8 (agreed worth building)
+
+| Feature | What it is | Notes |
+| --- | --- | --- |
+| **Live in-progress drags** | Host streams what is being manipulated at 60 Hz on the hot lane; the reliable tier-1 delta on release stays the source of truth | Today a drag crosses at ~20 Hz via the 50 ms flush tick (`host_handlers.py:32`). Worth up to ~50 ms plus smoothness |
+| **Encryption of sync traffic** | TLS + pinned cert for control/hot/cold, not just the video | Today ZMQ is token-auth only, unencrypted — scene data protected by the VPN alone. Client-IP relevant |
+| **Replica supervision** | Helper launches/restarts Blender, exits kiosk without a keyboard, pushes addon updates (`install-file` keeps prefs), reports GPU/VRAM/encoder health to the host panel | Ends the "check the PC's version first" failure class. Remote update is an RCE surface: paired host only (cert+token), consider signed packages |
+| **Pristine still on demand** | On settle (or a host-panel button) the replica renders at viewport resolution, writes a float EXR to its **temp dir** (never the project tree) and sends it over the reliable lane; QCView shows it beside the live stream | Python cannot read the Cycles viewport buffer (stage-0 finding), so this is a real render: seconds on Cycles. Makes the 8-bit stream a non-issue for exposure judgment |
+| **Remote F12 render** | Same mechanism at production settings, progress over the stream, results land in QCView only | Bigger scope; decide separately |
+
+## Shelved (revisit, do not design away)
+
+- **Several replicas from one host** (live A/B between EEVEE/Cycles, rig
+  variants, two cameras). Chris: likely part of a larger QCView upgrade that
+  is not roadmapped yet. Keep requirement 3 above so it stays possible. It
+  would also need a replica-local override layer ("replica profile": engine,
+  samples, view layer) that sync skips and re-asserts, like the camera-view
+  re-assert in `replica_apply`.
+- **Read-only remote viewers** (a supervisor watching the same stream).
+  Easy with the fan-out, same QCView upgrade question.
+
+## Ruled out (chris, 2026-09-17)
+
+- **QCView controlling Blender in any way** — click-to-select, focus-at-click,
+  pixel queries driven from the viewer. Too close to remote desktop, and then
+  the viewer has no reason to exist. The viewer receives; it never drives.
+- **Forwarding raw keyboard/mouse to the replica** — same reason.
+- **Transporting missing media/caches over the wire** — the assumption that
+  all media is available on both machines still holds.
+
 ## Kyber patches (fork of plank-kymux @ 912ece5), as phases need them
 
 1. **Raw latest-wins datagram lane** for hot state (S5). kyproto's router
