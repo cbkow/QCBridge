@@ -26,14 +26,30 @@ if E("QCB_SMOKE_ENGINE"):
     bpy.context.scene.render.engine = E("QCB_SMOKE_ENGINE")
     if E("QCB_SMOKE_ENGINE") == "CYCLES":
         bpy.context.scene.cycles.device = "GPU"  # replica picks the backend
+# Bootstrap bench: QCB_SMOKE_HEAVY=N adds N million random-offset vertices
+# (incompressible-ish mesh data) so the bootstrap blob is large.
+if E("QCB_SMOKE_HEAVY"):
+    import random
+
+    import bmesh
+    n = int(float(E("QCB_SMOKE_HEAVY")) * 1_000_000)
+    mesh = bpy.data.meshes.new("Heavy")
+    mesh.vertices.add(n)
+    rnd = random.Random(7)
+    mesh.vertices.foreach_set("co", [rnd.uniform(-5, 5) for _ in range(n * 3)])
+    mesh.update()
+    obj = bpy.data.objects.new("Heavy", mesh)
+    obj.hide_viewport = True  # bench the wire, not the viewport
+    bpy.context.scene.collection.objects.link(obj)
+_T_START = time.time()
 session.start(prefs)
 
 def _dump():
-    d = {"t": time.time(), "note": session.state.get("note"),
+    d = {"t": time.time(), "t_start": _T_START, "note": session.state.get("note"),
          "peer": session.state.get("peer_status"),
          "sync_seq": getattr(session.state.get("sync"), "seq", None)}
     with open(os.path.join(OUT, "host.json"), "w") as f:
         json.dump(d, f, default=str)
-    return 1.0
+    return float(E("QCB_SMOKE_DUMP", "1.0"))
 
 bpy.app.timers.register(_dump, first_interval=1.0, persistent=True)

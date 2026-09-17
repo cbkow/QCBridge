@@ -15,6 +15,7 @@ OUT = sys.argv[sys.argv.index("--") + 1]  # work dir: pysite/ (unzipped pyzmq wh
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(OUT, "pysite"))
 from qcbridge.ring0 import pixel_path, replica_apply, session  # noqa: E402
+from qcbridge.ring1 import protocol  # noqa: E402
 
 E = os.environ.get
 prefs = SimpleNamespace(
@@ -48,9 +49,12 @@ def _dump():
          "stats": {k: v for k, v in replica_apply.stats.items()},
          "region_xywh_window_xywh": region,
          "session_note": session.state.get("note"),
+         "hot_seq": (lambda h: protocol.unpack_hot(h).probe_seq if h else None)(
+             session.state["transport"].poll_hot()),
+         "transport_stats": getattr(session.state["transport"], "stats", None),
          "ffmpeg_note": session.state.get("ffmpeg_note", "")}
     with open(os.path.join(OUT, "replica.json"), "w") as f:
         json.dump(d, f)
-    return 1.0
+    return float(E("QCB_SMOKE_DUMP", "1.0"))
 
 bpy.app.timers.register(_dump, first_interval=1.0, persistent=True)

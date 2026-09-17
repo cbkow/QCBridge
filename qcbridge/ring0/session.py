@@ -7,14 +7,43 @@ it works purely on strings captured at session start.
 
 from __future__ import annotations
 
+import os
 import uuid as _uuid
 
 import bpy
 
 from ..ring1 import pathmap, protocol, toolbox
 from ..ring1.transport import TransportConfig
-from ..ring1.transport_zmq import HostTransportZmq, ReplicaTransportZmq
 from . import host_handlers, host_hot, kiosk, overlay, pixel_path, replica_apply
+
+_KYBER_VIDEO_PORT = 19997  # host-local TCP port the helper serves the stream on
+
+
+def _use_kyber(prefs) -> bool:
+    """Transport switch while the Kyber path is proven (parity plan S5):
+    QCB_TRANSPORT=kyber, or a `transport` pref. Both ends must agree."""
+    kind = os.environ.get("QCB_TRANSPORT") or getattr(prefs, "transport", "zmq")
+    return str(kind).lower() == "kyber"
+
+
+def _make_transport(prefs, cfg: TransportConfig, role: str):
+    # Imported lazily: the Kyber path must not need pyzmq, nor zmq the helper.
+    if _use_kyber(prefs):
+        from ..ring1 import transport_kyber
+
+        cls = (transport_kyber.HostTransportKyber if role == "HOST"
+               else transport_kyber.ReplicaTransportKyber)
+    else:
+        from ..ring1 import transport_zmq
+
+        cls = (transport_zmq.HostTransportZmq if role == "HOST"
+               else transport_zmq.ReplicaTransportZmq)
+    return cls(cfg)
+
+
+def _kyber_cert_dir() -> str:
+    """Stable across sessions, or the host's pinned fingerprint would break."""
+    return os.path.join(bpy.utils.user_resource("CONFIG"), "qcbridge-cert")
 
 _HANDSHAKE_TIMEOUT = 3.0
 _HANDSHAKE_RETRY = 2.0
@@ -157,8 +186,14 @@ def _start_host(prefs) -> None:
         port_control=prefs.port_control,
         port_hot=prefs.port_hot,
         port_cold=prefs.port_cold,
+        token=prefs.token,
+        helper_path=getattr(prefs, "helper_path", ""),
+        fingerprint=getattr(prefs, "replica_fingerprint", ""),
+        video_listen=(
+            f"127.0.0.1:{_KYBER_VIDEO_PORT}" if getattr(prefs, "enable_stream", True) else ""
+        ),
     )
-    transport = HostTransportZmq(cfg)
+    transport = _make_transport(prefs, cfg, "HOST")
     transport.start()
     state["transport"] = transport
     state["note"] = address_error or "connecting"
@@ -225,8 +260,15 @@ def _start_replica(prefs) -> None:
         port_control=prefs.port_control,
         port_hot=prefs.port_hot,
         port_cold=prefs.port_cold,
+        token=prefs.token,
+        helper_path=getattr(prefs, "helper_path", ""),
+        cert_dir=_kyber_cert_dir() if _use_kyber(prefs) else "",
     )
-    transport = ReplicaTransportZmq(cfg)
+    transport = _make_transport(prefs, cfg, "REPLICA")
+    if _use_kyber(prefs):
+        pixel_path.set_external(transport.stop_video, lambda: transport.video_state)
+    else:
+        pixel_path.set_external()
     token = prefs.token
     epoch = state["epoch"]
 
@@ -316,10 +358,13 @@ def _start_pixel_path(prefs) -> None:
         return
     state["pixel_resolving"] = True
     # bpy reads happen HERE, main thread; the worker gets plain strings.
+    kyber = _use_kyber(prefs)
     args = (
-        prefs.ffmpeg_path, prefs.encoder_rung, _replica_srt_url(prefs),
-        protocol.srt_passphrase(prefs.token),
+        prefs.ffmpeg_path, prefs.encoder_rung,
+        pixel_path.PIPE_OUTPUT if kyber else _replica_srt_url(prefs),
+        "" if kyber else protocol.srt_passphrase(prefs.token),
     )
+    transport = state.get("transport")
 
     def _resolve_and_start():
         try:
@@ -328,7 +373,14 @@ def _start_pixel_path(prefs) -> None:
                 state["ffmpeg_note"] = f"stream OFF — ffmpeg {source}"
                 return
             state["ffmpeg_note"] = f"ffmpeg: {source}"
-            pixel_path.start(ffmpeg, args[1], args[2], args[3])
+            if kyber:
+                # The helper owns the capture child and sends it down the one
+                # Kyber connection (S6/S7 replace the child with native capture).
+                transport.start_video(
+                    pixel_path.build_command(ffmpeg, args[1], args[2], args[3])
+                )
+            else:
+                pixel_path.start(ffmpeg, args[1], args[2], args[3])
         finally:
             state["pixel_resolving"] = False
 
@@ -369,6 +421,10 @@ def viewer_url() -> str:
     prefs = state.get("prefs")
     if not stream.get("enabled") or prefs is None:
         return ""
+    if _use_kyber(prefs):
+        # The host's helper re-serves the stream locally as Annex-B HEVC.
+        port = getattr(state.get("transport"), "video_port", 0)
+        return f"tcp://127.0.0.1:{port}" if port else ""
     latency_us = int(stream.get("latency_ms", 300)) * 1000
     url = (
         f"srt://{prefs.replica_address}:{stream.get('port', 9998)}"

@@ -26,6 +26,13 @@ class TransportConfig:
     port_cold: int
     heartbeat_interval: float = 1.0
     heartbeat_misses: int = 3
+    # Kyber transport only (transport_kyber.py); one UDP port = port_control.
+    token: str = ""         # QUIC-level auth, on top of the hello token check
+    helper_path: str = ""   # qcb-helper binary; empty = auto-discover
+    fingerprint: str = ""   # host: pinned replica cert SHA-256; empty = trust on first use
+    cert_dir: str = ""      # replica: where its certificate lives
+    video_listen: str = ""  # host: "127.0.0.1:PORT" serving the stream to the viewer
+    cap_mbps: float = 0.0   # replica: wire-rate cap; 0 = helper default
 
 
 class HostTransport(Protocol):

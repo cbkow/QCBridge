@@ -26,6 +26,10 @@ except ImportError:  # file-imported by tests with qcbridge/ on sys.path
 
 _RESTART_BACKOFF = 2.0
 
+# build_command(srt_url=PIPE_OUTPUT): Annex-B HEVC with AUDs on stdout, for
+# the Kyber helper (which owns and supervises the child in that mode).
+PIPE_OUTPUT = "pipe:"
+
 # Encoder rungs judged on a production scene (windows-v0-matrix/notes.md).
 _RUNG_BITRATE = {
     "hevc_10_420_100": "100M",
@@ -72,7 +76,15 @@ def build_command(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> list
         ]
     else:
         raise RuntimeError("no capture path for this platform")
-    cmd += ["-f", "mpegts", url]
+    if srt_url == PIPE_OUTPUT:
+        # Raw HEVC carries no timestamps, so ffmpeg defaults to constant-rate
+        # output and pads with duplicate frames; at a 120 Hz capture the
+        # encoder then falls behind and latency grows without bound (seen
+        # live: 90 s behind after 90 s). Pass frames through as captured.
+        cmd += ["-fps_mode", "passthrough",
+                "-bsf:v", "hevc_metadata=aud=insert", "-f", "hevc", "-"]
+    else:
+        cmd += ["-f", "mpegts", url]
     return cmd
 
 
@@ -150,8 +162,23 @@ def start(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> None:
     _thread.start()
 
 
+_external = None  # (stop_fn, state_fn): the Kyber helper owns the child instead
+_EXTERNAL_STATUS = {"running": "streaming", "restarting": "ffmpeg exited — restarting",
+                    "spawn_failed": "ffmpeg spawn failed", "off": "off", "": "off"}
+
+
+def set_external(stop_fn=None, state_fn=None) -> None:
+    """Kyber transport: capture runs as the helper's child, so stop()/status()
+    — called from goodbye handling, the panel and pong status — defer to it."""
+    global _external
+    _external = (stop_fn, state_fn) if stop_fn and state_fn else None
+
+
 def stop() -> None:
     global _thread, _proc
+    if _external is not None:
+        _external[0]()
+        return
     _stop.set()
     if _proc is not None and _proc.poll() is None:
         _proc.terminate()
@@ -166,4 +193,7 @@ def stop() -> None:
 
 
 def status() -> str:
+    if _external is not None:
+        state = _external[1]()
+        return _EXTERNAL_STATUS.get(state, state)
     return _status

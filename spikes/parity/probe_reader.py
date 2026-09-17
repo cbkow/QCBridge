@@ -52,6 +52,8 @@ def main() -> None:
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--srt", metavar="HOST:PORT", help="call an SRT listener")
     src.add_argument("--stdin", action="store_true", help="Annex-B HEVC on stdin")
+    src.add_argument("--tcp", metavar="HOST:PORT",
+                     help="Annex-B HEVC from the host helper's local video port (Kyber transport)")
     ap.add_argument("--latency", type=int, default=120, help="SRT latency, ms")
     ap.add_argument("--token", default="")
     ap.add_argument("--band", type=int, default=128, help="rows from the bottom to scan")
@@ -75,6 +77,8 @@ def main() -> None:
         cmd += ["-hwaccel", hw]
     if args.stdin:
         cmd += ["-f", "hevc", "-i", "-"]
+    elif args.tcp:
+        cmd += ["-f", "hevc", "-i", f"tcp://{args.tcp}"]
     else:
         host, port = args.srt.rsplit(":", 1)
         cmd += ["-i", srt_url(host, int(port), "caller", args.latency, args.token)]
