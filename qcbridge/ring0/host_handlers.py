@@ -233,6 +233,7 @@ class HostSync:
         and force-resync). Chunks drain through flush_tick under
         backpressure; explicit, so it proceeds even while paused."""
         data = bootstrap.serialize_mainfile()
+        self.last_bootstrap_bytes = len(data)
         meta = {
             "uuid": "__mainfile__",
             "name": bpy.path.basename(bpy.data.filepath) or "untitled",

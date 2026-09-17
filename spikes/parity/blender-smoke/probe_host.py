@@ -48,14 +48,20 @@ _boot = {"s": None}
 
 
 def _dump():
-    # Bootstrap time measured on the host clock alone: the replica's pong
-    # status reports seq >= 1 once the bootstrap has been applied.
     transport = session.state.get("transport")
     status = getattr(transport, "peer_status", None) or {}
-    if _boot["s"] is None and status.get("seq", 0) >= 1:
+    # Transfer time on the host clock alone: every cold message the host has
+    # sent (bootstrap chunks included) is counted by the replica and reported
+    # back on its pong. Done = the replica's seq caught up with ours. Pongs
+    # are 1 s apart, so this is good to about a second.
+    sync = session.state.get("sync")
+    sent = getattr(sync, "seq", 0)
+    if (_boot["s"] is None and sent > 0 and status.get("seq") == sent
+            and getattr(sync, "last_bootstrap_bytes", 0)):
         _boot["s"] = round(time.time() - _T_START, 2)
     d = {"t": time.time(), "t_start": _T_START, "note": session.state.get("note"),
          "peer": status, "boot_s": _boot["s"],
+         "boot_bytes": getattr(session.state.get("sync"), "last_bootstrap_bytes", None),
          "link_note": getattr(transport, "link_note", ""),
          "peer_fingerprint": getattr(transport, "peer_fingerprint", ""),
          "transport_stats": getattr(transport, "stats", None),
