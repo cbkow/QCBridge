@@ -44,9 +44,21 @@ if E("QCB_SMOKE_HEAVY"):
 _T_START = time.time()
 session.start(prefs)
 
+_boot = {"s": None}
+
+
 def _dump():
+    # Bootstrap time measured on the host clock alone: the replica's pong
+    # status reports seq >= 1 once the bootstrap has been applied.
+    transport = session.state.get("transport")
+    status = getattr(transport, "peer_status", None) or {}
+    if _boot["s"] is None and status.get("seq", 0) >= 1:
+        _boot["s"] = round(time.time() - _T_START, 2)
     d = {"t": time.time(), "t_start": _T_START, "note": session.state.get("note"),
-         "peer": session.state.get("peer_status"),
+         "peer": status, "boot_s": _boot["s"],
+         "link_note": getattr(transport, "link_note", ""),
+         "peer_fingerprint": getattr(transport, "peer_fingerprint", ""),
+         "transport_stats": getattr(transport, "stats", None),
          "sync_seq": getattr(session.state.get("sync"), "seq", None)}
     with open(os.path.join(OUT, "host.json"), "w") as f:
         json.dump(d, f, default=str)
