@@ -143,6 +143,8 @@ def main() -> None:
                             lo -= 1
                         while ok(hi + 1):
                             hi += 1
+                        if hi - lo + 1 < block // 2:
+                            continue  # a real strip decodes on many rows; noise doesn't
                         y = (lo + hi) // 2
                         row = buf[y * width: (y + 1) * width]
                         lock = (y, x0)

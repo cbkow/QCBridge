@@ -89,7 +89,11 @@ def find_strip(row: bytes, block: int = BLOCK_PX) -> int | None:
     """x0 of a strip whose marker AND check decode on this row, else None."""
     span = TOTAL_BITS * block
     half = block // 2
-    for x0 in range(0, len(row) - span + 1):
+    for x0 in range(block, len(row) - span - block + 1):
+        # Both strip drawers put an opaque black block either side; noise
+        # rarely does. Without this, random noise passes marker + 8-bit check.
+        if row[x0 - half] >= 64 or row[x0 + span + half] >= 64:
+            continue
         if any(
             (row[x0 + i * block + half] >= 128) != bool(m)
             for i, m in enumerate(MARKER)
@@ -99,7 +103,7 @@ def find_strip(row: bytes, block: int = BLOCK_PX) -> int | None:
             # Every x0 inside the blocks decodes; the first one hugs a block
             # edge, where compression blur flips bits. Lock on the middle.
             last = x0
-            while last + 1 <= len(row) - span and decode_bits(sample_row(row, last + 1, block)):
+            while last + 1 <= len(row) - span - block and decode_bits(sample_row(row, last + 1, block)):
                 last += 1
             return (x0 + last) // 2
     return None
