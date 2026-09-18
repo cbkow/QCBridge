@@ -60,7 +60,7 @@ Host Blender addon <-stdio frames-> Host helper (Rust+Kyber) <==QUIC: control/ho
 
 | Phase | Deliverable | Exit criteria |
 | --- | --- | --- |
-| **S5 One connection** (DONE on Mac + over the VPN with a Windows replica — `results/2026-09-17-s5-one-connection/`, `results/2026-09-17-s5-vpn/`; open: Windows-side notes, replica-unreachable-after-hard-kill incident, QCView tcp:// intake, fingerprint UI) | Helper with all lanes (video still fed by ffmpeg, as in `kyber-pipe`); `transport_kyber.py`; addon↔helper framing | 21-check sync smoke suite passes over Kyber (scripts in the project memory dir `smoke-harness/`); probe ≤ today's Kyber numbers; bootstrap time on a large .blend vs ZMQ |
+| **S5 One connection** (transport DONE on Mac + over the VPN; closes with the Agent, above with a Windows replica — `results/2026-09-17-s5-one-connection/`, `results/2026-09-17-s5-vpn/`; open: Windows-side notes, replica-unreachable-after-hard-kill incident, QCView tcp:// intake, fingerprint UI) | Helper with all lanes (video still fed by ffmpeg, as in `kyber-pipe`); `transport_kyber.py`; addon↔helper framing | 21-check sync smoke suite passes over Kyber (scripts in the project memory dir `smoke-harness/`); probe ≤ today's Kyber numbers; bootstrap time on a large .blend vs ZMQ |
 | **S6 Native Mac capture + encode** | ScreenCaptureKit (x420 IOSurface, minimumFrameInterval 0, queueDepth 3) → VTCompressionSession (RealTime, AllowFrameReordering=NO, PrioritizeEncodingSpeedOverQuality, matched color tags, long GOP, DataRateLimits 2×); max 3 frames in flight, skip don't queue | Mac replica probe within ~15 ms of a Windows replica |
 | **S7 Native Windows capture + encode** | Desktop Duplication or Windows.Graphics.Capture (D3D11) → NVENC SDK: preset P1, CBR with one-frame VBV, zero reorder delay, infinite GOP + IDR on request, split-frame encoding auto at 4K, latest-wins slot | Encode p95 ≤ ~15 ms at 4K60; no periodic-keyframe gaps |
 | **S8 Replica + viewer latency** | Capture the viewport region at stream resolution; apply hot state on arrival (not the 15 ms tick); raise replica redraw rate; QCView newest-frame pacer; converged indicator from sequence labels; pristine keyframe on settle | Motion → decoded frame ~70–85 ms (estimate) |
@@ -72,6 +72,40 @@ Plank references for S6/S7:
   `docs/development/investigations/macos-*`.
 - **Repo:** github.com/instinctual/plank. Don't copy code without checking its
   license; the transport boundary is AGPL.
+
+## The QCBridge Agent (added 2026-09-18, chris: "make it part of the plan")
+
+The per-machine helper becomes a **tray app** (macOS menu bar / Windows
+system tray): one binary, both platforms, both roles, running at login.
+It owns everything that isn't scene reading; the Blender addon stays the
+only thing that understands Blender data and shrinks to deltas + a panel.
+
+**Replica, set and forget:** agent listens with no Blender running (GPU
+idle) → a paired host connects → agent launches Blender (`--python`
+startup script: enable addon, start replica session, kiosk, chosen Blender
+version) → host goodbye / gone N min → agent closes Blender → crash →
+relaunch, host re-bootstraps → version mismatch → host offers the addon
+zip over the connection, agent installs (`install-file` keeps prefs) and
+restarts. Capture + encode live in the agent (S6/S7): on macOS the Screen
+Recording permission attaches to the agent bundle, granted once.
+
+**Host:** addon still runs in Blender; agent holds pairing + pinned
+fingerprint, the connection, the local stream port for QCView, "Open in
+QCView", status/stats. Sync-only mode unchanged.
+
+**Addon ↔ agent:** the S5 stdio framing over a local socket (agent is
+already running). **Constraints:** Windows agent runs in the logged-in
+user's session (logon task, not a service); macOS login item, signed +
+notarized (same pipeline as QCView); idle policy = close on goodbye or
+keep warm N min (Cycles kernels + bootstrap reload cost). Never touches
+the project tree. UI: `tray-icon` + `muda`, minimal settings (pairing
+token, fingerprint confirm, port, Blender path, idle timeout).
+
+**Sequence (closes S5):** (1) agent crate: tray, settings, listener,
+Blender launch/close, local socket → (2) host role: pairing, connection,
+QCView hand-off → (3) remote addon update (pairing-gated; last, it's the
+security-sensitive piece). Then S6/S7 put capture inside the agent.
+Resist scope creep: lifecycle + transport only.
 
 ## S5 design requirements (build the seams now, features later)
 
