@@ -35,10 +35,9 @@ Context (chris): the wire bootstrap happens only at connect, project switch
 or Force Resync; per-change traffic is deltas, and media/caches come from
 the shared file system. A 441 MB blob is a deliberate worst case.
 
-## Incident 2026-09-17: replica unreachable after a hard-killed heavy host
+## Note: replica "unreachable" on 2026-09-17 evening — not a bug
 
-After the first heavy host was killed (SIGKILL) at ~18:33 UTC mid-session,
-new hosts got `QUIC connect: timed out` from the Windows replica until it
-was relaunched the next day. Same scene with a clean host stop on 09-18:
-the replica stayed reachable. Windows-side log findings: see
-`replica-notes.md` (Windows session).
+New hosts got `QUIC connect: timed out` after the first heavy run. Cause:
+chris had closed the replica Blender on the Windows box when he paused the
+session. Nothing to diagnose; recorded so nobody chases it. A clean host
+stop on 09-18 left the replica reachable as expected.
