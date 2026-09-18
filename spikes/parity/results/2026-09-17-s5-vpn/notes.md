@@ -1,4 +1,4 @@
-# 2026-09-17 — S5 over the VPN: Mac host → Windows 4K replica, one Kyber connection (IN PROGRESS)
+# 2026-09-17 — S5 over the VPN: Mac host → Windows 4K replica, one Kyber connection 
 
 Everything on UDP 19990 (`QCB_TRANSPORT=kyber`): sync lanes + video from the
 replica helper's own capture child (ddagrab 60 fps → hevc_nvenc 50M), read on
@@ -16,14 +16,29 @@ Host helper stats: 61 fps, ~36 Mbps, RTT 7.4 ms, 0 holes, 0 QUIC loss. The
 replica accepted a restarted host without a relaunch. Same ballpark as the
 separate-pipeline Kyber run earlier today (~127 / 132).
 
-## Open: heavy bootstrap over the VPN
+## Heavy bootstrap over the VPN (worst-case startup, not a per-change cost)
 
-A 40 M-vertex scene serializes to 441 MB. The first heavy host (18:23:44) got
-all 106 chunks to the replica (replica seq 106 = host seq 106), but no valid
-time was recorded (timer bugs on the Mac side, since fixed: `boot_s` now =
-replica seq caught up with host seq). After that host was killed (~18:33),
-new hosts got `QUIC connect: timed out` — the Windows replica stopped
-answering on UDP 19990. Cause not yet known (Windows-side check requested:
-is Blender wedged applying the 441 MB file, did the helper exit?). Paused
-here by chris; resume with the Windows findings, then one timed heavy run
-per transport (Kyber, ZMQ).
+40 M random vertices → 441 MB compressed bootstrap blob, 106 chunks. Time =
+host session start → replica's pong reports every chunk received (host
+clock only; pongs are 1 s apart). Includes serializing the file on the host.
+
+| Transport | Run (UTC, 2026-09-18) | Time |
+| --- | --- | ---: |
+| Kyber (one connection) | 17:26:27 | **11.6 s** |
+| ZMQ (TCP) | 17:30:21 | **11.65 s** |
+
+Identical: over the VPN both are network-bound (~300 Mbps effective incl.
+serialization), so the loopback difference (Kyber 3.1 s vs ZMQ 1.24 s) does
+not show on a real link. Replica after each: seq 106/106, 0 gaps, 0 errors.
+
+Context (chris): the wire bootstrap happens only at connect, project switch
+or Force Resync; per-change traffic is deltas, and media/caches come from
+the shared file system. A 441 MB blob is a deliberate worst case.
+
+## Incident 2026-09-17: replica unreachable after a hard-killed heavy host
+
+After the first heavy host was killed (SIGKILL) at ~18:33 UTC mid-session,
+new hosts got `QUIC connect: timed out` from the Windows replica until it
+was relaunched the next day. Same scene with a clean host stop on 09-18:
+the replica stayed reachable. Windows-side log findings: see
+`replica-notes.md` (Windows session).
