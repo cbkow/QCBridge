@@ -1,0 +1,49 @@
+[package]
+name = "qcbridge-agent"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+# Links Kyber (LicenseRef-Kyber-Commercial OR AGPL-3.0-or-later): this
+# binary is AGPL-3.0-or-later and ships with its source (see SOURCE_URL in
+# main.rs). The Blender addon (GPL-3) talks to it over a local socket only.
+license = "AGPL-3.0-or-later"
+description = "QCBridge Agent: tray app owning the Kyber connection, capture and Blender's lifecycle"
+
+[workspace]
+
+[lib]
+name = "qcbridge_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qcbridge-agent"
+path = "src/main.rs"
+
+[dependencies]
+kynet = { git = "https://github.com/instinctual/plank-kymux", rev = "912ece5c64787997f978673ca60d313898a3548c", features = ["kynet-quinn"] }
+kyproto = { git = "https://github.com/instinctual/plank-kymux", rev = "912ece5c64787997f978673ca60d313898a3548c" }
+kymux-types = { git = "https://github.com/instinctual/plank-kymux", rev = "912ece5c64787997f978673ca60d313898a3548c" }
+quinn-proto = { version = "=0.11.17", default-features = false }
+
+anyhow = "1.0"
+bytes = "1.10"
+hex = "0.4"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+ring = "0.17"
+rustls = { version = "0.23.31", default-features = false, features = ["logging", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "6"
+rand = "0.8"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util"] }
+tray-icon = "0.20"
+muda = "0.16"
+tao = "0.31"
+
+[patch.crates-io]
+quinn-proto = { path = "vendor/quinn-proto-0.11.17" }
+
+[profile.release]
+debug = 1

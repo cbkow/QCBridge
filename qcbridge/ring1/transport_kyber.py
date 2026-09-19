@@ -1,10 +1,14 @@
 """Kyber implementation of the transport interface (parity plan, phase S5).
 
-One QUIC connection carries every lane. The connection lives in a helper
-process (`qcb-helper`, Rust + Kyber) that this module spawns and talks to over
-stdin/stdout frames — the same supervision pattern as the ffmpeg child, and
-the reason the addon needs no native wheel for this transport. Kyber is AGPL;
-the process boundary keeps it out of the addon.
+One QUIC connection carries every lane. The connection lives outside Blender:
+either in the QCBridge Agent (tray app, already running — the addon attaches
+to its local socket) or, for tests and dev, in a `qcb-helper` process this
+module spawns and talks to over stdin/stdout. Same frames either way. Kyber is
+AGPL; the process boundary keeps it out of the addon.
+
+Mode: QCB_AGENT=spawn forces the helper; otherwise the agent is used when
+QCB_AGENT_PORT/QCB_AGENT_SECRET are set (an agent-launched Blender) or the
+agent's agent.json exists in the user's config dir.
 
 Replica listens, host connects (same topology as transport_zmq). Request /
 reply, heartbeats and pong status stay in Python, byte-compatible with the
@@ -191,6 +195,103 @@ class _HelperLink:
         self.exited.set()
 
 
+def agent_socket_info() -> tuple[str, int, str] | None:
+    """(host, port, secret) of a running agent, or None."""
+    port, secret = os.environ.get("QCB_AGENT_PORT"), os.environ.get("QCB_AGENT_SECRET")
+    if port and secret:
+        return ("127.0.0.1", int(port), secret)
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA", "")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    path = os.path.join(base, "QCBridge", "agent.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            info = json.load(f)
+        return ("127.0.0.1", int(info["port"]), str(info["secret"]))
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def use_agent() -> bool:
+    return os.environ.get("QCB_AGENT", "") != "spawn" and agent_socket_info() is not None
+
+
+class _AgentLink(_HelperLink):
+    """Same frames as the helper, over the agent's local TCP socket. The
+    attach handshake is the first frame; the reply is an `attached` event."""
+
+    def __init__(self, info: tuple[str, int, str], role: str, on_frame: Callable[[int, bytes], None]) -> None:
+        super().__init__([], on_frame)
+        self._info = info
+        self._role = role
+        self._sock = None
+
+    def start(self) -> None:
+        import socket
+
+        host, port, secret = self._info
+        self._sock = socket.create_connection((host, port), timeout=5.0)
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._sock.settimeout(None)
+        self._sock.sendall(self._frame(T_CMD, json.dumps(
+            {"cmd": "attach", "secret": secret, "role": self._role}).encode("utf-8")))
+        for target, name in ((self._read_loop, "qcb-agent-rx"), (self._write_loop, "qcb-agent-tx")):
+            thread = threading.Thread(target=target, name=name, daemon=True)
+            thread.start()
+            self._threads.append(thread)
+
+    def close(self, grace: float = 1.0) -> None:
+        self.cmd(cmd="detach")
+        with self._cv:
+            self._closing = True
+            self._cv.notify()
+        time.sleep(0.05)
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    def _write_loop(self) -> None:
+        while True:
+            with self._cv:
+                while not self._frames and not self._hot and not self._closing:
+                    self._cv.wait()
+                batch = list(self._frames)
+                self._frames.clear()
+                batch.extend(self._hot.values())
+                self._hot.clear()
+                closing = self._closing
+            try:
+                for frame in batch:
+                    self._sock.sendall(frame)
+            except OSError:
+                return
+            if closing and not batch:
+                return
+
+    def _read_exact(self, n: int) -> bytes | None:
+        chunks, got = [], 0
+        while got < n:
+            try:
+                chunk = self._sock.recv(n - got)
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            got += len(chunk)
+        return b"".join(chunks)
+
+
+def _make_link(cfg: TransportConfig, role: str, on_frame, spawn_args: Callable[[], list[str]]):
+    if use_agent():
+        return _AgentLink(agent_socket_info(), role, on_frame)
+    return _HelperLink(spawn_args(), on_frame)
+
+
 def _helper_args(cfg: TransportConfig, role: str) -> list[str]:
     helper = find_helper(getattr(cfg, "helper_path", ""))
     if helper is None:
@@ -222,15 +323,19 @@ class HostTransportKyber:
         self.link_note = ""          # last helper-reported reason for being down
         self.video_port = 0          # localhost TCP port serving Annex-B HEVC
         self.stats: dict = {}
+        self.agent_version = ""      # set in agent mode
 
     def start(self) -> None:
-        args = _helper_args(self._cfg, "host")
-        args += ["--connect", f"{self._cfg.address}:{self._cfg.port_control}"]
-        if getattr(self._cfg, "fingerprint", ""):
-            args += ["--fingerprint", self._cfg.fingerprint]
-        if getattr(self._cfg, "video_listen", ""):
-            args += ["--video-listen", self._cfg.video_listen]
-        self._link = _HelperLink(args, self._on_frame)
+        def spawn_args() -> list[str]:
+            args = _helper_args(self._cfg, "host")
+            args += ["--connect", f"{self._cfg.address}:{self._cfg.port_control}"]
+            if getattr(self._cfg, "fingerprint", ""):
+                args += ["--fingerprint", self._cfg.fingerprint]
+            if getattr(self._cfg, "video_listen", ""):
+                args += ["--video-listen", self._cfg.video_listen]
+            return args
+
+        self._link = _make_link(self._cfg, "host", self._on_frame, spawn_args)
         self._link.start()
         self._stop.clear()
         self._thread = threading.Thread(target=self._io_loop, name="qcb-host-io", daemon=True)
@@ -324,7 +429,12 @@ class HostTransportKyber:
 
     def _handle_event(self, event: dict) -> None:
         name = event.get("event")
-        if name == "peer":
+        if name == "attached":  # agent mode: current state at attach time
+            self.agent_version = event.get("version", "")
+            self.video_port = int(event.get("video_port") or 0)
+            self._link_up = bool(event.get("peer_up"))
+            self.peer_fingerprint = event.get("peer_fingerprint") or ""
+        elif name == "peer":
             self._link_up = bool(event.get("up"))
             if self._link_up:
                 self.peer_fingerprint = event.get("fingerprint") or ""
@@ -386,13 +496,18 @@ class ReplicaTransportKyber:
         self.link_note = ""
         self.video_state = "off"
         self.stats: dict = {}
+        self.agent_version = ""
+        self.quit_requested = False
 
     def start(self) -> None:
-        args = _helper_args(self._cfg, "replica")
-        args += ["--listen", f"{self._cfg.address}:{self._cfg.port_control}"]
-        if getattr(self._cfg, "cert_dir", ""):
-            args += ["--cert-dir", self._cfg.cert_dir]
-        self._link = _HelperLink(args, self._on_frame)
+        def spawn_args() -> list[str]:
+            args = _helper_args(self._cfg, "replica")
+            args += ["--listen", f"{self._cfg.address}:{self._cfg.port_control}"]
+            if getattr(self._cfg, "cert_dir", ""):
+                args += ["--cert-dir", self._cfg.cert_dir]
+            return args
+
+        self._link = _make_link(self._cfg, "replica", self._on_frame, spawn_args)
         self._link.start()
         self._ready.wait(timeout=5.0)
 
@@ -460,10 +575,14 @@ class ReplicaTransportKyber:
         elif kind == T_EVENT:
             event = json.loads(body.decode("utf-8"))
             name = event.get("event")
-            if name == "listening":
+            if name in ("listening", "attached"):
                 self._port = int(event.get("port") or 0)
                 self.fingerprint = event.get("fingerprint") or ""
+                self.agent_version = event.get("version", "")
+                self.video_state = event.get("video_state") or self.video_state
                 self._ready.set()
+            elif name == "quit":
+                self.quit_requested = True  # the agent wants Blender closed
             elif name == "peer":
                 self.link_note = "" if event.get("up") else (event.get("reason") or "")
                 if not event.get("up"):

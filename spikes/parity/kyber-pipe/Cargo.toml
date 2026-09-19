@@ -46,7 +46,7 @@ tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "ti
 # Plank's quinn-proto 0.11.17 with the DATAGRAM send-buffer accounting fix,
 # copied verbatim from plank@20ee198 third_party/quinn-proto-0.11.17 (see
 # README.md "Patched quinn-proto" for why this is vendored, not a git dep).
-quinn-proto = { path = "vendor/quinn-proto-0.11.17" }
+quinn-proto = { path = "../../../agent/vendor/quinn-proto-0.11.17" }
 
 [profile.release]
 debug = 1

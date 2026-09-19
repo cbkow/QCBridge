@@ -5,10 +5,13 @@ qcb-helper processes. Skipped whole-module when the helper isn't built
 (cargo build --release --bin qcb-helper in spikes/parity/kyber-pipe).
 """
 
+import os
 import pathlib
 import socket
 import sys
 import time
+
+os.environ["QCB_AGENT"] = "spawn"  # never attach to a running agent from tests
 
 import pytest
 

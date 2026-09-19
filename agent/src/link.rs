@@ -1,0 +1,258 @@
+//! The addon link: one Blender addon attached over a local TCP socket, speaking
+//! the length-prefixed frames the S5 helper introduced (see FRAMES below).
+//!
+//! The link outlives Blender: frames from the network queue (bounded, so QUIC
+//! flow control pushes back on the host) until an addon attaches; hot values
+//! conflate per key the whole time.
+//!
+//! FRAMES, both directions:  u32 BE length | u8 type | body
+//!   0x01 CONTROL   u8 peer | json bytes
+//!   0x02 HOT       u8 peer | u8 keylen | key | value
+//!   0x03 COLD      u8 peer | opaque (addon packs header+payload)
+//!   0x04 COLD_ACK  u32 BE count            agent -> addon: credits returned
+//!   0x10 CMD       json                    addon -> agent
+//!   0x20 EVENT     json                    agent -> addon
+
+use bytes::Bytes;
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, Condvar, Mutex};
+use tokio::sync::{Notify, mpsc};
+
+pub const T_CONTROL: u8 = 0x01;
+pub const T_HOT: u8 = 0x02;
+pub const T_COLD: u8 = 0x03;
+pub const T_COLD_ACK: u8 = 0x04;
+pub const T_CMD: u8 = 0x10;
+pub const T_EVENT: u8 = 0x20;
+
+const MAX_FRAME: usize = 256 << 20;
+
+pub enum Out {
+    Frame(u8, Bytes),
+    Wake,
+}
+
+/// Agent -> addon side of the link.
+pub struct Link {
+    pub tx: mpsc::Sender<Out>,
+    hot: Mutex<HashMap<Vec<u8>, Bytes>>,
+    hot_dirty: AtomicBool,
+    sink: Mutex<Option<TcpStream>>,
+    sink_cv: Condvar,
+    pub attached: AtomicBool,
+}
+
+impl Link {
+    pub fn new(tx: mpsc::Sender<Out>) -> Self {
+        Self {
+            tx,
+            hot: Mutex::new(HashMap::new()),
+            hot_dirty: AtomicBool::new(false),
+            sink: Mutex::new(None),
+            sink_cv: Condvar::new(),
+            attached: AtomicBool::new(false),
+        }
+    }
+
+    pub async fn frame(&self, kind: u8, body: Bytes) {
+        let _ = self.tx.send(Out::Frame(kind, body)).await;
+    }
+
+    pub fn frame_blocking(&self, kind: u8, body: Bytes) {
+        let _ = self.tx.blocking_send(Out::Frame(kind, body));
+    }
+
+    pub async fn event(&self, v: Value) {
+        self.frame(T_EVENT, Bytes::from(v.to_string())).await;
+    }
+
+    pub fn event_blocking(&self, v: Value) {
+        self.frame_blocking(T_EVENT, Bytes::from(v.to_string()));
+    }
+
+    /// Non-blocking (safe from async tasks); drops the event if the queue is full.
+    pub fn event_try(&self, v: Value) {
+        let _ = self.tx.try_send(Out::Frame(T_EVENT, Bytes::from(v.to_string())));
+    }
+
+    /// Events the addon must see even if the queue is full (attach replies).
+    pub fn event_direct(&self, v: Value) {
+        let mut sink = self.sink.lock().unwrap();
+        if let Some(s) = sink.as_mut() {
+            let _ = write_frame(s, T_EVENT, v.to_string().as_bytes()).and_then(|_| s.flush());
+        }
+    }
+
+    pub fn hot(&self, key: Vec<u8>, body: Bytes) {
+        self.hot.lock().unwrap().insert(key, body);
+        self.hot_dirty.store(true, Relaxed);
+        let _ = self.tx.try_send(Out::Wake);
+    }
+
+    fn set_sink(&self, stream: Option<TcpStream>) {
+        let mut sink = self.sink.lock().unwrap();
+        *sink = stream;
+        self.attached.store(sink.is_some(), Relaxed);
+        self.sink_cv.notify_all();
+    }
+
+    /// Blocks until an addon is attached, then writes. Returns false when the
+    /// write failed (the addon went away); the frame is lost, like a socket.
+    fn write_when_attached(&self, kind: u8, body: &[u8]) -> bool {
+        let mut sink = self.sink.lock().unwrap();
+        while sink.is_none() {
+            sink = self.sink_cv.wait(sink).unwrap();
+        }
+        let s = sink.as_mut().unwrap();
+        let ok = write_frame(s, kind, body).is_ok();
+        if !ok {
+            *sink = None;
+            self.attached.store(false, Relaxed);
+        }
+        ok
+    }
+
+    fn flush(&self) {
+        if let Some(s) = self.sink.lock().unwrap().as_mut() {
+            let _ = s.flush();
+        }
+    }
+}
+
+pub fn write_frame(w: &mut impl Write, kind: u8, body: &[u8]) -> std::io::Result<()> {
+    w.write_all(&((body.len() + 1) as u32).to_be_bytes())?;
+    w.write_all(&[kind])?;
+    w.write_all(body)
+}
+
+pub fn writer_thread(link: Arc<Link>, mut rx: mpsc::Receiver<Out>) {
+    while let Some(item) = rx.blocking_recv() {
+        match item {
+            Out::Frame(kind, body) => {
+                link.write_when_attached(kind, &body);
+            }
+            Out::Wake => {}
+        }
+        if link.hot_dirty.swap(false, Relaxed) {
+            let drained: Vec<Bytes> = link.hot.lock().unwrap().drain().map(|(_, v)| v).collect();
+            for body in drained {
+                if !link.attached.load(Relaxed) {
+                    link.hot_dirty.store(true, Relaxed); // keep for the next addon
+                    break;
+                }
+                link.write_when_attached(T_HOT, &body);
+            }
+        }
+        link.flush();
+    }
+}
+
+/// Addon -> network queues. They outlive sessions and addons.
+pub struct Inbound {
+    pub control_tx: mpsc::Sender<Bytes>,
+    pub cold_tx: mpsc::Sender<Bytes>,
+    pub hot: Mutex<HashMap<Vec<u8>, Bytes>>,
+    pub hot_notify: Notify,
+    pub connected: AtomicBool,
+}
+
+fn read_exact(r: &mut impl Read, buf: &mut [u8]) -> bool {
+    r.read_exact(buf).is_ok()
+}
+
+/// Reads one attached addon until it goes away. CMD frames go to `on_cmd`.
+fn reader_loop(mut r: impl Read, inb: &Inbound, link: &Link, on_cmd: &(dyn Fn(&Value) + Sync)) {
+    let mut head = [0u8; 5];
+    loop {
+        if !read_exact(&mut r, &mut head) {
+            return;
+        }
+        let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        if len == 0 || len > MAX_FRAME {
+            return;
+        }
+        let kind = head[4];
+        let mut body = vec![0u8; len - 1];
+        if !read_exact(&mut r, &mut body) {
+            return;
+        }
+        let body = Bytes::from(body);
+        match kind {
+            T_CONTROL => {
+                let _ = inb.control_tx.try_send(body);
+            }
+            T_HOT => {
+                if body.len() >= 2 {
+                    let klen = body[1] as usize;
+                    if body.len() >= 2 + klen {
+                        inb.hot.lock().unwrap().insert(body[2..2 + klen].to_vec(), body);
+                        inb.hot_notify.notify_one();
+                    }
+                }
+            }
+            T_COLD => {
+                let sent = inb.connected.load(Relaxed) && inb.cold_tx.try_send(body).is_ok();
+                if !sent {
+                    link.frame_blocking(T_COLD_ACK, Bytes::copy_from_slice(&1u32.to_be_bytes()));
+                }
+            }
+            T_CMD => match serde_json::from_slice::<Value>(&body) {
+                Ok(cmd) => on_cmd(&cmd),
+                Err(e) => eprintln!("[link] bad CMD json: {e}"),
+            },
+            other => eprintln!("[link] unknown frame type {other:#x}"),
+        }
+    }
+}
+
+/// Accept loop for the local socket. One addon at a time; the first frame
+/// must be `{"cmd":"attach","secret":...}`. `on_attach`/`on_detach` let the
+/// lifecycle react; `on_cmd` gets every later command.
+pub fn serve_local(
+    listener: TcpListener,
+    secret: String,
+    inb: Arc<Inbound>,
+    link: Arc<Link>,
+    on_attach: Arc<dyn Fn() -> Value + Send + Sync>,
+    on_detach: Arc<dyn Fn() + Send + Sync>,
+    on_cmd: Arc<dyn Fn(&Value) + Send + Sync>,
+) {
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let _ = stream.set_nodelay(true);
+        // Attach handshake, synchronously on the new stream.
+        let mut head = [0u8; 5];
+        if !read_exact(&mut stream, &mut head) {
+            continue;
+        }
+        let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        if head[4] != T_CMD || len == 0 || len > 4096 {
+            continue;
+        }
+        let mut body = vec![0u8; len - 1];
+        if !read_exact(&mut stream, &mut body) {
+            continue;
+        }
+        let cmd: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if cmd.get("cmd").and_then(Value::as_str) != Some("attach")
+            || cmd.get("secret").and_then(Value::as_str) != Some(secret.as_str())
+        {
+            let _ = write_frame(&mut stream, T_EVENT, json!({"event": "rejected"}).to_string().as_bytes());
+            continue;
+        }
+        if link.attached.load(Relaxed) {
+            let _ = write_frame(&mut stream, T_EVENT, json!({"event": "rejected", "reason": "already attached"}).to_string().as_bytes());
+            continue;
+        }
+        let Ok(reader) = stream.try_clone() else { continue };
+        link.set_sink(Some(stream));
+        link.event_direct(on_attach());
+        reader_loop(reader, &inb, &link, &*on_cmd);
+        link.set_sink(None);
+        on_detach();
+    }
+}
