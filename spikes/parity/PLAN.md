@@ -102,9 +102,13 @@ the project tree. UI: `tray-icon` + `muda`, minimal settings (pairing
 token, fingerprint confirm, port, Blender path, idle timeout).
 
 **Sequence (closes S5):** (1) agent crate: tray, settings, listener,
-Blender launch/close, local socket → (2) host role: pairing, connection,
-QCView hand-off → (3) remote addon update (pairing-gated; last, it's the
-security-sensitive piece). Then S6/S7 put capture inside the agent.
+Blender launch/close, local socket — **DONE 2026-09-19 (045f69c)** → (2) host
+role: pairing, connection, QCView hand-off — **DONE 2026-09-19 (e1808c6)**;
+QCView auto-detects the agent's raw HEVC `tcp://127.0.0.1:19997` → (3) remote
+addon update (pairing-gated; last, it's the security-sensitive piece). Still
+open before (3): Windows build + logon-task autostart, packaging/signing,
+bundling the agent with the addon, agent-config UI (token/peer currently in
+agent.toml AND addon prefs). Then S6/S7 put capture inside the agent.
 Resist scope creep: lifecycle + transport only.
 
 ## S5 design requirements (build the seams now, features later)
