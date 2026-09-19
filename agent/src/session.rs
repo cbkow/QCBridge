@@ -389,10 +389,31 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct HostTarget {
     pub addr: String,
     pub fingerprint: Option<Vec<u8>>,
     pub mtu: u16,
+}
+
+/// Where the host should connect: set by config or by the addon (CMD
+/// connect). Changing it ends the current session.
+pub struct HostControl {
+    pub target: Mutex<Option<HostTarget>>,
+    pub generation: std::sync::atomic::AtomicU64,
+    pub notify: tokio::sync::Notify,
+}
+
+impl HostControl {
+    pub fn new(target: Option<HostTarget>) -> Self {
+        Self { target: Mutex::new(target), generation: std::sync::atomic::AtomicU64::new(0), notify: tokio::sync::Notify::new() }
+    }
+
+    pub fn set(&self, target: Option<HostTarget>) {
+        *self.target.lock().unwrap() = target;
+        self.generation.fetch_add(1, Relaxed);
+        self.notify.notify_waiters();
+    }
 }
 
 pub async fn connect_one(ctx: Arc<Ctx>, target: &HostTarget) -> Result<()> {
@@ -446,12 +467,29 @@ pub async fn connect_one(ctx: Arc<Ctx>, target: &HostTarget) -> Result<()> {
     r
 }
 
-/// Host: connect forever with backoff.
-pub async fn host_loop(ctx: Arc<Ctx>, target: HostTarget) {
+/// Host: connect to whatever target the control holds, forever, with
+/// backoff; a target change drops the session and reconnects.
+pub async fn host_loop(ctx: Arc<Ctx>, control: Arc<HostControl>) {
     let mut backoff = Duration::from_millis(250);
     loop {
+        let (target, generation) = {
+            let t = control.target.lock().unwrap().clone();
+            (t, control.generation.load(Relaxed))
+        };
+        let Some(target) = target else {
+            control.notify.notified().await;
+            continue;
+        };
         let started = Instant::now();
-        let _ = connect_one(ctx.clone(), &target).await;
+        tokio::select! {
+            _ = connect_one(ctx.clone(), &target) => {}
+            _ = async {
+                loop {
+                    control.notify.notified().await;
+                    if control.generation.load(Relaxed) != generation { break; }
+                }
+            } => { ctx.observer.peer_down("target changed".into()); backoff = Duration::from_millis(100); continue; }
+        }
         if started.elapsed() > Duration::from_secs(5) {
             backoff = Duration::from_millis(250);
         }

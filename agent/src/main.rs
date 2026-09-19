@@ -25,28 +25,51 @@ const USAGE: &str = "\
 qcbridge-agent [--config PATH] [--no-tray] [--role host|replica] [--listen IP:PORT]
                [--peer IP:PORT] [--token T] [--local-port N] [--version]";
 
-/// Host-role observer: no Blender to manage, just status.
+/// Host-role observer: no Blender to manage. Pins the replica certificate
+/// on first successful connect (trust on first use) and tells the addon.
 struct HostObserver {
     status: Arc<Mutex<String>>,
     fingerprint: Mutex<Option<String>>,
     up: AtomicBool,
+    link: Arc<Link>,
+    cfg_path: std::path::PathBuf,
+    cfg: Mutex<Config>,
+    control: Arc<session::HostControl>,
 }
 
 impl PeerObserver for HostObserver {
     fn peer_up(&self, fp: Option<String>) {
         self.up.store(true, Relaxed);
-        *self.fingerprint.lock().unwrap() = fp;
+        *self.fingerprint.lock().unwrap() = fp.clone();
         *self.status.lock().unwrap() = "replica connected".into();
+        let mut pinned = false;
+        if let Some(fp) = &fp {
+            let mut cfg = self.cfg.lock().unwrap();
+            if cfg.fingerprint.is_empty() {
+                cfg.fingerprint = fp.clone();
+                if let Err(e) = config::save(&self.cfg_path, &cfg) {
+                    eprintln!("[agent] could not persist fingerprint: {e}");
+                }
+                if let Some(t) = self.control.target.lock().unwrap().as_mut() {
+                    t.fingerprint = hex::decode(fp).ok(); // enforce from now on, no reconnect
+                }
+                pinned = true;
+                eprintln!("[agent] pinned replica certificate {fp}");
+            }
+        }
+        self.link.event_try(json!({"event": "peer", "peer": 0, "up": true, "fingerprint": fp, "pinned": !pinned}));
     }
     fn peer_down(&self, reason: String) {
         self.up.store(false, Relaxed);
-        *self.status.lock().unwrap() = if reason.is_empty() { "replica disconnected".into() } else { reason };
+        *self.status.lock().unwrap() = if reason.is_empty() { "replica disconnected".into() } else { reason.clone() };
+        self.link.event_try(json!({"event": "peer", "peer": 0, "up": false, "reason": reason}));
     }
     fn goodbye(&self) {}
 }
 
 struct Agent {
     cfg: Config,
+    host_control: Arc<session::HostControl>,
     link: Arc<Link>,
     inb: Arc<Inbound>,
     ctx: Arc<Ctx>,
@@ -120,7 +143,7 @@ fn main() -> Result<()> {
         rand::thread_rng().fill_bytes(&mut b);
         hex::encode(b)
     };
-    config::write_socket_info(local_port, &secret)?;
+    config::write_socket_info(&cfg.role, local_port, &secret)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     let video_src = Arc::new(VideoSource::new());
@@ -130,8 +153,13 @@ fn main() -> Result<()> {
     let mut replica_fingerprint = String::new();
     let mut lifecycle: Option<Arc<Lifecycle>> = None;
     let mut host_obs: Option<Arc<HostObserver>> = None;
+    let host_control = Arc::new(session::HostControl::new(None));
     let observer: Arc<dyn PeerObserver> = if role_host {
-        let h = Arc::new(HostObserver { status: status.clone(), fingerprint: Mutex::new(None), up: AtomicBool::new(false) });
+        let h = Arc::new(HostObserver {
+            status: status.clone(), fingerprint: Mutex::new(None), up: AtomicBool::new(false),
+            link: link.clone(), cfg_path: cfg_path.clone(), cfg: Mutex::new(cfg.clone()),
+            control: host_control.clone(),
+        });
         host_obs = Some(h.clone());
         h
     } else {
@@ -154,20 +182,26 @@ fn main() -> Result<()> {
     });
 
     if role_host {
-        let target = HostTarget {
-            addr: cfg.peer.clone(),
-            fingerprint: (!cfg.fingerprint.is_empty())
-                .then(|| hex::decode(cfg.fingerprint.to_lowercase().replace(':', "")))
-                .transpose()
-                .context("config fingerprint must be hex")?,
-            mtu: session::DEFAULT_MTU,
-        };
+        // A configured peer connects at once; otherwise the addon sends
+        // CMD connect with the address from its preferences.
+        if !cfg.peer.is_empty() {
+            host_control.set(Some(HostTarget {
+                addr: cfg.peer.clone(),
+                fingerprint: (!cfg.fingerprint.is_empty())
+                    .then(|| hex::decode(cfg.fingerprint.to_lowercase().replace(':', "")))
+                    .transpose()
+                    .context("config fingerprint must be hex")?,
+                mtu: session::DEFAULT_MTU,
+            }));
+            *status.lock().unwrap() = format!("connecting to {}", cfg.peer);
+        } else {
+            *status.lock().unwrap() = "waiting for the addon".into();
+        }
         if cfg.video_port > 0 {
             let addr = format!("127.0.0.1:{}", cfg.video_port).parse()?;
             runtime.spawn(video_listener(addr, video_sink.clone(), link.clone()));
         }
-        *status.lock().unwrap() = format!("connecting to {}", cfg.peer);
-        runtime.spawn(session::host_loop(ctx.clone(), target));
+        runtime.spawn(session::host_loop(ctx.clone(), host_control.clone()));
     } else {
         let addr = cfg.listen.parse().context("listen must be IP:PORT")?;
         // Quinn binds its socket inside a Tokio context.
@@ -189,7 +223,7 @@ fn main() -> Result<()> {
     }
 
     let agent = Arc::new(Agent {
-        cfg: cfg.clone(), link: link.clone(), inb: inb.clone(), ctx: ctx.clone(),
+        cfg: cfg.clone(), host_control: host_control.clone(), link: link.clone(), inb: inb.clone(), ctx: ctx.clone(),
         lifecycle: lifecycle.clone(), host_obs, replica_fingerprint, local_port, status: status.clone(),
         quit: Arc::new(Notify::new()),
     });
@@ -233,6 +267,34 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
             }
         }
         Some("video_stop") => agent.ctx.video_src.stop(),
+        Some("connect") if agent.cfg.role == "host" => {
+            let addr = cmd.get("peer").and_then(Value::as_str).unwrap_or("").to_string();
+            if addr.is_empty() {
+                return;
+            }
+            // The agent's pin wins over whatever the addon remembers.
+            let pinned = agent.host_obs.as_ref().map(|h| h.cfg.lock().unwrap().fingerprint.clone()).unwrap_or_default();
+            let fp = if !pinned.is_empty() { pinned } else {
+                cmd.get("fingerprint").and_then(Value::as_str).unwrap_or("").to_string()
+            };
+            let target = HostTarget {
+                addr,
+                fingerprint: (!fp.is_empty()).then(|| hex::decode(fp.to_lowercase().replace(':', "")).ok()).flatten(),
+                mtu: session::DEFAULT_MTU,
+            };
+            if agent.host_control.target.lock().unwrap().as_ref() != Some(&target) {
+                *agent.status.lock().unwrap() = format!("connecting to {}", target.addr);
+                agent.host_control.set(Some(target));
+            }
+        }
+        Some("disconnect") if agent.cfg.role == "host" => agent.host_control.set(None),
+        Some("forget_fingerprint") if agent.cfg.role == "host" => {
+            if let Some(h) = &agent.host_obs {
+                let mut cfg = h.cfg.lock().unwrap();
+                cfg.fingerprint.clear();
+                let _ = config::save(&h.cfg_path, &cfg);
+            }
+        }
         Some("detach") => {}
         Some("shutdown") => {
             // The addon asking us to exit: only meaningful for headless test agents.
@@ -325,7 +387,7 @@ mod tray {
                 } else if ev.id == quit_item.id() {
                     if let Some(l) = &agent.lifecycle { let _ = l.tx.send(Event::Shutdown); }
                     agent.ctx.video_src.stop();
-                    let _ = std::fs::remove_file(config::socket_info_path());
+                    config::remove_socket_info(&agent.cfg.role);
                     if let Some(rt) = runtime.lock().unwrap().take() {
                         rt.shutdown_timeout(std::time::Duration::from_millis(500));
                     }

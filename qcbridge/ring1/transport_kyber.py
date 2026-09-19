@@ -195,8 +195,9 @@ class _HelperLink:
         self.exited.set()
 
 
-def agent_socket_info() -> tuple[str, int, str] | None:
-    """(host, port, secret) of a running agent, or None."""
+def agent_socket_info(role: str) -> tuple[str, int, str] | None:
+    """(host, port, secret) of a running agent for this role, or None.
+    agent.json keeps one entry per role (a machine can run both)."""
     port, secret = os.environ.get("QCB_AGENT_PORT"), os.environ.get("QCB_AGENT_SECRET")
     if port and secret:
         return ("127.0.0.1", int(port), secret)
@@ -209,14 +210,14 @@ def agent_socket_info() -> tuple[str, int, str] | None:
     path = os.path.join(base, "QCBridge", "agent.json")
     try:
         with open(path, encoding="utf-8") as f:
-            info = json.load(f)
+            info = json.load(f)[role]
         return ("127.0.0.1", int(info["port"]), str(info["secret"]))
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
-def use_agent() -> bool:
-    return os.environ.get("QCB_AGENT", "") != "spawn" and agent_socket_info() is not None
+def use_agent(role: str) -> bool:
+    return os.environ.get("QCB_AGENT", "") != "spawn" and agent_socket_info(role) is not None
 
 
 class _AgentLink(_HelperLink):
@@ -287,8 +288,8 @@ class _AgentLink(_HelperLink):
 
 
 def _make_link(cfg: TransportConfig, role: str, on_frame, spawn_args: Callable[[], list[str]]):
-    if use_agent():
-        return _AgentLink(agent_socket_info(), role, on_frame)
+    if use_agent(role):
+        return _AgentLink(agent_socket_info(role), role, on_frame)
     return _HelperLink(spawn_args(), on_frame)
 
 
@@ -320,10 +321,12 @@ class HostTransportKyber:
         self._peer_cb: Callable[[bool], None] | None = None
         self.peer_status: dict = {}
         self.peer_fingerprint = ""   # replica certificate SHA-256 (hex)
+        self.peer_pinned = True      # False right after trust-on-first-use
         self.link_note = ""          # last helper-reported reason for being down
         self.video_port = 0          # localhost TCP port serving Annex-B HEVC
         self.stats: dict = {}
         self.agent_version = ""      # set in agent mode
+        self.agent_mode = False
 
     def start(self) -> None:
         def spawn_args() -> list[str]:
@@ -337,6 +340,11 @@ class HostTransportKyber:
 
         self._link = _make_link(self._cfg, "host", self._on_frame, spawn_args)
         self._link.start()
+        self.agent_mode = isinstance(self._link, _AgentLink)
+        if self.agent_mode:
+            # The agent holds the connection; tell it where (its own pin wins).
+            self._link.cmd(cmd="connect", peer=f"{self._cfg.address}:{self._cfg.port_control}",
+                           fingerprint=getattr(self._cfg, "fingerprint", "") or "")
         self._stop.clear()
         self._thread = threading.Thread(target=self._io_loop, name="qcb-host-io", daemon=True)
         self._thread.start()
@@ -434,10 +442,12 @@ class HostTransportKyber:
             self.video_port = int(event.get("video_port") or 0)
             self._link_up = bool(event.get("peer_up"))
             self.peer_fingerprint = event.get("peer_fingerprint") or ""
+            self.peer_pinned = True
         elif name == "peer":
             self._link_up = bool(event.get("up"))
             if self._link_up:
                 self.peer_fingerprint = event.get("fingerprint") or ""
+                self.peer_pinned = bool(event.get("pinned", True))
                 self.link_note = ""
             else:
                 self.link_note = event.get("reason") or ""
@@ -497,6 +507,7 @@ class ReplicaTransportKyber:
         self.video_state = "off"
         self.stats: dict = {}
         self.agent_version = ""
+        self.agent_mode = False
         self.quit_requested = False
 
     def start(self) -> None:
@@ -509,6 +520,7 @@ class ReplicaTransportKyber:
 
         self._link = _make_link(self._cfg, "replica", self._on_frame, spawn_args)
         self._link.start()
+        self.agent_mode = isinstance(self._link, _AgentLink)
         self._ready.wait(timeout=5.0)
 
     def stop(self) -> None:

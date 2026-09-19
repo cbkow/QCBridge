@@ -98,11 +98,50 @@ pub fn save(path: &PathBuf, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-pub fn write_socket_info(port: u16, secret: &str) -> Result<()> {
+/// agent.json holds one entry per role, so a host and a replica agent can
+/// share a machine (dev, or a workstation that is both).
+pub fn write_socket_info(role: &str, port: u16, secret: &str) -> Result<()> {
     let path = socket_info_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, serde_json::json!({"port": port, "secret": secret, "pid": std::process::id()}).to_string())?;
-    Ok(())
+    let mine = serde_json::json!({"port": port, "secret": secret, "pid": std::process::id()});
+    // Two agents starting together race on this file; write, re-read, and
+    // retry until our own entry is what's on disk. Only role keys survive.
+    for attempt in 0..5 {
+        let mut doc = serde_json::json!({});
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&text) {
+                for (k, v) in map {
+                    if (k == "host" || k == "replica") && v.is_object() {
+                        doc[k] = v;
+                    }
+                }
+            }
+        }
+        doc[role] = mine.clone();
+        std::fs::write(&path, doc.to_string())?;
+        std::thread::sleep(std::time::Duration::from_millis(50 + 30 * attempt));
+        let back: Option<serde_json::Value> = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok());
+        if back.as_ref().and_then(|d| d.get(role)) == Some(&mine) {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("could not register in {}", path.display())
+}
+
+pub fn remove_socket_info(role: &str) {
+    let path = socket_info_path();
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(obj) = doc.as_object_mut() {
+                obj.remove(role);
+                if obj.is_empty() {
+                    let _ = std::fs::remove_file(&path);
+                } else {
+                    let _ = std::fs::write(&path, doc.to_string());
+                }
+            }
+        }
+    }
 }

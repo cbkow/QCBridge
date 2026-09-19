@@ -524,6 +524,16 @@ def status_text() -> str:
         )
     if state["paused"]:
         bits.append("paused")
+    # Kyber/agent link state: where the connection actually lives.
+    if getattr(transport, "agent_mode", False):
+        bits.append(f"agent {getattr(transport, 'agent_version', '') or '?'}")
+    note = getattr(transport, "link_note", "")
+    if note:
+        bits.append(f"link: {note}")
+    fp = getattr(transport, "peer_fingerprint", "")
+    if fp and state["role"] == "HOST":
+        pinned = getattr(transport, "peer_pinned", True)
+        bits.append(f"replica cert {fp[:8]}…{'' if pinned else ' (new — pinned on first use)'}")
     sync = state.get("sync")
     if sync is not None and len(sync.dirty):
         t1, t2, tomb = sync.dirty.counts()
