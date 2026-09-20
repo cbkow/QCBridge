@@ -41,6 +41,7 @@ pub struct VideoSource {
     wanted: AtomicBool,
     generation: AtomicU64,
     child: Mutex<Option<std::process::Child>>,
+    child_stdin: Mutex<Option<std::process::ChildStdin>>,
     pub counters: VideoCounters,
     pub state: Mutex<String>,
 }
@@ -53,6 +54,7 @@ impl VideoSource {
             wanted: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             child: Mutex::new(None),
+            child_stdin: Mutex::new(None),
             counters: VideoCounters::default(),
             state: Mutex::new("off".into()),
         }
@@ -90,7 +92,7 @@ impl VideoSource {
         while self.current(generation) {
             let spawned = std::process::Command::new(&argv[0])
                 .args(&argv[1..])
-                .stdin(std::process::Stdio::null())
+                .stdin(std::process::Stdio::piped()) // "key\n" = keyframe on request (native capture)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::inherit())
                 .spawn();
@@ -103,6 +105,7 @@ impl VideoSource {
                 }
             };
             let mut stdout = child.stdout.take().expect("piped stdout");
+            *self.child_stdin.lock().unwrap() = child.stdin.take();
             *self.child.lock().unwrap() = Some(child);
             self.set_state(&link, "running");
             self.pump(&mut stdout, generation);
@@ -165,6 +168,19 @@ impl VideoSource {
         st.active = active;
         st.need_key = true;
         st.queue.clear();
+        drop(st);
+        if active {
+            self.request_key();
+        }
+    }
+
+    /// Ask the capture child for a keyframe (native capture honours it;
+    /// ffmpeg ignores its stdin, so there it costs nothing).
+    pub fn request_key(&self) {
+        use std::io::Write;
+        if let Some(stdin) = self.child_stdin.lock().unwrap().as_mut() {
+            let _ = stdin.write_all(b"key\n").and_then(|_| stdin.flush());
+        }
     }
 
     pub async fn next(&self) -> (AccessUnit, u64, Instant) {

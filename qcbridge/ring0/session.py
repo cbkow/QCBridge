@@ -377,7 +377,8 @@ def _start_pixel_path(prefs) -> None:
                 # The helper owns the capture child and sends it down the one
                 # Kyber connection (S6/S7 replace the child with native capture).
                 transport.start_video(
-                    pixel_path.build_command(ffmpeg, args[1], args[2], args[3])
+                    pixel_path.build_command(ffmpeg, args[1], args[2], args[3]),
+                    fps=pixel_path.capture_fps(), bitrate_mbps=pixel_path.rung_mbps(args[1]),
                 )
             else:
                 pixel_path.start(ffmpeg, args[1], args[2], args[3])

@@ -563,8 +563,10 @@ class ReplicaTransportKyber:
 
     # ── video child, owned by the helper (S6/S7 make it native) ──────────────
 
-    def start_video(self, argv: list[str]) -> None:
-        self._link.cmd(cmd="video_start", argv=argv)
+    def start_video(self, argv: list[str], **params) -> None:
+        """argv = the ffmpeg fallback; params (fps, bitrate_mbps, region,
+        ten_bit) let the agent build its native capture command instead."""
+        self._link.cmd(cmd="video_start", argv=argv, **params)
 
     def stop_video(self) -> None:
         self._link.cmd(cmd="video_stop")

@@ -254,12 +254,44 @@ fn main() -> Result<()> {
     }
 }
 
+/// argv for the native capture child if one is installed beside the agent.
+fn native_capture_argv(cmd: &Value, cfg: &Config) -> Option<Vec<String>> {
+    let exe = std::env::current_exe().ok()?;
+    let name = if cfg!(target_os = "macos") { "qcb-capture-mac" } else if cfg!(windows) { "qcb-capture-win.exe" } else { return None };
+    let path = exe.parent()?.join(name);
+    if !path.is_file() {
+        return None;
+    }
+    let fps = cmd.get("fps").and_then(Value::as_u64).unwrap_or(60);
+    let mbps = cmd.get("bitrate_mbps").and_then(Value::as_u64).unwrap_or(50);
+    let mut argv = vec![path.to_string_lossy().into_owned(), "--fps".into(), fps.to_string(), "--bitrate".into(), mbps.to_string()];
+    if cfg.capture_scale > 0.0 && cfg.capture_scale != 1.0 {
+        argv.push("--scale".into());
+        argv.push(cfg.capture_scale.to_string());
+    }
+    if let Some(r) = cmd.get("region").and_then(Value::as_str) {
+        argv.push("--region".into());
+        argv.push(r.to_string());
+    }
+    if cmd.get("ten_bit").and_then(Value::as_bool) == Some(true) {
+        argv.push("--10bit".into());
+    }
+    Some(argv)
+}
+
 fn handle_cmd(agent: &Agent, cmd: &Value) {
     match cmd.get("cmd").and_then(Value::as_str) {
         Some("video_start") => {
-            let argv: Vec<String> = cmd.get("argv").and_then(Value::as_array)
+            let mut argv: Vec<String> = cmd.get("argv").and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
+            // S6: prefer the native capture binary shipped next to the agent
+            // (ScreenCaptureKit -> VideoToolbox) over the addon's ffmpeg argv.
+            if cmd.get("native").and_then(Value::as_bool) != Some(false) {
+                if let Some(native) = native_capture_argv(cmd, &agent.cfg) {
+                    argv = native;
+                }
+            }
             if argv.is_empty() {
                 agent.link.event_blocking(json!({"event": "error", "msg": "video_start: empty argv"}));
             } else {

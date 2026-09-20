@@ -19,6 +19,9 @@ pub struct Config {
     pub fingerprint: String,
     /// Wire-rate cap for the video lane (replica), Mbps.
     pub cap_mbps: f64,
+    /// Replica, native capture: stream resolution as a fraction of the
+    /// captured pixels (1.0 = native; 0.5 halves each dimension).
+    pub capture_scale: f64,
     /// Host: local TCP port serving the stream to the viewer (0 = off).
     pub video_port: u16,
     /// Local socket for the addon (0 = pick a free port).
@@ -42,6 +45,7 @@ impl Default for Config {
             peer: "127.0.0.1:19990".into(),
             fingerprint: String::new(),
             cap_mbps: 400.0,
+            capture_scale: 1.0,
             video_port: 19997,
             local_port: 0,
             blender_path: default_blender_path(),

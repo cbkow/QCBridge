@@ -37,6 +37,14 @@ _RUNG_BITRATE = {
     "hevc_10_444_50": "50M",
 }
 
+def capture_fps() -> int:
+    return probe.capture_fps()
+
+
+def rung_mbps(rung: str) -> int:
+    return int(_RUNG_BITRATE.get(rung, "100M").rstrip("M"))
+
+
 _proc: subprocess.Popen | None = None
 _thread: threading.Thread | None = None
 _stop = threading.Event()
