@@ -15,7 +15,7 @@ and that should not live in one person's notes.
 ```zsh
 smokes/run_smoke.sh                 # work dir defaults to a fresh /tmp dir
 smokes/run_smoke.sh /tmp/my-run     # or pick one
-QCB_TRANSPORT=agent smokes/run_smoke.sh    # over the agent/QUIC transport
+QCB_TRANSPORT=agent QCB_AGENT=spawn smokes/run_smoke.sh   # over QUIC
 BLENDER=/path/to/Blender smokes/run_smoke.sh
 ```
 
@@ -31,10 +31,15 @@ machine.
 The scripts run in place and write only into the work dir. They find the repo
 from their own location, so nothing needs configuring.
 
-`QCB_TRANSPORT=agent` needs `agent/` built (`cargo build`). The default zmq
-path additionally needs pyzmq importable by Blender's Python: unzip the
-matching wheel from `qcbridge/wheels/` into `<work-dir>/pysite/`. The agent
-path does not — it is stdlib-only.
+`QCB_TRANSPORT=agent` needs `agent/` built (`cargo build`). `QCB_AGENT=spawn`
+goes with it here: outside a real session there is no agent running to attach
+to, so the transport starts a private one per role, isolated under each
+instance's Blender config dir.
+
+The default zmq path additionally needs pyzmq importable by Blender's Python:
+unzip the matching wheel from `qcbridge/wheels/` into `<work-dir>/pysite/`.
+The agent path does not — it is stdlib-only, which is one of the things the
+transport boundary bought.
 
 ## The suites
 

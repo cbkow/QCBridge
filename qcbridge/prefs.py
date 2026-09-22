@@ -173,7 +173,7 @@ class QCB_OT_kiosk_toggle(Operator):
 _SETTINGS_FIELDS = (
     "role", "replica_address", "bind_address", "port_control", "port_hot",
     "port_cold", "token", "enable_stream", "srt_port", "srt_url",
-    "encoder_rung", "ffmpeg_path", "replica_kiosk",
+    "srt_latency_ms", "encoder_rung", "ffmpeg_path", "replica_kiosk",
 )
 
 

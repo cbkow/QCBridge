@@ -163,6 +163,10 @@ def stop() -> None:
         role=None, transport=None, peer_epoch=None, note="", sync=None,
         prefs=None, ffmpeg_note="", peer_stream={}, shot_mode=False,
         peer_addon=None,
+        # Cleared here or a session stopped mid-resolve leaves it True and
+        # every later _start_pixel_path returns at the guard: sync works,
+        # the stream never starts again.
+        pixel_resolving=False,
     )
 
 
