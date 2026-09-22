@@ -224,16 +224,22 @@ into a resend storm. `point_cache` is also skipped in the modifier digest.
 Bake state is sampled on the 0.5 s sweep, because a bake finishing on a job
 thread or a Delete Bake gives no dependable event for the owning object.
 
-**The limitation: only tier 3 carries cache data.** A tier-2 partial blend
-does not contain it. So when the set of baked caches changes, `bake_note` is
-set and the host panel nags for a Force Resync, which ships the full file.
-Un-baked live sims are explicitly out of scope — only a baked cache is state a
-resend can faithfully carry.
+**The limitation is narrower than it looks.** A tier-2 resend *does* carry the
+cache frames — re-probed on 5.2 on 2026-09-18, correcting an earlier belief
+that partial blends dropped them. What it loses is the `is_baked` flag, so the
+replica ends up with an unbaked cache holding the right frames, which will
+re-simulate on the next edit rather than staying authoritative. Only tier 3
+carries the bake intact. That is why a changed bake sets `bake_note` and the
+host panel nags for a Force Resync, and why un-baked live sims are out of
+scope: only a baked cache is state a resend can faithfully carry.
 
-> **Stale comment:** `host_handlers.py:113-118` claims the escalation is "to
-> tier 2 so the baked cache travels in the resend". That contradicts
-> `:85-87` ("only tier 3 carries cache data") and the actual `bake_note`
-> behaviour. The tier-3 statement is the correct one.
+The probing also found: appending from a full save keeps `is_baked`; toggling
+`use_disk_cache` converts memory↔disk (and writes `blendcache_<name>/` beside
+the project); `.bphys` is zstd since 5.0, so every public third-party reader
+predates the format; external caches scan their directory once on toggle, and
+un-ticking External deletes files in the default location. Nobody else has
+solved cache transfer either — Multiuser has it as an open blocked item and
+Mixer does not support it.
 
 Geometry nodes cross two ways: tree-side edits fire on the `GeometryNodeTree`
 ID, which is a syncable tier-2 type; modifier-panel input tweaks fire only the

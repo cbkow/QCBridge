@@ -82,9 +82,14 @@ class HostSync:
         self.sent_t1 = 0
         self.sent_t2 = 0
         self.t2_unsupported = 0
-        self.bake_note = ""  # a sim bake appeared/vanished: only tier 3
-                             # carries cache data (probed 5.2) — panel nags
-                             # for Force Resync until one ships
+        self.bake_note = ""  # a sim bake appeared/vanished — panel nags for
+                             # Force Resync until one ships. A tier-2 resend
+                             # DOES carry the cache frames (re-probed 5.2,
+                             # 2026-09-18, correcting the older "only the
+                             # full save carries cache data"); what it loses
+                             # is is_baked, so the replica's copy is unbaked
+                             # and re-simulates on the next edit. Only tier 3
+                             # carries the bake intact.
         self.sync_errors = 0
         self.last_sync_error = ""
         # Nothing marks until the first bootstrap is serialized: every edit
@@ -112,7 +117,8 @@ class HostSync:
         Point-cache state rides the same sweep for the same reason: a bake
         finishing (job thread) or Delete Bake gives no dependable event for
         the owning object; the flush diff sees "~pcache" change and
-        escalates to tier 2 so the baked cache travels in the resend."""
+        escalates to tier 2, which carries the cache frames but not the
+        baked flag — hence bake_note and the nag for a Force Resync."""
         now = time.monotonic()
         for obj in bpy.data.objects:
             uuid = self.registry.uuid_for(obj.session_uid)
