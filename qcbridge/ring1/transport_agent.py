@@ -385,13 +385,21 @@ class HostTransportAgent:
         self.peers_sources: list = []
         self._cmd_ids = itertools.count(1000)
         self._cmd_replies: dict[int, dict] = {}
+        self._attached = threading.Event()
+
+    def wait_attached(self, timeout: float = 3.0) -> bool:
+        """True once the agent's `attached` reply — and with it agent_config —
+        has arrived. The session reads the token and peer from there."""
+        return self._attached.wait(timeout)
 
     def start(self) -> None:
         self._link = _make_link(self._cfg, "host", self._on_frame)
         self._link.start()
         self.agent_mode = isinstance(self._link, _AgentLink)
-        if self.agent_mode:
-            # The agent holds the connection; tell it where (its own pin wins).
+        if self.agent_mode and self._cfg.address:
+            # An address in the addon is an explicit override; the agent's own
+            # pin still wins. Blank means the agent's configured peer stands —
+            # it used to be replaced with a 127.0.0.1 fallback here.
             self._link.cmd(cmd="connect", peer=f"{self._cfg.address}:{self._cfg.port_control}",
                            fingerprint=getattr(self._cfg, "fingerprint", "") or "")
         self._stop.clear()
@@ -493,6 +501,7 @@ class HostTransportAgent:
             self.peer_fingerprint = event.get("peer_fingerprint") or ""
             self.peer_pinned = True
             self.agent_config = dict(event.get("config") or {})
+            self._attached.set()
         elif name == "config":   # every settings change, from us or the tray
             self.agent_config = dict(event.get("config") or self.agent_config)
             self._stash_reply(event)
