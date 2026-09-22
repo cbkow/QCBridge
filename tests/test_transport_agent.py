@@ -236,3 +236,51 @@ def test_wrong_quic_token_never_connects(tmp_path):
     finally:
         host.stop()
         replica.stop()
+
+
+def wait_reply(transport, req_id, timeout=5.0):
+    """The agent's correlated reply, or None. (poll_cmd_reply pops, so a
+    walrus inside a wait_for lambda would consume it into the lambda's own
+    scope — which is exactly the bug this helper replaced.)"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        reply = transport.poll_cmd_reply(req_id)
+        if reply is not None:
+            return reply
+        time.sleep(0.02)
+    return None
+
+
+def test_set_config_round_trip_and_needs_restart(pair):
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    # A live field lands, persists, and comes back in the correlated reply.
+    reply = wait_reply(host, host.set_config(idle_secs=7))
+    assert reply and reply["changed"] == ["idle_secs"], reply
+    assert host.agent_config["idle_secs"] == 7
+    # A restart-only field is named back, not silently ignored.
+    reply = wait_reply(host, host.set_config(listen="0.0.0.0:1"))
+    assert reply and reply["needs_restart"] == ["listen"] and reply["changed"] == [], reply
+    assert host.agent_config["listen"] != "0.0.0.0:1"
+    # A bad value is rejected, not coerced.
+    reply = wait_reply(host, host.set_config(discovery="loud"))
+    assert reply and reply["rejected"] == ["discovery"], reply
+
+
+def test_discover_by_direct_probe_finds_the_replica(pair):
+    """The VPN path: a unicast probe to an address returns the replica's
+    beacon — name, listen port, certificate fingerprint, paired state — with
+    the asking host excluded from its own answer."""
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    reply = wait_reply(host, host.discover("127.0.0.1"), timeout=6.0)
+    assert reply, "no peers reply within 6 s"
+    assert reply["sources"] == ["probe"]
+    peers = reply["peers"]
+    assert len(peers) == 1, peers
+    p = peers[0]
+    assert p["role"] == "replica"
+    assert p["fp"] == replica.fingerprint, "the probe reports the certificate we would pin"
+    assert p["port"] == replica.bound_ports()[0]
+    assert p["paired"] is True
+    assert host.peers == peers

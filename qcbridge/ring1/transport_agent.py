@@ -61,17 +61,18 @@ def find_agent(explicit: str = "") -> str | None:
     exe = "qcbridge-agent.exe" if sys.platform == "win32" else "qcbridge-agent"
     here = Path(__file__).resolve()
     repo = here.parents[2]
-    candidates = [
-        explicit,
-        os.environ.get("QCB_AGENT_BIN", ""),
-        str(here.parents[1] / "bin" / exe),
-        str(repo / "agent" / "target" / "release" / exe),
-        str(repo / "agent" / "target" / "debug" / exe),
-    ]
-    for path in candidates:
+    for path in (explicit, os.environ.get("QCB_AGENT_BIN", ""), str(here.parents[1] / "bin" / exe)):
         if path and os.path.isfile(path):
             return path
-    return None
+    # Dev checkouts: whichever cargo profile was built most recently. A fixed
+    # release-before-debug order once had the contract tests exercising a
+    # stale release binary while every hand check ran the fresh debug one —
+    # the tests passed and proved nothing.
+    builds = [
+        str(repo / "agent" / "target" / prof / exe) for prof in ("release", "debug")
+    ]
+    builds = [b for b in builds if os.path.isfile(b)]
+    return max(builds, key=os.path.getmtime) if builds else None
 
 
 def pack_cold(header: dict, payload: bytes) -> bytes:
