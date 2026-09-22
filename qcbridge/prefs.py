@@ -173,7 +173,7 @@ class QCB_OT_kiosk_toggle(Operator):
 _SETTINGS_FIELDS = (
     "role", "replica_address", "bind_address", "port_control", "port_hot",
     "port_cold", "token", "enable_stream", "srt_port", "srt_url",
-    "encoder_rung", "ffmpeg_path", "replica_kiosk",
+    "srt_latency_ms", "encoder_rung", "ffmpeg_path", "replica_kiosk",
 )
 
 
@@ -400,10 +400,12 @@ class QCBridgePreferences(AddonPreferences):
     srt_latency_ms: IntProperty(
         name="Stream Latency (ms)",
         description=(
-            "SRT retransmission buffer — a fixed add to glass-to-glass "
-            "latency. 300 is very safe; ~120 is fine on a clean low-RTT VPN"
+            "SRT retransmission buffer. Measured as a ~1:1 add to "
+            "glass-to-glass latency, so this value is very nearly what it "
+            "costs you: 120 suits a clean low-RTT VPN, raise it on a lossy "
+            "link, and only go below ~60 on a LAN"
         ),
-        default=300, min=20, max=2000,
+        default=120, min=20, max=2000,
     )
     srt_url: StringProperty(
         name="SRT URL Override",

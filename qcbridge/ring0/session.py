@@ -236,7 +236,7 @@ def _start_replica(prefs) -> None:
     stream_info = {
         "enabled": bool(getattr(prefs, "enable_stream", True)),
         "port": prefs.srt_port,
-        "latency_ms": getattr(prefs, "srt_latency_ms", 300),
+        "latency_ms": getattr(prefs, "srt_latency_ms", 120),
     }
 
     our_version = _addon_version()  # captured: the handler runs on IO thread
@@ -300,7 +300,7 @@ def _replica_srt_url(prefs) -> str:
     if prefs.srt_url:
         return prefs.srt_url
     bind = prefs.bind_address or "0.0.0.0"
-    latency_us = getattr(prefs, "srt_latency_ms", 300) * 1000
+    latency_us = getattr(prefs, "srt_latency_ms", 120) * 1000
     return f"srt://{bind}:{prefs.srt_port}?mode=listener&latency={latency_us}"
 
 
@@ -369,7 +369,7 @@ def viewer_url() -> str:
     prefs = state.get("prefs")
     if not stream.get("enabled") or prefs is None:
         return ""
-    latency_us = int(stream.get("latency_ms", 300)) * 1000
+    latency_us = int(stream.get("latency_ms", 120)) * 1000
     url = (
         f"srt://{prefs.replica_address}:{stream.get('port', 9998)}"
         f"?mode=caller&latency={latency_us}"
