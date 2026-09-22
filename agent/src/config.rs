@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -157,5 +158,79 @@ pub fn remove_socket_info(base: &Path, role: &str) {
                 }
             }
         }
+    }
+}
+
+
+/// The one config, shared by everything that holds one.
+///
+/// It used to be cloned three ways — the agent, the Blender lifecycle and
+/// the host observer each owned a copy — and only the observer's was updated
+/// when a certificate was pinned. So `Agent.cfg.fingerprint` was stale for
+/// the life of the process, and the lifecycle could never see an edited
+/// `blender_path` or `idle_secs`. Any runtime settings work would have
+/// written to one copy and been invisible to the rest.
+///
+/// Read with `with`, change with `update`, and keep both closures short:
+/// the lock is held for their duration and every holder shares it.
+#[derive(Clone)]
+pub struct SharedConfig(Arc<Mutex<Config>>);
+
+impl SharedConfig {
+    pub fn new(cfg: Config) -> Self {
+        Self(Arc::new(Mutex::new(cfg)))
+    }
+
+    pub fn with<T>(&self, f: impl FnOnce(&Config) -> T) -> T {
+        f(&self.0.lock().unwrap())
+    }
+
+    pub fn update<T>(&self, f: impl FnOnce(&mut Config) -> T) -> T {
+        f(&mut self.0.lock().unwrap())
+    }
+
+    /// A whole copy, for the few places that want one (saving to disk).
+    pub fn snapshot(&self) -> Config {
+        self.0.lock().unwrap().clone()
+    }
+
+    // The two most-read facts, which never change after startup but are
+    // read often enough that `with(|c| ...)` at every site buries them.
+    pub fn role(&self) -> String {
+        self.with(|c| c.role.clone())
+    }
+
+    pub fn is_host(&self) -> bool {
+        self.with(|c| c.role == "host")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this type exists to prevent: the config used to be cloned per
+    /// holder, so a write through one was invisible to the rest. A pinned
+    /// fingerprint reached the host observer and nothing else.
+    #[test]
+    fn a_write_through_one_handle_is_visible_through_another() {
+        let a = SharedConfig::new(Config::default());
+        let b = a.clone();
+        assert!(b.with(|c| c.fingerprint.is_empty()));
+
+        a.update(|c| c.fingerprint = "abc123".into());
+
+        assert_eq!(b.with(|c| c.fingerprint.clone()), "abc123");
+        assert_eq!(a.snapshot().fingerprint, "abc123");
+    }
+
+    /// A snapshot is a copy on purpose — it is what gets written to disk —
+    /// so changing it must not change what the others see.
+    #[test]
+    fn a_snapshot_is_detached() {
+        let a = SharedConfig::new(Config::default());
+        let mut snap = a.snapshot();
+        snap.token = "edited".into();
+        assert!(a.with(|c| c.token.is_empty()));
     }
 }

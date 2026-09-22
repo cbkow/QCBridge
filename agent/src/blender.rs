@@ -3,7 +3,7 @@
 //! starts Blender with an expression that hands control to the addon's
 //! `agent_launch` module.
 
-use crate::config::Config;
+use crate::config::SharedConfig;
 use crate::link::Link;
 use crate::session::PeerObserver;
 use serde_json::json;
@@ -54,7 +54,7 @@ pub enum Event {
 }
 
 pub struct Lifecycle {
-    cfg: Config,
+    cfg: SharedConfig,
     link: Arc<Link>,
     local_port: u16,
     secret: String,
@@ -79,7 +79,7 @@ impl PeerObserver for Lifecycle {
 }
 
 impl Lifecycle {
-    pub fn new(cfg: Config, link: Arc<Link>, local_port: u16, secret: String, status: Arc<Mutex<String>>)
+    pub fn new(cfg: SharedConfig, link: Arc<Link>, local_port: u16, secret: String, status: Arc<Mutex<String>>)
         -> (Arc<Self>, mpsc::UnboundedReceiver<Event>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let me = Arc::new(Self {
@@ -108,18 +108,23 @@ impl Lifecycle {
         // still pairs, carries every lane and reports status, it just never
         // launches anything. That is what the transport contract tests need,
         // and it suits a machine where Blender is started by hand.
-        if self.cfg.blender_path.trim().is_empty() {
+        // One read of the shared config, so a launch cannot see half of an
+        // edit made while it was assembling the command.
+        let (path, args, token, kiosk) = self.cfg.with(|c| {
+            (c.blender_path.clone(), c.blender_args.clone(), c.token.clone(), c.kiosk)
+        });
+        if path.trim().is_empty() {
             self.set_status("connected (Blender supervision off)");
             return;
         }
-        let mut cmd = Command::new(&self.cfg.blender_path);
-        cmd.args(&self.cfg.blender_args)
+        let mut cmd = Command::new(&path);
+        cmd.args(&args)
             .arg("--python-expr")
             .arg(LAUNCH_EXPR)
             .env("QCB_AGENT_PORT", self.local_port.to_string())
             .env("QCB_AGENT_SECRET", &self.secret)
-            .env("QCB_AGENT_TOKEN", &self.cfg.token)
-            .env("QCB_AGENT_KIOSK", if self.cfg.kiosk { "1" } else { "0" })
+            .env("QCB_AGENT_TOKEN", &token)
+            .env("QCB_AGENT_KIOSK", if kiosk { "1" } else { "0" })
             .env("QCB_TRANSPORT", "agent")
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
@@ -149,7 +154,7 @@ impl Lifecycle {
                     let _ = me.tx.send(Event::ChildExited);
                 });
             }
-            Err(e) => self.set_status(&format!("Blender launch failed: {e} ({})", self.cfg.blender_path)),
+            Err(e) => self.set_status(&format!("Blender launch failed: {e} ({path})")),
         }
     }
 
@@ -199,8 +204,11 @@ impl Lifecycle {
                     self.spawn_blender();
                 }
                 Event::PeerDown => {
-                    if self.cfg.idle_secs > 0 && idle_deadline.is_none() {
-                        idle_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(self.cfg.idle_secs));
+                    // Read live: an edited idle_secs now takes effect on the
+                    // next peer-down instead of never.
+                    let idle = self.cfg.with(|c| c.idle_secs);
+                    if idle > 0 && idle_deadline.is_none() {
+                        idle_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(idle));
                     }
                     self.set_status(if self.blender_running() { "host gone, Blender warm" } else { "listening" });
                 }

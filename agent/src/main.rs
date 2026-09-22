@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use qcbridge_agent::blender::{Event, Lifecycle};
-use qcbridge_agent::config::{self, Config};
+use qcbridge_agent::config::{self, Config, SharedConfig};
 use qcbridge_agent::link::{Inbound, Link, serve_local, writer_thread};
 use qcbridge_agent::session::{self, Ctx, HostTarget, PeerObserver};
 use qcbridge_agent::video::{VideoSink, VideoSource, video_listener};
@@ -35,7 +35,7 @@ struct HostObserver {
     up: AtomicBool,
     link: Arc<Link>,
     cfg_path: std::path::PathBuf,
-    cfg: Mutex<Config>,
+    cfg: SharedConfig,
     control: Arc<session::HostControl>,
 }
 
@@ -46,9 +46,16 @@ impl PeerObserver for HostObserver {
         *self.status.lock().unwrap() = "replica connected".into();
         let mut pinned = false;
         if let Some(fp) = &fp {
-            let mut cfg = self.cfg.lock().unwrap();
-            if cfg.fingerprint.is_empty() {
+            // Writes through the shared config, so the agent and the
+            // lifecycle see the pin too — they used to hold stale copies.
+            let saved = self.cfg.update(|cfg| {
+                if !cfg.fingerprint.is_empty() {
+                    return None;
+                }
                 cfg.fingerprint = fp.clone();
+                Some(cfg.clone())
+            });
+            if let Some(cfg) = saved {
                 if let Err(e) = config::save(&self.cfg_path, &cfg) {
                     eprintln!("[agent] could not persist fingerprint: {e}");
                 }
@@ -70,7 +77,7 @@ impl PeerObserver for HostObserver {
 }
 
 struct Agent {
-    cfg: Config,
+    cfg: SharedConfig,
     /// Directory this instance owns: config, cert, agent.json.
     base: std::path::PathBuf,
     host_control: Arc<session::HostControl>,
@@ -88,14 +95,14 @@ struct Agent {
 fn attach_reply(agent: &Agent) -> Value {
     let mut v = json!({
         "event": "attached",
-        "role": agent.cfg.role,
+        "role": agent.cfg.role(),
         "version": VERSION,
         "source": SOURCE_URL,
-        "port": agent.cfg.listen.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(0),
+        "port": agent.cfg.with(|c| c.listen.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(0)),
         "fingerprint": agent.replica_fingerprint,
         "peer_up": agent.lifecycle.as_ref().map(|l| l.peer_up.load(Relaxed))
             .or_else(|| agent.host_obs.as_ref().map(|h| h.up.load(Relaxed))).unwrap_or(false),
-        "video_port": if agent.cfg.role == "host" { agent.cfg.video_port } else { 0 },
+        "video_port": agent.cfg.with(|c| if c.role == "host" { c.video_port } else { 0 }),
         "video_state": *agent.ctx.video_src.state.lock().unwrap(),
     });
     if let Some(h) = &agent.host_obs {
@@ -163,6 +170,11 @@ fn main() -> Result<()> {
     let video_src = Arc::new(VideoSource::new());
     let video_sink = Arc::new(VideoSink::new());
 
+    // One config from here on. Everything long-lived takes a handle to it,
+    // so a change is visible to all of them; `cfg` itself stays only for the
+    // startup reads below, which happen before any of this can be edited.
+    let shared = SharedConfig::new(cfg.clone());
+
     // Role wiring.
     let mut replica_fingerprint = String::new();
     let mut lifecycle: Option<Arc<Lifecycle>> = None;
@@ -171,13 +183,13 @@ fn main() -> Result<()> {
     let observer: Arc<dyn PeerObserver> = if role_host {
         let h = Arc::new(HostObserver {
             status: status.clone(), fingerprint: Mutex::new(None), up: AtomicBool::new(false),
-            link: link.clone(), cfg_path: cfg_path.clone(), cfg: Mutex::new(cfg.clone()),
+            link: link.clone(), cfg_path: cfg_path.clone(), cfg: shared.clone(),
             control: host_control.clone(),
         });
         host_obs = Some(h.clone());
         h
     } else {
-        let (l, rx) = Lifecycle::new(cfg.clone(), link.clone(), local_port, secret.clone(), status.clone());
+        let (l, rx) = Lifecycle::new(shared.clone(), link.clone(), local_port, secret.clone(), status.clone());
         runtime.spawn(l.clone().run(rx));
         lifecycle = Some(l.clone());
         l
@@ -237,7 +249,7 @@ fn main() -> Result<()> {
     }
 
     let agent = Arc::new(Agent {
-        cfg: cfg.clone(), base: base.clone(), host_control: host_control.clone(), link: link.clone(),
+        cfg: shared.clone(), base: base.clone(), host_control: host_control.clone(), link: link.clone(),
         inb: inb.clone(), ctx: ctx.clone(),
         lifecycle: lifecycle.clone(), host_obs, replica_fingerprint, local_port, status: status.clone(),
         quit: Arc::new(Notify::new()),
@@ -272,7 +284,7 @@ fn main() -> Result<()> {
         if let Some(l) = &agent.lifecycle { let _ = l.tx.send(Event::Shutdown); }
         // Deregister on the way out, so the next agent in this directory
         // does not read a dead port back out of agent.json.
-        config::remove_socket_info(&agent.base, &agent.cfg.role);
+        config::remove_socket_info(&agent.base, &agent.cfg.role());
         Ok(())
     }
 }
@@ -311,7 +323,7 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
             // S6: prefer the native capture binary shipped next to the agent
             // (ScreenCaptureKit -> VideoToolbox) over the addon's ffmpeg argv.
             if cmd.get("native").and_then(Value::as_bool) != Some(false) {
-                if let Some(native) = native_capture_argv(cmd, &agent.cfg) {
+                if let Some(native) = agent.cfg.with(|c| native_capture_argv(cmd, c)) {
                     argv = native;
                 }
             }
@@ -322,13 +334,13 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
             }
         }
         Some("video_stop") => agent.ctx.video_src.stop(),
-        Some("connect") if agent.cfg.role == "host" => {
+        Some("connect") if agent.cfg.is_host() => {
             let addr = cmd.get("peer").and_then(Value::as_str).unwrap_or("").to_string();
             if addr.is_empty() {
                 return;
             }
             // The agent's pin wins over whatever the addon remembers.
-            let pinned = agent.host_obs.as_ref().map(|h| h.cfg.lock().unwrap().fingerprint.clone()).unwrap_or_default();
+            let pinned = agent.host_obs.as_ref().map(|h| h.cfg.with(|c| c.fingerprint.clone())).unwrap_or_default();
             let fp = if !pinned.is_empty() { pinned } else {
                 cmd.get("fingerprint").and_then(Value::as_str).unwrap_or("").to_string()
             };
@@ -342,18 +354,20 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
                 agent.host_control.set(Some(target));
             }
         }
-        Some("disconnect") if agent.cfg.role == "host" => agent.host_control.set(None),
-        Some("forget_fingerprint") if agent.cfg.role == "host" => {
+        Some("disconnect") if agent.cfg.is_host() => agent.host_control.set(None),
+        Some("forget_fingerprint") if agent.cfg.is_host() => {
             if let Some(h) = &agent.host_obs {
-                let mut cfg = h.cfg.lock().unwrap();
-                cfg.fingerprint.clear();
+                let cfg = h.cfg.update(|c| {
+                    c.fingerprint.clear();
+                    c.clone()
+                });
                 let _ = config::save(&h.cfg_path, &cfg);
             }
         }
         Some("detach") => {}
         Some("shutdown") => {
             // The addon asking us to exit: only meaningful for headless test agents.
-            if !agent.cfg.tray {
+            if !agent.cfg.with(|c| c.tray) {
                 agent.ctx.video_src.stop();
                 agent.quit.notify_waiters();
             }
@@ -390,15 +404,15 @@ mod tray {
         let menu = Menu::new();
         let status_item = MenuItem::new("starting", false, None);
         let info_item = MenuItem::new(
-            if agent.cfg.role == "host" { format!("host → {}", agent.cfg.peer) } else { format!("replica · listening {}", agent.cfg.listen) },
+            agent.cfg.with(|c| if c.role == "host" { format!("host → {}", c.peer) } else { format!("replica · listening {}", c.listen) }),
             false, None,
         );
         let fp_item = MenuItem::new(
             if agent.replica_fingerprint.is_empty() { "fingerprint: (host role)".to_string() } else { format!("fingerprint {}…", &agent.replica_fingerprint[..16]) },
             false, None,
         );
-        let start_item = MenuItem::new("Launch Blender now", agent.cfg.role != "host", None);
-        let stop_item = MenuItem::new("Close Blender", agent.cfg.role != "host", None);
+        let start_item = MenuItem::new("Launch Blender now", !agent.cfg.is_host(), None);
+        let stop_item = MenuItem::new("Close Blender", !agent.cfg.is_host(), None);
         let config_item = MenuItem::new("Open config folder", true, None);
         let quit_item = MenuItem::new("Quit QCBridge Agent", true, None);
         menu.append_items(&[
@@ -442,7 +456,7 @@ mod tray {
                 } else if ev.id == quit_item.id() {
                     if let Some(l) = &agent.lifecycle { let _ = l.tx.send(Event::Shutdown); }
                     agent.ctx.video_src.stop();
-                    config::remove_socket_info(&agent.base, &agent.cfg.role);
+                    config::remove_socket_info(&agent.base, &agent.cfg.role());
                     if let Some(rt) = runtime.lock().unwrap().take() {
                         rt.shutdown_timeout(std::time::Duration::from_millis(500));
                     }
