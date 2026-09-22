@@ -1,7 +1,11 @@
-//! Shared pieces for the QCBridge Agent (grown from the kyber-pipe spike): Annex-B access-unit
-//! splitting, the self-signed certificate, a fixed-rate Quinn controller and
-//! tiny helpers. The Kyber media path itself is KyProto's
-//! `VideoProtocol::UnreliableFec` (RaptorQ over QUIC datagrams), untouched.
+//! Shared pieces for the QCBridge Agent: Annex-B access-unit splitting, the
+//! self-signed certificate, a fixed-rate Quinn congestion controller and tiny
+//! helpers.
+//!
+//! `FixedRateController` is currently unused by the transport: it existed to
+//! hold a window open behind a media pacer, and video no longer rides the QUIC
+//! connection (the replica sends SRT). It is kept because it is the piece a
+//! paced media lane would need again.
 
 use anyhow::{Context, Result, bail};
 use bytes::{Bytes, BytesMut};
@@ -241,7 +245,11 @@ pub fn sha256_hex(der: &[u8]) -> String {
 /// Load `cert.der` + `key.der` from `dir`, or create a self-signed pair there.
 pub fn load_or_create_cert(
     dir: &Path,
-) -> Result<(kynet::cert::Certificate, kynet::cert::PrivateKey, String)> {
+) -> Result<(
+    rustls::pki_types::CertificateDer<'static>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+    String,
+)> {
     let cert_path = dir.join("cert.der");
     let key_path = dir.join("key.der");
     let (cert_der, key_der) = if cert_path.exists() && key_path.exists() {

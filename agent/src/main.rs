@@ -1,10 +1,11 @@
-//! QCBridge Agent — tray app owning the Kyber connection, the capture child
+//! QCBridge Agent — tray app owning the QUIC connection, the capture child
 //! and (replica) Blender's lifecycle. See spikes/parity/PLAN.md "The QCBridge
 //! Agent". Config: <config dir>/QCBridge/agent.toml; the addon finds the
 //! local socket via agent.json next to it.
 //!
-//! AGPL-3.0-or-later (links Kyber). Source: SOURCE_URL below — reported in
-//! `--version` and in every attach reply, per AGPL §13.
+//! GPL-3.0-or-later, same as the repository. SOURCE_URL is still reported by
+//! `--version` and in every attach reply — no longer an obligation, just
+//! useful.
 
 use anyhow::{Context, Result};
 use qcbridge_agent::blender::{Event, Lifecycle};
@@ -103,7 +104,7 @@ fn attach_reply(agent: &Agent) -> Value {
 fn main() -> Result<()> {
     let args = qcbridge_agent::Args::parse(USAGE);
     if args.flag("version") {
-        println!("qcbridge-agent {VERSION}\nsource: {SOURCE_URL}\nlicense: AGPL-3.0-or-later (links Kyber, LicenseRef-Kyber-Commercial OR AGPL-3.0-or-later)");
+        println!("qcbridge-agent {VERSION}\nsource: {SOURCE_URL}\nlicense: GPL-3.0-or-later");
         return Ok(());
     }
     let cfg_path = args.get("config").map(Into::into).unwrap_or_else(config::config_path);
@@ -117,7 +118,9 @@ fn main() -> Result<()> {
     let role_host = cfg.role == "host";
     eprintln!("[agent] {VERSION} role={} config={}", cfg.role, cfg_path.display());
 
-    kynet::init_crypto();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("a rustls crypto provider was already installed"))?;
 
     // Addon link + queues.
     let (out_tx, out_rx) = mpsc::channel(256);
@@ -207,7 +210,7 @@ fn main() -> Result<()> {
         // Quinn binds its socket inside a Tokio context.
         let listener = {
             let _guard = runtime.enter();
-            session::listen(addr, &config::cert_dir(), cfg.cap_mbps, session::DEFAULT_MTU)?
+            session::listen(addr, &config::cert_dir(), session::DEFAULT_MTU)?
         };
         replica_fingerprint = listener.fingerprint.clone();
         eprintln!("[agent] listening on {} fingerprint {}", cfg.listen, replica_fingerprint);
@@ -215,7 +218,7 @@ fn main() -> Result<()> {
         let ctx = ctx.clone();
         runtime.spawn(async move {
             loop {
-                if let Err(e) = session::serve_one(ctx.clone(), &listener.server).await {
+                if let Err(e) = session::serve_one(ctx.clone(), &listener.endpoint).await {
                     eprintln!("[agent] session ended: {e:#}");
                 }
             }
