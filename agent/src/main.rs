@@ -470,7 +470,11 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
                     Some(t) => ("probe", discovery::discover(Some(t), discovery::PORT, std::time::Duration::from_secs(2), &me).await),
                     None => ("multicast", discovery::discover(None, discovery::PORT, std::time::Duration::from_secs(1), &me).await),
                 };
-                let mut sources = vec![source.to_string()];
+                // Name only the sources that actually produced a peer: a
+                // sweep always *tries* multicast, but "found via multicast"
+                // when only the phonebook answered would mislabel the picker.
+                let mut sources = vec![];
+                if !peers.is_empty() { sources.push(source.to_string()); }
                 if target.is_none() {
                     let book = discovery::phonebook_scan(&cfg, &me);
                     if !book.is_empty() { sources.push("phonebook".into()); }
