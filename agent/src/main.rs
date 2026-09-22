@@ -10,6 +10,7 @@
 use anyhow::{Context, Result};
 use qcbridge_agent::blender::{Event, Lifecycle};
 use qcbridge_agent::config::{self, Config, SharedConfig};
+use qcbridge_agent::discovery;
 use qcbridge_agent::link::{Inbound, Link, serve_local, writer_thread};
 use qcbridge_agent::session::{self, Ctx, HostTarget, PeerObserver};
 use qcbridge_agent::video::{VideoSink, VideoSource, video_listener};
@@ -84,6 +85,10 @@ struct Agent {
     /// replica role could persist anything; and `base.join("agent.toml")`
     /// would be wrong under `--config other.toml`.
     cfg_path: std::path::PathBuf,
+    /// handle_cmd runs on the socket thread and is sync; anything that must
+    /// await (a discovery sweep) is spawned here.
+    rt: tokio::runtime::Handle,
+    beacon: discovery::Service,
     host_control: Arc<session::HostControl>,
     link: Arc<Link>,
     inb: Arc<Inbound>,
@@ -301,8 +306,32 @@ fn main() -> Result<()> {
         });
     }
 
+    let beacon = {
+        let paired: Arc<dyn Fn() -> bool + Send + Sync> = {
+            let l = lifecycle.clone();
+            let h = host_obs.clone();
+            Arc::new(move || {
+                l.as_ref().map(|l| l.peer_up.load(Relaxed))
+                    .or_else(|| h.as_ref().map(|h| h.up.load(Relaxed)))
+                    .unwrap_or(false)
+            })
+        };
+        // A host does not listen; advertising the default listen port from
+        // its config would offer a port nothing answers on.
+        let listen_port = if role_host { 0 } else {
+            cfg.listen.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(0)
+        };
+        discovery::Service::start(runtime.handle(), shared.clone(), Arc::new(discovery::Identity {
+            role: cfg.role.clone(),
+            listen_port,
+            fingerprint: replica_fingerprint.clone(),
+            version: VERSION.to_string(),
+            paired,
+        }))
+    };
     let agent = Arc::new(Agent {
         cfg: shared.clone(), base: base.clone(), cfg_path: cfg_path.clone(),
+        rt: runtime.handle().clone(), beacon,
         host_control: host_control.clone(), link: link.clone(),
         inb: inb.clone(), ctx: ctx.clone(),
         lifecycle: lifecycle.clone(), host_obs, replica_fingerprint, local_port, status: status.clone(),
@@ -338,6 +367,7 @@ fn main() -> Result<()> {
         if let Some(l) = &agent.lifecycle { let _ = l.tx.send(Event::Shutdown); }
         // Deregister on the way out, so the next agent in this directory
         // does not read a dead port back out of agent.json.
+        agent.beacon.set_mode("off");
         config::remove_socket_info(&agent.base, &agent.cfg.role());
         Ok(())
     }
@@ -415,10 +445,43 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
                 if applied.changed.iter().any(|f| f == "peer") && agent.cfg.is_host() {
                     retarget(agent, snapshot.peer.clone(), snapshot.fingerprint.clone());
                 }
-                // Phase C: a changed `discovery` or `phonebook` starts or
-                // stops the beacon here.
+                if applied.changed.iter().any(|f| f == "discovery" || f == "phonebook" || f == "name") {
+                    // The service rebinds on a mode change and re-reads the
+                    // name/phonebook on its next announce; nudge it now.
+                    agent.beacon.set_mode(&snapshot.discovery);
+                }
             }
             push_config_event(agent, cmd.get("req").cloned(), &applied);
+        }
+        Some("discover") => {
+            // Probe one address (the VPN path), or sweep: multicast plus the
+            // phonebook. Async, so it never blocks the addon link.
+            let req = cmd.get("req").cloned();
+            let target = cmd.get("addr").and_then(Value::as_str).map(String::from);
+            let link = agent.link.clone();
+            let cfg = agent.cfg.clone();
+            let me = discovery::SelfId {
+                fp: agent.replica_fingerprint.clone(),
+                name: agent.cfg.with(|c| c.display_name()),
+                role: agent.cfg.role(),
+            };
+            agent.rt.spawn(async move {
+                let (source, mut peers) = match target.as_deref() {
+                    Some(t) => ("probe", discovery::discover(Some(t), discovery::PORT, std::time::Duration::from_secs(2), &me).await),
+                    None => ("multicast", discovery::discover(None, discovery::PORT, std::time::Duration::from_secs(1), &me).await),
+                };
+                let mut sources = vec![source.to_string()];
+                if target.is_none() {
+                    let book = discovery::phonebook_scan(&cfg, &me);
+                    if !book.is_empty() { sources.push("phonebook".into()); }
+                    for b in book {
+                        if !peers.iter().any(|p| p.fp == b.fp && p.port == b.port) { peers.push(b); }
+                    }
+                }
+                let mut v = json!({"event": "peers", "sources": sources, "peers": peers});
+                if let Some(r) = req { v["req"] = r; }
+                link.event_try(v);
+            });
         }
         Some("forget_fingerprint") if agent.cfg.is_host() => {
             let snapshot = agent.cfg.update(|c| {
@@ -493,7 +556,14 @@ mod tray {
         let net_off = CheckMenuItem::with_id("net.off", "Off — no connections", true, mode0 == "off", None);
         let net_direct = CheckMenuItem::with_id("net.direct", "Direct only — reachable by address", true, mode0 == "direct", None);
         let net_discover = CheckMenuItem::with_id("net.discover", "Discoverable — also announce on the LAN", true, mode0 == "discoverable", None);
-        let network = Submenu::with_items("Network", true, &[&net_off, &net_direct, &net_discover])?;
+        // Replicas are the things that get found; a host only looks. The
+        // setting still exists in a host's config for symmetry, but there is
+        // nothing for it to do, so say so rather than offer a dead switch.
+        let network = if agent.cfg.is_host() {
+            Submenu::with_items("Network (a replica-side setting)", false, &[&net_off, &net_direct, &net_discover])?
+        } else {
+            Submenu::with_items("Network", true, &[&net_off, &net_direct, &net_discover])?
+        };
 
         menu.append_items(&[
             &status_item, &info_item, &fp_item, &PredefinedMenuItem::separator(),
@@ -570,7 +640,7 @@ mod tray {
                         if let Err(e) = config::save(&agent.cfg_path, &snapshot) {
                             eprintln!("[agent] could not persist config: {e}");
                         }
-                        // Phase C: start/stop the beacon here.
+                        agent.beacon.set_mode(&snapshot.discovery);
                     }
                     push_config_event(&agent, None, &applied);
                     last_mode.clear(); // force the check refresh next tick
@@ -589,6 +659,7 @@ mod tray {
                 } else if ev.id == quit_item.id() {
                     if let Some(l) = &agent.lifecycle { let _ = l.tx.send(Event::Shutdown); }
                     agent.ctx.video_src.stop();
+                    agent.beacon.set_mode("off"); // sends bye, removes the phonebook entry
                     config::remove_socket_info(&agent.base, &agent.cfg.role());
                     if let Some(rt) = runtime.lock().unwrap().take() {
                         rt.shutdown_timeout(std::time::Duration::from_millis(500));

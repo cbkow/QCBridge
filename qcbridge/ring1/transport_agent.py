@@ -378,6 +378,12 @@ class HostTransportAgent:
         self.stats: dict = {}
         self.agent_version = ""      # set in agent mode
         self.agent_mode = False
+        # Mirrored from the agent: it owns these, we display them.
+        self.agent_config: dict = {}
+        self.peers: list = []        # last discovery result
+        self.peers_sources: list = []
+        self._cmd_ids = itertools.count(1000)
+        self._cmd_replies: dict[int, dict] = {}
 
     def start(self) -> None:
         self._link = _make_link(self._cfg, "host", self._on_frame)
@@ -485,6 +491,16 @@ class HostTransportAgent:
             self._link_up = bool(event.get("peer_up"))
             self.peer_fingerprint = event.get("peer_fingerprint") or ""
             self.peer_pinned = True
+            self.agent_config = dict(event.get("config") or {})
+        elif name == "config":   # every settings change, from us or the tray
+            self.agent_config = dict(event.get("config") or self.agent_config)
+            self._stash_reply(event)
+        elif name == "peers":
+            self.peers = list(event.get("peers") or [])
+            self.peers_sources = list(event.get("sources") or [])
+            self._stash_reply(event)
+        elif name == "rejected":  # used to fall off the end of this chain
+            self.link_note = "agent refused the attach: " + (event.get("reason") or "bad secret")
         elif name == "peer":
             self._link_up = bool(event.get("up"))
             if self._link_up:
@@ -500,6 +516,35 @@ class HostTransportAgent:
             self.stats = event
         elif name == "error":
             self.link_note = event.get("msg") or ""
+
+    # -- agent commands with a correlated reply ---------------------------
+    # T_CMD has no reply channel; the agent answers with an event that echoes
+    # `req`. These stash such events so a caller can poll for its own.
+    def _stash_reply(self, event: dict) -> None:
+        req = event.get("req")
+        if isinstance(req, int):
+            self._cmd_replies[req] = event
+
+    def poll_cmd_reply(self, req_id: int) -> dict | None:
+        """The agent's reply to `req_id`, once; None until it arrives."""
+        return self._cmd_replies.pop(req_id, None)
+
+    def discover(self, addr: str | None = None) -> int:
+        """Probe one address (the VPN path) or sweep the LAN and phonebook.
+        Results land in `peers` and in the correlated `peers` reply."""
+        req = next(self._cmd_ids)
+        fields = {"cmd": "discover", "req": req}
+        if addr:
+            fields["addr"] = addr
+        self._link.cmd(**fields)
+        return req
+
+    def set_config(self, **fields) -> int:
+        """Change agent settings. The `config` reply names what changed, what
+        needs a restart, and what was rejected."""
+        req = next(self._cmd_ids)
+        self._link.cmd(cmd="set_config", req=req, set=fields)
+        return req
 
     def _handle_reply(self, reply: dict) -> None:
         if reply.get("kind") == "pong":
@@ -548,6 +593,11 @@ class ReplicaTransportAgent:
         self.link_note = ""
         self.video_state = "off"
         self.stats: dict = {}
+        self.agent_config: dict = {}
+        self.peers: list = []
+        self.peers_sources: list = []
+        self._cmd_ids = itertools.count(1000)
+        self._cmd_replies: dict[int, dict] = {}
         self.agent_version = ""
         self.agent_mode = False
         self.quit_requested = False
@@ -629,6 +679,18 @@ class ReplicaTransportAgent:
                 self.fingerprint = event.get("fingerprint") or ""
                 self.agent_version = event.get("version", "")
                 self.video_state = event.get("video_state") or self.video_state
+                self.agent_config = dict(event.get("config") or {})
+                self._ready.set()
+            elif name == "config":
+                self.agent_config = dict(event.get("config") or self.agent_config)
+                self._stash_reply(event)
+            elif name == "peers":
+                self.peers = list(event.get("peers") or [])
+                self.peers_sources = list(event.get("sources") or [])
+                self._stash_reply(event)
+            elif name == "rejected":
+                # Before, this timed out five seconds later with no reason.
+                self.link_note = "agent refused the attach: " + (event.get("reason") or "bad secret")
                 self._ready.set()
             elif name == "quit":
                 self.quit_requested = True  # the agent wants Blender closed
@@ -642,6 +704,27 @@ class ReplicaTransportAgent:
                 self.stats = event
             elif name == "error":
                 self.link_note = event.get("msg") or ""
+
+    def _stash_reply(self, event: dict) -> None:
+        req = event.get("req")
+        if isinstance(req, int):
+            self._cmd_replies[req] = event
+
+    def poll_cmd_reply(self, req_id: int) -> dict | None:
+        return self._cmd_replies.pop(req_id, None)
+
+    def discover(self, addr: str | None = None) -> int:
+        req = next(self._cmd_ids)
+        fields = {"cmd": "discover", "req": req}
+        if addr:
+            fields["addr"] = addr
+        self._link.cmd(**fields)
+        return req
+
+    def set_config(self, **fields) -> int:
+        req = next(self._cmd_ids)
+        self._link.cmd(cmd="set_config", req=req, set=fields)
+        return req
 
     def _serve_control(self, msg: dict) -> None:
         if msg.get("kind") == "ping":

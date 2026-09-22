@@ -30,6 +30,9 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 # congestion traits must be the same types quinn expects. RttEstimator lives
 # at the crate root, which quinn does not re-export.
 quinn-proto = { version = "0.11", default-features = false }
+# The beacon socket: SO_REUSEADDR/REUSEPORT and the multicast join. 0.6 is
+# the copy quinn-udp already brings in, so this adds no packages.
+socket2 = "0.6"
 
 anyhow = "1.0"
 bytes = "1.10"

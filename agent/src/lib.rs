@@ -412,6 +412,7 @@ mod tests {
 }
 
 pub mod blender;
+pub mod discovery;
 pub mod config;
 pub mod link;
 pub mod session;
