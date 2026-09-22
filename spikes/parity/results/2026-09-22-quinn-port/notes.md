@@ -51,6 +51,34 @@ removes a ~15 ms host fan-out hop. So the probe must be run with `--srt`, not
 3. `bootstrap_bench.sh` at 8 M and 40 M against `zmq` as the control, which
    carries no video and is therefore a clean transport A/B.
 
+## Result (2026-09-22, one Mac)
+
+| Criterion | Kyber, 2026-09-17 | quinn, 2026-09-22 |
+| --- | --- | --- |
+| Transport contract tests | 10 / 10 | **10 / 10** |
+| Full Python suite | 85 passed, 2 skipped | **87 passed, 0 skipped** — same tests, both transport suites now actually run |
+| 21-check sync smoke | 21 / 21 | **21 / 21**, `verdict.json "pass": true`, exit 0 |
+| `cargo build` / `cargo test` | — | clean / 2 passed |
+
+The smoke ran with `QCB_TRANSPORT=agent QCB_AGENT=spawn`, and it was checked
+to be the QUIC path rather than a silent fall back to zmq: the spawned
+replica agent logged `listening on 127.0.0.1:19990 fingerprint e41cd04e...`
+then `host connected`, which it only says once the token is accepted and all
+three lanes are open, and the host agent logged `pinned replica certificate`.
+`replica_clean` passed, so gaps, apply errors and unknown uuids were all
+zero, and `bake_crossed_via_resync` passed, which needs a second bootstrap
+mid-session.
+
+Also proved by hand, two agents with no Blender: a wrong token is rejected
+**immediately** — five rejections in the four seconds where the old Kyber
+path managed one five-second timeout — and reports
+`rejected by replica: closed by peer: token rejected (code 1)` instead of the
+old `video ready timeout (token rejected?)`. A wrong pin fails the TLS
+handshake with `replica certificate changed: pinned ..., got ...`.
+
+**Not run yet:** `bootstrap_bench.sh` at 8 M and 40 M verts against zmq, and
+everything cross-machine. Those are the remaining gates.
+
 ## Salvaged from the deleted kyber-pipe README
 
 Two things in it were statements about the design rather than about Kyber, so
