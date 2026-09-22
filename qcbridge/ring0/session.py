@@ -29,10 +29,10 @@ def _use_kyber(prefs) -> bool:
 def _make_transport(prefs, cfg: TransportConfig, role: str):
     # Imported lazily: the Kyber path must not need pyzmq, nor zmq the helper.
     if _use_kyber(prefs):
-        from ..ring1 import transport_kyber
+        from ..ring1 import transport_agent
 
-        cls = (transport_kyber.HostTransportKyber if role == "HOST"
-               else transport_kyber.ReplicaTransportKyber)
+        cls = (transport_agent.HostTransportAgent if role == "HOST"
+               else transport_agent.ReplicaTransportAgent)
     else:
         from ..ring1 import transport_zmq
 

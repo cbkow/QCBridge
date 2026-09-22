@@ -1,8 +1,14 @@
-"""Live localhost integration of the Kyber transport pair (plan phase S5).
+"""Live localhost integration of the agent transport pair.
 
-Same contract as test_transport_zmq.py, over one QUIC connection through two
-qcb-helper processes. Skipped whole-module when the helper isn't built
-(cargo build --release --bin qcb-helper in spikes/parity/kyber-pipe).
+Same contract as test_transport_zmq.py, over one QUIC connection between two
+qcbridge-agent processes this module spawns (QCB_AGENT=spawn). Each agent
+gets its own directory, so config, certificate and agent.json are isolated
+and a replica's certificate is stable across restarts within a test.
+
+This file IS the transport contract: the four cases below the zmq suite does
+not cover — keyed hot, credit-window backpressure, trust-on-first-use
+pinning, and a token rejected at the QUIC layer — are the reason it exists.
+Skipped whole-module when the agent isn't built (cargo build in agent/).
 """
 
 import os
@@ -19,12 +25,12 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "qcbridge")
 
 from ring1 import protocol  # noqa: E402
 from ring1.transport import TransportConfig  # noqa: E402
-from ring1.transport_kyber import (  # noqa: E402
-    HostTransportKyber, ReplicaTransportKyber, find_helper, pack_cold, unpack_cold,
+from ring1.transport_agent import (  # noqa: E402
+    HostTransportAgent, ReplicaTransportAgent, find_agent, pack_cold, unpack_cold,
 )
 
-if find_helper() is None:
-    pytest.skip("qcb-helper binary not built", allow_module_level=True)
+if find_agent() is None:
+    pytest.skip("qcbridge-agent binary not built", allow_module_level=True)
 
 HEARTBEAT = 0.1
 
@@ -46,12 +52,12 @@ def free_udp_port() -> int:
 
 def make_pair(tmp_path, token_host="tok", token_replica="tok", fingerprint=""):
     port = free_udp_port()
-    replica = ReplicaTransportKyber(TransportConfig(
+    replica = ReplicaTransportAgent(TransportConfig(
         address="127.0.0.1", port_control=port, port_hot=0, port_cold=0,
         heartbeat_interval=HEARTBEAT, token=token_replica, cert_dir=str(tmp_path / "cert"),
     ))
     replica.start()
-    host = HostTransportKyber(TransportConfig(
+    host = HostTransportAgent(TransportConfig(
         address="127.0.0.1", port_control=port, port_hot=0, port_cold=0,
         heartbeat_interval=HEARTBEAT, token=token_host, fingerprint=fingerprint,
     ))

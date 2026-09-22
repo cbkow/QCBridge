@@ -1,20 +1,26 @@
-"""Kyber implementation of the transport interface (parity plan, phase S5).
+"""Agent implementation of the transport interface.
 
-One QUIC connection carries every lane. The connection lives outside Blender:
-either in the QCBridge Agent (tray app, already running — the addon attaches
-to its local socket) or, for tests and dev, in a `qcb-helper` process this
-module spawns and talks to over stdin/stdout. Same frames either way. Kyber is
-AGPL; the process boundary keeps it out of the addon.
+One QUIC connection carries control, hot and cold. It lives outside Blender,
+in the QCBridge Agent: a separate process that owns the connection, the
+capture child and (on a replica) Blender's lifecycle. This module never
+speaks QUIC — it exchanges frames with the agent over a loopback socket, so
+nothing here knows or cares which protocol the agent runs. That is why the
+Kyber-to-quinn change did not touch this file beyond its name.
 
-Mode: QCB_AGENT=spawn forces the helper; otherwise the agent is used when
-QCB_AGENT_PORT/QCB_AGENT_SECRET are set (an agent-launched Blender) or the
-agent's agent.json exists in the user's config dir.
+Video does not ride the connection: the replica's encoder sends SRT and
+QCView opens the srt:// URL directly.
+
+Mode: normally the agent is already running and we attach to it, found via
+QCB_AGENT_PORT/QCB_AGENT_SECRET (an agent-launched Blender) or agent.json in
+the user's config dir. QCB_AGENT=spawn starts a private agent instead, which
+is what the contract tests use — each gets its own directory, so its config,
+certificate and agent.json are isolated.
 
 Replica listens, host connects (same topology as transport_zmq). Request /
 reply, heartbeats and pong status stay in Python, byte-compatible with the
 zmq transport's control JSON, so ring0 cannot tell the two apart.
 
-Frame, both directions:  u32 BE length | u8 type | body   (see qcb-helper.rs)
+Frame, both directions:  u32 BE length | u8 type | body   (see agent/src/link.rs)
 """
 
 from __future__ import annotations
@@ -48,16 +54,18 @@ _PEER = b"\x00"    # one peer today; the byte keeps several replicas possible
 _TICK = 0.05
 
 
-def find_helper(explicit: str = "") -> str | None:
-    """Explicit path → QCB_HELPER → a binary bundled next to the addon → the
-    spike's cargo build dir (dev checkouts)."""
-    exe = "qcb-helper.exe" if sys.platform == "win32" else "qcb-helper"
+def find_agent(explicit: str = "") -> str | None:
+    """Explicit path → QCB_AGENT_BIN → a binary bundled next to the addon →
+    the agent crate's cargo output (dev checkouts, release before debug)."""
+    exe = "qcbridge-agent.exe" if sys.platform == "win32" else "qcbridge-agent"
     here = Path(__file__).resolve()
+    repo = here.parents[2]
     candidates = [
         explicit,
-        os.environ.get("QCB_HELPER", ""),
+        os.environ.get("QCB_AGENT_BIN", ""),
         str(here.parents[1] / "bin" / exe),
-        str(here.parents[2] / "spikes" / "parity" / "kyber-pipe" / "target" / "release" / exe),
+        str(repo / "agent" / "target" / "release" / exe),
+        str(repo / "agent" / "target" / "debug" / exe),
     ]
     for path in candidates:
         if path and os.path.isfile(path):
@@ -79,12 +87,12 @@ def unpack_cold(body: bytes) -> tuple[dict, bytes] | None:
     return protocol.decode_cold([body[4:4 + n], body[4 + n:]])
 
 
-class _HelperLink:
-    """Owns the helper process. Writes never block the caller: frames queue
-    for a writer thread, and hot values conflate per key while it is busy."""
+class _FrameLink:
+    """Frame queueing, shared by every link. Writes never block the caller:
+    frames queue for a writer thread, and hot values conflate per key while
+    it is busy. Subclasses own the actual byte pipe."""
 
-    def __init__(self, argv: list[str], on_frame: Callable[[int, bytes], None]) -> None:
-        self._argv = argv
+    def __init__(self, on_frame: Callable[[int, bytes], None]) -> None:
         self._on_frame = on_frame
         self._proc: subprocess.Popen | None = None
         self._frames: collections.deque[bytes] = collections.deque()
@@ -95,18 +103,13 @@ class _HelperLink:
         self.exited = threading.Event()
 
     def start(self) -> None:
-        log = open(Path(tempfile.gettempdir()) / "qcbridge-helper.log", "ab")
-        log.write(f"\n--- spawn {time.ctime()} {' '.join(self._argv[:3])} ---\n".encode())
-        log.flush()
-        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        self._proc = subprocess.Popen(
-            self._argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
-            bufsize=0, creationflags=flags,
-        )
-        for target, name in ((self._read_loop, "qcb-helper-rx"), (self._write_loop, "qcb-helper-tx")):
-            thread = threading.Thread(target=target, name=name, daemon=True)
-            thread.start()
-            self._threads.append(thread)
+        raise NotImplementedError
+
+    def _write_loop(self) -> None:
+        raise NotImplementedError
+
+    def _read_exact(self, n: int) -> bytes | None:
+        raise NotImplementedError
 
     @staticmethod
     def _frame(kind: int, body: bytes) -> bytes:
@@ -126,58 +129,16 @@ class _HelperLink:
     def cmd(self, **fields) -> None:
         self.send(T_CMD, json.dumps(fields, separators=(",", ":")).encode("utf-8"))
 
-    def close(self, grace: float = 1.0) -> None:
-        """Flush what is queued (a goodbye rides out here), then ask the
-        helper to exit. It also exits on its own when stdin closes."""
-        self.cmd(cmd="shutdown")
-        with self._cv:
-            self._closing = True
-            self._cv.notify()
+    def _stop_proc(self, grace: float = 2.0) -> None:
+        """Only set when we spawned a private agent (QCB_AGENT=spawn)."""
         proc = self._proc
         if proc is None:
             return
+        proc.terminate()
         try:
             proc.wait(timeout=grace)
         except subprocess.TimeoutExpired:
             proc.kill()
-        for stream in (proc.stdin, proc.stdout):
-            try:
-                stream.close()
-            except OSError:
-                pass
-
-    def _write_loop(self) -> None:
-        stdin = self._proc.stdin
-        while True:
-            with self._cv:
-                while not self._frames and not self._hot and not self._closing:
-                    self._cv.wait()
-                batch = list(self._frames)
-                self._frames.clear()
-                batch.extend(self._hot.values())
-                self._hot.clear()
-                closing = self._closing
-            try:
-                for frame in batch:
-                    stdin.write(frame)
-            except (OSError, ValueError):
-                return
-            if closing and not batch:
-                return
-
-    def _read_exact(self, n: int) -> bytes | None:
-        chunks, got = [], 0
-        stdout = self._proc.stdout
-        while got < n:
-            try:
-                chunk = stdout.read(n - got)
-            except (OSError, ValueError):
-                return None
-            if not chunk:
-                return None
-            chunks.append(chunk)
-            got += len(chunk)
-        return b"".join(chunks)
 
     def _read_loop(self) -> None:
         while True:
@@ -217,18 +178,27 @@ def agent_socket_info(role: str) -> tuple[str, int, str] | None:
 
 
 def use_agent(role: str) -> bool:
+    """True when an agent for this role is reachable without spawning one."""
     return os.environ.get("QCB_AGENT", "") != "spawn" and agent_socket_info(role) is not None
 
 
-class _AgentLink(_HelperLink):
-    """Same frames as the helper, over the agent's local TCP socket. The
-    attach handshake is the first frame; the reply is an `attached` event."""
+class _AgentLink(_FrameLink):
+    """Frames over the agent's local TCP socket. The attach handshake is the
+    first frame; the reply is an `attached` event. `proc` is set only when we
+    spawned the agent ourselves and are therefore responsible for it."""
 
-    def __init__(self, info: tuple[str, int, str], role: str, on_frame: Callable[[int, bytes], None]) -> None:
-        super().__init__([], on_frame)
+    def __init__(
+        self,
+        info: tuple[str, int, str],
+        role: str,
+        on_frame: Callable[[int, bytes], None],
+        proc: subprocess.Popen | None = None,
+    ) -> None:
+        super().__init__(on_frame)
         self._info = info
         self._role = role
         self._sock = None
+        self._proc = proc
 
     def start(self) -> None:
         import socket
@@ -245,6 +215,8 @@ class _AgentLink(_HelperLink):
             self._threads.append(thread)
 
     def close(self, grace: float = 1.0) -> None:
+        # A shared agent outlives us and only gets a detach; one we spawned
+        # is ours to stop.
         self.cmd(cmd="detach")
         with self._cv:
             self._closing = True
@@ -254,6 +226,7 @@ class _AgentLink(_HelperLink):
             self._sock.close()
         except OSError:
             pass
+        self._stop_proc(grace)
 
     def _write_loop(self) -> None:
         while True:
@@ -287,28 +260,89 @@ class _AgentLink(_HelperLink):
         return b"".join(chunks)
 
 
-def _make_link(cfg: TransportConfig, role: str, on_frame, spawn_args: Callable[[], list[str]]):
-    if use_agent(role):
-        return _AgentLink(agent_socket_info(role), role, on_frame)
-    return _HelperLink(spawn_args(), on_frame)
+def spawn_agent(cfg: TransportConfig, role: str) -> tuple[tuple[str, int, str], subprocess.Popen]:
+    """Start a private agent for this role and wait for it to register.
 
-
-def _helper_args(cfg: TransportConfig, role: str) -> list[str]:
-    helper = find_helper(getattr(cfg, "helper_path", ""))
-    if helper is None:
+    Everything the instance owns — config, certificate, agent.json — lives in
+    one directory, so two agents on one machine cannot collide. `cert_dir`
+    picks that directory when given (its parent), which is how a caller keeps
+    a replica's certificate stable across restarts.
+    """
+    binary = find_agent(getattr(cfg, "agent_path", ""))
+    if binary is None:
         raise FileNotFoundError(
-            "qcb-helper not found — set QCB_HELPER or build spikes/parity/kyber-pipe"
+            "qcbridge-agent not found — set QCB_AGENT_BIN, or build it with "
+            "cargo build in agent/"
         )
-    args = [helper, "--role", role, "--token", getattr(cfg, "token", "") or "qcbridge"]
-    if getattr(cfg, "cap_mbps", 0):
-        args += ["--cap-mbps", str(cfg.cap_mbps)]
-    return args
+    cert_dir = getattr(cfg, "cert_dir", "")
+    base = Path(cert_dir).parent if cert_dir else Path(tempfile.mkdtemp(prefix="qcb-agent-"))
+    base.mkdir(parents=True, exist_ok=True)
+    cfg_path = base / f"{role}.toml"
+
+    peer = f"{cfg.address}:{cfg.port_control}"
+    lines = [
+        f'role = "{role}"',
+        f'token = "{getattr(cfg, "token", "") or "qcbridge"}"',
+        f'listen = "{peer}"' if role == "replica" else f'peer = "{peer}"',
+        'blender_path = ""',   # whoever spawned us already has Blender
+        "tray = false",
+        "video_port = 0",      # video goes over SRT, not through the agent
+    ]
+    if getattr(cfg, "fingerprint", ""):
+        lines.append(f'fingerprint = "{cfg.fingerprint}"')
+    cfg_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # A previous agent in this directory may still be registered: it is
+    # killed, not asked to quit, so nothing removed its entry. Drop our role
+    # first, or we would read the dead port back and dial it.
+    info_path = base / "agent.json"
+    try:
+        doc = json.loads(info_path.read_text(encoding="utf-8"))
+        doc.pop(role, None)
+        if doc:
+            info_path.write_text(json.dumps(doc), encoding="utf-8")
+        else:
+            info_path.unlink()
+    except (OSError, ValueError, AttributeError):
+        pass
+
+    log_path = base / f"{role}-agent.log"
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    log = open(log_path, "ab")
+    proc = subprocess.Popen(
+        [binary, "--config", str(cfg_path)], stdout=log, stderr=log, creationflags=flags
+    )
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            entry = json.loads(info_path.read_text(encoding="utf-8"))[role]
+            return ("127.0.0.1", int(entry["port"]), str(entry["secret"])), proc
+        except (OSError, ValueError, KeyError, TypeError):
+            if proc.poll() is not None:
+                raise RuntimeError(f"agent exited at once; see {log_path}")
+            time.sleep(0.05)
+    proc.kill()
+    raise TimeoutError(f"agent did not register in {info_path}; see {log_path}")
 
 
-class HostTransportKyber:
+def _make_link(cfg: TransportConfig, role: str, on_frame) -> _AgentLink:
+    if os.environ.get("QCB_AGENT", "") == "spawn":
+        info, proc = spawn_agent(cfg, role)
+        return _AgentLink(info, role, on_frame, proc)
+    info = agent_socket_info(role)
+    if info is None:
+        raise FileNotFoundError(
+            f"no running QCBridge Agent for role {role} — start the agent, or "
+            "set QCB_AGENT=spawn to have a private one started"
+        )
+    return _AgentLink(info, role, on_frame)
+
+
+class HostTransportAgent:
     def __init__(self, cfg: TransportConfig) -> None:
         self._cfg = cfg
-        self._link: _HelperLink | None = None
+        self._link: _AgentLink | None = None
         self._pending: dict[int, tuple[threading.Event | None, list]] = {}
         self._req_ids = itertools.count(1)
         self._lock = threading.Lock()
@@ -329,16 +363,7 @@ class HostTransportKyber:
         self.agent_mode = False
 
     def start(self) -> None:
-        def spawn_args() -> list[str]:
-            args = _helper_args(self._cfg, "host")
-            args += ["--connect", f"{self._cfg.address}:{self._cfg.port_control}"]
-            if getattr(self._cfg, "fingerprint", ""):
-                args += ["--fingerprint", self._cfg.fingerprint]
-            if getattr(self._cfg, "video_listen", ""):
-                args += ["--video-listen", self._cfg.video_listen]
-            return args
-
-        self._link = _make_link(self._cfg, "host", self._on_frame, spawn_args)
+        self._link = _make_link(self._cfg, "host", self._on_frame)
         self._link.start()
         self.agent_mode = isinstance(self._link, _AgentLink)
         if self.agent_mode:
@@ -490,10 +515,10 @@ class HostTransportKyber:
             self._stop.wait(_TICK)
 
 
-class ReplicaTransportKyber:
+class ReplicaTransportAgent:
     def __init__(self, cfg: TransportConfig) -> None:
         self._cfg = cfg
-        self._link: _HelperLink | None = None
+        self._link: _AgentLink | None = None
         self._handler: Callable[[dict], dict] = lambda msg: {"kind": "error"}
         self._status_provider: Callable[[], dict] | None = None
         self._hot: dict[bytes, bytes] = {}
@@ -511,14 +536,7 @@ class ReplicaTransportKyber:
         self.quit_requested = False
 
     def start(self) -> None:
-        def spawn_args() -> list[str]:
-            args = _helper_args(self._cfg, "replica")
-            args += ["--listen", f"{self._cfg.address}:{self._cfg.port_control}"]
-            if getattr(self._cfg, "cert_dir", ""):
-                args += ["--cert-dir", self._cfg.cert_dir]
-            return args
-
-        self._link = _make_link(self._cfg, "replica", self._on_frame, spawn_args)
+        self._link = _make_link(self._cfg, "replica", self._on_frame)
         self._link.start()
         self.agent_mode = isinstance(self._link, _AgentLink)
         self._ready.wait(timeout=5.0)
