@@ -76,8 +76,24 @@ path managed one five-second timeout — and reports
 old `video ready timeout (token rejected?)`. A wrong pin fails the TLS
 handshake with `replica certificate changed: pinned ..., got ...`.
 
-**Not run yet:** `bootstrap_bench.sh` at 8 M and 40 M verts against zmq, and
-everything cross-machine. Those are the remaining gates.
+### Bootstrap A/B (release build, loopback)
+
+| verts | zmq control | quinn | Kyber, 2026-09-17 |
+| --- | --- | --- | --- |
+| 8 M | 1.03 s (baseline 1.0) | **1.14 s** | 1.1 s |
+| 40 M | 1.21 s (baseline 1.24) | **3.02 s** | 3.1–3.2 s |
+
+Parity with Kyber, and the zmq control reproduces its own recorded numbers,
+so the comparison holds. The 40 M gap against zmq is the same one Kyber had
+and is a loopback artifact: on loopback zmq moves bytes at memory speed,
+while the QUIC path pays crypto and two socket hops. Over the VPN the
+441 MB case was network-bound and the two were equal (11.6 vs 11.65 s).
+
+**Build the agent with `--release` before benching.** A debug agent measured
+1.54 s at 8 M — a 35 % error, enough to look like a regression that is not
+there.
+
+**Not run yet:** everything cross-machine. That is the remaining gate.
 
 ## Salvaged from the deleted kyber-pipe README
 

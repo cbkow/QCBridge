@@ -24,7 +24,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "\
 qcbridge-agent [--config PATH] [--no-tray] [--role host|replica] [--listen IP:PORT]
-               [--peer IP:PORT] [--token T] [--local-port N] [--version]";
+               [--peer IP:PORT] [--token T] [--local-port N] [--exit-with-addon]
+               [--version]";
 
 /// Host-role observer: no Blender to manage. Pins the replica certificate
 /// on first successful connect (trust on first use) and tells the addon.
@@ -120,6 +121,11 @@ fn main() -> Result<()> {
     if let Some(t) = args.get("token") { cfg.token = t.to_string(); }
     if let Some(p) = args.get("local-port") { cfg.local_port = p.parse()?; }
     if args.flag("no-tray") { cfg.tray = false; }
+    // A spawned agent belongs to whoever spawned it. Without this it
+    // outlives a Blender that was killed rather than closed, keeps its UDP
+    // port, and the next run dies with "Address already in use" — which is
+    // exactly what happened to the first bootstrap bench.
+    let exit_with_addon = args.flag("exit-with-addon");
     let role_host = cfg.role == "host";
     eprintln!("[agent] {VERSION} role={} config={}", cfg.role, cfg_path.display());
 
@@ -244,6 +250,11 @@ fn main() -> Result<()> {
         let a = agent.clone();
         let on_detach: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             if let Some(l) = &a.lifecycle { let _ = l.tx.send(Event::AddonDetached); }
+            if exit_with_addon {
+                eprintln!("[agent] addon detached; exiting (--exit-with-addon)");
+                a.ctx.video_src.stop();
+                a.quit.notify_waiters();
+            }
         });
         let a = agent.clone();
         let on_cmd: Arc<dyn Fn(&Value) + Send + Sync> = Arc::new(move |cmd| handle_cmd(&a, cmd));
@@ -259,6 +270,9 @@ fn main() -> Result<()> {
     } else {
         runtime.block_on(agent.quit.notified());
         if let Some(l) = &agent.lifecycle { let _ = l.tx.send(Event::Shutdown); }
+        // Deregister on the way out, so the next agent in this directory
+        // does not read a dead port back out of agent.json.
+        config::remove_socket_info(&agent.base, &agent.cfg.role);
         Ok(())
     }
 }

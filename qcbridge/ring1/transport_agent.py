@@ -25,6 +25,7 @@ Frame, both directions:  u32 BE length | u8 type | body   (see agent/src/link.rs
 
 from __future__ import annotations
 
+import atexit
 import collections
 import itertools
 import json
@@ -260,6 +261,15 @@ class _AgentLink(_FrameLink):
         return b"".join(chunks)
 
 
+def _reap(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 def spawn_agent(cfg: TransportConfig, role: str) -> tuple[tuple[str, int, str], subprocess.Popen]:
     """Start a private agent for this role and wait for it to register.
 
@@ -309,9 +319,16 @@ def spawn_agent(cfg: TransportConfig, role: str) -> tuple[tuple[str, int, str], 
     log_path = base / f"{role}-agent.log"
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     log = open(log_path, "ab")
+    # --exit-with-addon: the agent belongs to us. Without it, a Blender that
+    # is killed rather than closed leaves the agent holding its UDP port, and
+    # the next run fails with "Address already in use".
     proc = subprocess.Popen(
-        [binary, "--config", str(cfg_path)], stdout=log, stderr=log, creationflags=flags
+        [binary, "--config", str(cfg_path), "--exit-with-addon"],
+        stdout=log, stderr=log, creationflags=flags,
     )
+    # Belt and braces for a hard kill of our own process, which never gets to
+    # close the link.
+    atexit.register(_reap, proc)
 
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
