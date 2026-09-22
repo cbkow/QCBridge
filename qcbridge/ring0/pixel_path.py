@@ -27,7 +27,7 @@ except ImportError:  # file-imported by tests with qcbridge/ on sys.path
 _RESTART_BACKOFF = 2.0
 
 # build_command(srt_url=PIPE_OUTPUT): Annex-B HEVC with AUDs on stdout, for
-# the Kyber helper (which owns and supervises the child in that mode).
+# an external owner of the capture child, when there is one.
 PIPE_OUTPUT = "pipe:"
 
 # Encoder rungs judged on a production scene (windows-v0-matrix/notes.md).
@@ -170,13 +170,13 @@ def start(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> None:
     _thread.start()
 
 
-_external = None  # (stop_fn, state_fn): the Kyber helper owns the child instead
+_external = None  # (stop_fn, state_fn): something else owns the child
 _EXTERNAL_STATUS = {"running": "streaming", "restarting": "ffmpeg exited — restarting",
                     "spawn_failed": "ffmpeg spawn failed", "off": "off", "": "off"}
 
 
 def set_external(stop_fn=None, state_fn=None) -> None:
-    """Kyber transport: capture runs as the helper's child, so stop()/status()
+    """When another process owns the capture child, stop()/status()
     — called from goodbye handling, the panel and pong status — defer to it."""
     global _external
     _external = (stop_fn, state_fn) if stop_fn and state_fn else None

@@ -51,6 +51,26 @@ removes a ~15 ms host fan-out hop. So the probe must be run with `--srt`, not
 3. `bootstrap_bench.sh` at 8 M and 40 M against `zmq` as the control, which
    carries no video and is therefore a clean transport A/B.
 
+## Salvaged from the deleted kyber-pipe README
+
+Two things in it were statements about the design rather than about Kyber, so
+they outlive the crate:
+
+- **The TLS server name is not verified** — the certificate fingerprint is
+  what pins the peer. Still true of `TofuVerifier` after the port: it ignores
+  `_server_name` and compares SHA-256 over the end-entity DER. `"localhost"`
+  is passed only because a name is required.
+- **What a paced media lane costs**, if one is ever built again: pacing per
+  datagram at the cap means every access unit waits roughly
+  `AU size x 1.35 / cap` before it is fully on the wire, so keyframes wait
+  longest, and the first VideoToolbox IDR was large enough to overflow the
+  queue — a new client usually started at the *second* keyframe, 1–2 s in.
+  That is the behaviour `FixedRateController` (kept in `agent/src/lib.rs`)
+  was shaped around.
+
+The rest of that README was about vendoring `quinn-proto` to avoid a 4.1 GB
+submodule checkout, and about AGPL obligations. Both are moot.
+
 ## Baselines that survive in the tree
 
 `win-loopback` (SRT 20 → 120 costing 91 → 191 ms, plus the NVENC pipe numbers),

@@ -34,12 +34,12 @@ def _dev_prefs():
         srt_port=9998, srt_url="", srt_latency_ms=60,
         encoder_rung="hevc_10_420_50", ffmpeg_path="",
         replica_kiosk=os.environ.get("QCB_AGENT_KIOSK", "1") == "1",
-        path_mappings=[], transport="kyber",
+        path_mappings=[], transport="agent",
     )
 
 
 def run() -> None:
-    os.environ["QCB_TRANSPORT"] = "kyber"
+    os.environ["QCB_TRANSPORT"] = "agent"
     prefs = _prefs()
     if prefs is not None:
         prefs.role = "REPLICA"
@@ -47,7 +47,7 @@ def run() -> None:
             prefs.token = os.environ["QCB_AGENT_TOKEN"]
         prefs.replica_kiosk = os.environ.get("QCB_AGENT_KIOSK", "1") == "1"
         if hasattr(prefs, "transport"):
-            prefs.transport = "KYBER"
+            prefs.transport = "AGENT"
 
     def _start():
         if prefs is not None:

@@ -120,7 +120,7 @@ impl Lifecycle {
             .env("QCB_AGENT_SECRET", &self.secret)
             .env("QCB_AGENT_TOKEN", &self.cfg.token)
             .env("QCB_AGENT_KIOSK", if self.cfg.kiosk { "1" } else { "0" })
-            .env("QCB_TRANSPORT", "kyber")
+            .env("QCB_TRANSPORT", "agent")
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
