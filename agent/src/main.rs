@@ -446,7 +446,7 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
 
 mod tray {
     use super::*;
-    use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
     use tao::event::Event as TaoEvent;
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     use tray_icon::{Icon, TrayIconBuilder};
@@ -483,15 +483,39 @@ mod tray {
         let stop_item = MenuItem::new("Close Blender", !agent.cfg.is_host(), None);
         let config_item = MenuItem::new("Open config folder", true, None);
         let quit_item = MenuItem::new("Quit QCBridge Agent", true, None);
+
+        // Network: a three-way radio built from check items with explicit
+        // ids. muda flips a check item BEFORE it sends the event (both the
+        // macOS and Windows backends), so the handler never asks
+        // is_checked() what was picked — it goes by id, then sets all three
+        // from the config that resulted.
+        let mode0 = agent.cfg.with(|c| c.discovery.clone());
+        let net_off = CheckMenuItem::with_id("net.off", "Off — no connections", true, mode0 == "off", None);
+        let net_direct = CheckMenuItem::with_id("net.direct", "Direct only — reachable by address", true, mode0 == "direct", None);
+        let net_discover = CheckMenuItem::with_id("net.discover", "Discoverable — also announce on the LAN", true, mode0 == "discoverable", None);
+        let network = Submenu::with_items("Network", true, &[&net_off, &net_direct, &net_discover])?;
+
         menu.append_items(&[
             &status_item, &info_item, &fp_item, &PredefinedMenuItem::separator(),
+            &network, &PredefinedMenuItem::separator(),
             &start_item, &stop_item, &PredefinedMenuItem::separator(),
             &config_item, &quit_item,
         ])?;
+        let info_text = {
+            let cfg = agent.cfg.clone();
+            move || cfg.with(|c| if c.role == "host" { format!("host → {}", c.peer) } else { format!("replica · listening {}", c.listen) })
+        };
+        let tooltip_text = {
+            let cfg = agent.cfg.clone();
+            move || cfg.with(|c| format!("QCBridge Agent — {} · {}", c.display_name(), c.discovery))
+        };
         let mut tray: Option<tray_icon::TrayIcon> = None;
         let runtime = std::sync::Mutex::new(Some(runtime));
         let rx = MenuEvent::receiver();
         let mut last_status = String::new();
+        let mut last_info = String::new();
+        let mut last_tooltip = String::new();
+        let mut last_mode = mode0;
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::WaitUntil(std::time::Instant::now() + std::time::Duration::from_millis(500));
             if let TaoEvent::NewEvents(tao::event::StartCause::Init) = event {
@@ -504,13 +528,54 @@ mod tray {
                         .expect("tray icon"),
                 );
             }
-            let _ = tray.as_ref(); // keeps the icon alive for the loop's lifetime
             let s = agent.status.lock().unwrap().clone();
             if s != last_status {
                 status_item.set_text(&s);
                 last_status = s;
             }
+            // These were built once and went stale; a set_config from the
+            // addon can change any of them under us, so refresh on the tick.
+            let info = info_text();
+            if info != last_info {
+                info_item.set_text(&info);
+                last_info = info;
+            }
+            let mode = agent.cfg.with(|c| c.discovery.clone());
+            if mode != last_mode {
+                net_off.set_checked(mode == "off");
+                net_direct.set_checked(mode == "direct");
+                net_discover.set_checked(mode == "discoverable");
+                last_mode = mode;
+            }
+            let tip = tooltip_text();
+            if tip != last_tooltip {
+                if let Some(t) = tray.as_ref() { let _ = t.set_tooltip(Some(tip.as_str())); }
+                last_tooltip = tip;
+            }
             while let Ok(ev) = rx.try_recv() {
+                let picked = if ev.id == "net.off" { Some("off") }
+                    else if ev.id == "net.direct" { Some("direct") }
+                    else if ev.id == "net.discover" { Some("discoverable") }
+                    else { None };
+                if let Some(m) = picked {
+                    // Same path as a set_config from the addon: apply,
+                    // persist, tell the addon. The tick above then sets the
+                    // three checks from the config that resulted, which is
+                    // what undoes muda's premature toggle.
+                    let (applied, snapshot) = agent.cfg.update(|c| {
+                        let a = config::apply_live(c, &json!({"discovery": m}));
+                        (a, c.clone())
+                    });
+                    if !applied.changed.is_empty() {
+                        if let Err(e) = config::save(&agent.cfg_path, &snapshot) {
+                            eprintln!("[agent] could not persist config: {e}");
+                        }
+                        // Phase C: start/stop the beacon here.
+                    }
+                    push_config_event(&agent, None, &applied);
+                    last_mode.clear(); // force the check refresh next tick
+                    continue;
+                }
                 if ev.id == start_item.id() {
                     if let Some(l) = &agent.lifecycle { let _ = l.tx.send(Event::ManualStart); }
                 } else if ev.id == stop_item.id() {
