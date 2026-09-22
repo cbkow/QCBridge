@@ -8,3 +8,6 @@ __pycache__/
 .venv/
 dist/
 .pytest_cache/
+
+# built bench binaries (spikes/parity/mux-tax)
+spikes/parity/mux-tax/qcb-stamp
