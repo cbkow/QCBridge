@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -75,13 +75,23 @@ pub fn config_path() -> PathBuf {
     config_dir().join("agent.toml")
 }
 
-/// Where the addon looks for {port, secret}: written by the agent at start.
-pub fn socket_info_path() -> PathBuf {
-    config_dir().join("agent.json")
+/// Everything an agent instance owns sits beside its config file: the TOML,
+/// the certificate, and the agent.json the addon reads. Deriving them from
+/// the config path is what makes `--config` isolate an instance — before,
+/// only the TOML moved, so two agents pointed at different configs still
+/// shared one certificate and one agent.json. For the default config path
+/// this resolves to exactly where those files already live.
+pub fn base_dir(config_path: &Path) -> PathBuf {
+    config_path.parent().map(Path::to_path_buf).unwrap_or_else(config_dir)
 }
 
-pub fn cert_dir() -> PathBuf {
-    config_dir().join("cert")
+/// Where the addon looks for {port, secret}: written by the agent at start.
+pub fn socket_info_path(base: &Path) -> PathBuf {
+    base.join("agent.json")
+}
+
+pub fn cert_dir(base: &Path) -> PathBuf {
+    base.join("cert")
 }
 
 pub fn load_or_create(path: &PathBuf) -> Result<Config> {
@@ -104,8 +114,8 @@ pub fn save(path: &PathBuf, cfg: &Config) -> Result<()> {
 
 /// agent.json holds one entry per role, so a host and a replica agent can
 /// share a machine (dev, or a workstation that is both).
-pub fn write_socket_info(role: &str, port: u16, secret: &str) -> Result<()> {
-    let path = socket_info_path();
+pub fn write_socket_info(base: &Path, role: &str, port: u16, secret: &str) -> Result<()> {
+    let path = socket_info_path(base);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -134,8 +144,8 @@ pub fn write_socket_info(role: &str, port: u16, secret: &str) -> Result<()> {
     anyhow::bail!("could not register in {}", path.display())
 }
 
-pub fn remove_socket_info(role: &str) {
-    let path = socket_info_path();
+pub fn remove_socket_info(base: &Path, role: &str) {
+    let path = socket_info_path(base);
     if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(obj) = doc.as_object_mut() {

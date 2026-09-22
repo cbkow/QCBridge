@@ -104,6 +104,14 @@ impl Lifecycle {
         if self.blender_running() {
             return;
         }
+        // An empty blender_path means "do not supervise Blender": the agent
+        // still pairs, carries every lane and reports status, it just never
+        // launches anything. That is what the transport contract tests need,
+        // and it suits a machine where Blender is started by hand.
+        if self.cfg.blender_path.trim().is_empty() {
+            self.set_status("connected (Blender supervision off)");
+            return;
+        }
         let mut cmd = Command::new(&self.cfg.blender_path);
         cmd.args(&self.cfg.blender_args)
             .arg("--python-expr")

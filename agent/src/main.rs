@@ -70,6 +70,8 @@ impl PeerObserver for HostObserver {
 
 struct Agent {
     cfg: Config,
+    /// Directory this instance owns: config, cert, agent.json.
+    base: std::path::PathBuf,
     host_control: Arc<session::HostControl>,
     link: Arc<Link>,
     inb: Arc<Inbound>,
@@ -109,6 +111,9 @@ fn main() -> Result<()> {
     }
     let cfg_path = args.get("config").map(Into::into).unwrap_or_else(config::config_path);
     let mut cfg = config::load_or_create(&cfg_path)?;
+    // Cert and agent.json live beside the config, so --config isolates an
+    // instance completely (two agents in a test, or host+replica in dev).
+    let base = config::base_dir(&cfg_path);
     if let Some(r) = args.get("role") { cfg.role = r.to_string(); }
     if let Some(l) = args.get("listen") { cfg.listen = l.to_string(); }
     if let Some(p) = args.get("peer") { cfg.peer = p.to_string(); }
@@ -146,7 +151,7 @@ fn main() -> Result<()> {
         rand::thread_rng().fill_bytes(&mut b);
         hex::encode(b)
     };
-    config::write_socket_info(&cfg.role, local_port, &secret)?;
+    config::write_socket_info(&base, &cfg.role, local_port, &secret)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     let video_src = Arc::new(VideoSource::new());
@@ -210,7 +215,7 @@ fn main() -> Result<()> {
         // Quinn binds its socket inside a Tokio context.
         let listener = {
             let _guard = runtime.enter();
-            session::listen(addr, &config::cert_dir(), session::DEFAULT_MTU)?
+            session::listen(addr, &config::cert_dir(&base), session::DEFAULT_MTU)?
         };
         replica_fingerprint = listener.fingerprint.clone();
         eprintln!("[agent] listening on {} fingerprint {}", cfg.listen, replica_fingerprint);
@@ -226,7 +231,8 @@ fn main() -> Result<()> {
     }
 
     let agent = Arc::new(Agent {
-        cfg: cfg.clone(), host_control: host_control.clone(), link: link.clone(), inb: inb.clone(), ctx: ctx.clone(),
+        cfg: cfg.clone(), base: base.clone(), host_control: host_control.clone(), link: link.clone(),
+        inb: inb.clone(), ctx: ctx.clone(),
         lifecycle: lifecycle.clone(), host_obs, replica_fingerprint, local_port, status: status.clone(),
         quit: Arc::new(Notify::new()),
     });
@@ -414,7 +420,7 @@ mod tray {
                 } else if ev.id == stop_item.id() {
                     if let Some(l) = &agent.lifecycle { let _ = l.tx.send(Event::ManualStop); }
                 } else if ev.id == config_item.id() {
-                    let dir = config::config_dir();
+                    let dir = agent.base.clone();
                     #[cfg(target_os = "macos")]
                     let _ = std::process::Command::new("open").arg(&dir).spawn();
                     #[cfg(windows)]
@@ -422,7 +428,7 @@ mod tray {
                 } else if ev.id == quit_item.id() {
                     if let Some(l) = &agent.lifecycle { let _ = l.tx.send(Event::Shutdown); }
                     agent.ctx.video_src.stop();
-                    config::remove_socket_info(&agent.cfg.role);
+                    config::remove_socket_info(&agent.base, &agent.cfg.role);
                     if let Some(rt) = runtime.lock().unwrap().take() {
                         rt.shutdown_timeout(std::time::Duration::from_millis(500));
                     }

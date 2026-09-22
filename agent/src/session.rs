@@ -311,6 +311,28 @@ impl HostControl {
 }
 
 pub async fn connect_one(ctx: Arc<Ctx>, target: &HostTarget) -> Result<()> {
+    let (conn, lanes, fingerprint) = match dial(&ctx, target).await {
+        Ok(v) => v,
+        Err(e) => {
+            // Anything that fails before the lanes are up — a rejected token,
+            // a changed certificate, no route — used to be swallowed whole:
+            // host_loop discards the error and peer_down was only reached
+            // after a session had already started. The addon got no reason.
+            ctx.observer.peer_down(format!("{e:#}"));
+            return Err(e);
+        }
+    };
+    ctx.observer.peer_up(fingerprint);
+    let r = run_lanes(ctx.clone(), conn, lanes).await;
+    ctx.observer.peer_down(r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+    r
+}
+
+/// Everything up to "all three lanes are open and the token was accepted".
+async fn dial(
+    ctx: &Arc<Ctx>,
+    target: &HostTarget,
+) -> Result<(quinn::Connection, Lanes, Option<String>)> {
     let addr = target
         .addr
         .to_socket_addrs()
@@ -352,7 +374,13 @@ pub async fn connect_one(ctx: Arc<Ctx>, target: &HostTarget) -> Result<()> {
     let reply = tokio::time::timeout(HANDSHAKE, recv_msg(&mut control_recv))
         .await
         .context("auth reply timeout")?
-        .context("auth reply")?
+        // A rejected token reaches us as the connection dropping, so the
+        // close reason the replica set is the message worth reporting —
+        // "connection lost" on its own says nothing.
+        .map_err(|e| match conn.close_reason() {
+            Some(c) => anyhow!("rejected by replica: {c}"),
+            None => e.context("auth reply"),
+        })?
         .ok_or_else(|| anyhow!("replica closed during auth"))?;
     if reply.as_ref() != b"ok" {
         bail!("unexpected auth reply from replica");
@@ -364,7 +392,6 @@ pub async fn connect_one(ctx: Arc<Ctx>, target: &HostTarget) -> Result<()> {
     write_tag(&mut cold_send, LANE_COLD).await?;
 
     let fingerprint = seen.lock().unwrap().as_deref().map(hex::encode);
-    ctx.observer.peer_up(fingerprint);
     let lanes = Lanes {
         control_send,
         control_recv,
@@ -373,15 +400,17 @@ pub async fn connect_one(ctx: Arc<Ctx>, target: &HostTarget) -> Result<()> {
         cold_send: Some(cold_send),
         cold_recv: None,
     };
-    let r = run_lanes(ctx.clone(), conn, lanes).await;
-    ctx.observer.peer_down(r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
-    r
+    Ok((conn, lanes, fingerprint))
 }
 
 /// Host: connect to whatever target the control holds, forever, with
 /// backoff; a target change drops the session and reconnects.
 pub async fn host_loop(ctx: Arc<Ctx>, control: Arc<HostControl>) {
     let mut backoff = Duration::from_millis(250);
+    // Only logged when it changes: the loop retries every 250 ms to 2 s, and
+    // a host that cannot reach its replica would otherwise fill the log with
+    // one identical line per attempt.
+    let mut last_reason = String::new();
     loop {
         let (target, generation) = {
             let t = control.target.lock().unwrap().clone();
@@ -393,7 +422,15 @@ pub async fn host_loop(ctx: Arc<Ctx>, control: Arc<HostControl>) {
         };
         let started = Instant::now();
         tokio::select! {
-            _ = connect_one(ctx.clone(), &target) => {}
+            r = connect_one(ctx.clone(), &target) => {
+                let reason = r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default();
+                if reason != last_reason {
+                    if !reason.is_empty() {
+                        eprintln!("[agent] connect to {}: {reason}", target.addr);
+                    }
+                    last_reason = reason;
+                }
+            }
             _ = async {
                 loop {
                     control.notify.notified().await;
