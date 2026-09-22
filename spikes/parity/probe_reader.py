@@ -5,7 +5,7 @@ the strip is the host's time.time(), so `now - stamp` is motion-to-decode
 on one clock in every OS pairing.
 
   python probe_reader.py --srt 10.0.0.5:9998 --latency 120 --token dev --out run.jsonl
-  kyber-recv ... | python probe_reader.py --stdin --out run.jsonl
+  <any Annex-B HEVC source> | python probe_reader.py --stdin --out run.jsonl
 
 Measures up to decoded frame; present/scanout is not included. Each
 sequence number is scored the first time it appears (later repeats of the

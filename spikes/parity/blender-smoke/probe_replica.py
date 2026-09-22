@@ -1,7 +1,7 @@
 """Probe smoke replica: strip on (QCB_PROBE=1 from the launcher).
 
 Env: QCB_SMOKE_BIND (127.0.0.1), QCB_SMOKE_TOKEN (smoketok), QCB_SMOKE_STREAM
-(1 = addon's own SRT stream, 0 = none, e.g. when an external kyber pipeline
+(1 = addon's own SRT stream, 0 = none, e.g. when an external pipeline
 captures), QCB_SMOKE_SRT_LATENCY (60), QCB_SMOKE_RUNG (hevc_10_420_50),
 QCB_SMOKE_FFMPEG, QCB_SMOKE_KIOSK (0), QCB_SMOKE_CYCLES_DEVICE (OPTIX/CUDA/METAL). The replica viewport is always
 Rendered shading (kiosk.prepare_viewport); the engine comes from the host.

@@ -1,9 +1,9 @@
 #!/bin/zsh
 # Bootstrap bench (macOS, one machine): time from host session start to the
 # replica reporting its first bootstrap applied. Usage:
-#   bootstrap_bench.sh <work-dir> <zmq|kyber> <million-verts>
+#   bootstrap_bench.sh <work-dir> <zmq|agent> <million-verts>
 set -u
-HERE="${0:a:h}"; W="${1:?work dir}"; KIND="${2:?zmq|kyber}"; HEAVY="${3:-4}"
+HERE="${0:a:h}"; W="${1:?work dir}"; KIND="${2:?zmq|agent}"; HEAVY="${3:-4}"
 BL="${BLENDER:-/Applications/Blender.app/Contents/MacOS/Blender}"
 REPO="${HERE:h:h:h}"
 mkdir -p "$W/pysite" "$W/bl_host" "$W/bl_replica"

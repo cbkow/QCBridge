@@ -5,7 +5,7 @@ can be compared with identical input on any OS. Random noise below the strip
 makes the encoder actually spend its bitrate.
 
   python probe_testsrc.py --srt-listen 0.0.0.0:9998 --latency 120 --token dev
-  python probe_testsrc.py --stdout | kyber-send ...        (Annex-B HEVC)
+  python probe_testsrc.py --stdout | <sender>              (Annex-B HEVC)
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def main() -> None:
            "-r", str(args.fps), "-i", "-",
            *encoder_args(args.fps, args.bitrate, args.encoder)]
     if args.stdout:
-        # AUD NALs mark access-unit boundaries for pipe consumers (kyber-pipe).
+        # AUD NALs mark access-unit boundaries for pipe consumers.
         cmd += ["-bsf:v", "hevc_metadata=aud=insert", "-f", "hevc", "-"]
     else:
         host, port = args.srt_listen.rsplit(":", 1)

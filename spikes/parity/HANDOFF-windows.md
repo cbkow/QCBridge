@@ -3,6 +3,14 @@
 Written 2026-09-17 by the Mac session. Read this, then `spikes/parity/README.md`
 and `spikes/parity/results/2026-09-17-mac-loopback/notes.md`.
 
+> **Superseded in part, 2026-09-22.** Task 4 below was the Kyber go/no-go.
+> Kyber is gone: the transport is plain `quinn` and video no longer rides the
+> connection. Skip task 4 and build `agent/` instead (`cargo build`, then
+> `pytest -q` — the transport contract tests spawn the agent themselves). The
+> ground rules, ports, addresses and clock-correction notes all still apply.
+> Current plan: `PLAN.md`; what the port had to match:
+> `results/2026-09-22-quinn-port/notes.md`.
+
 ## Context in five lines
 
 - QCBridge = host Blender syncs a replica Blender; replica viewport is captured,
@@ -41,13 +49,11 @@ and `spikes/parity/results/2026-09-17-mac-loopback/notes.md`.
    - reader `--hwaccel none` once, to separate decode from encode
 3. **Windows SRT loopback:** sender `--srt-listen 127.0.0.1:19998 --latency 120 --token spike`,
    reader `--srt 127.0.0.1:19998 --latency 120 --token spike --seconds 20`; repeat at latency 20.
-4. **Kyber Windows build check** (the Kyber go/no-go). Install rustup (MSVC
-   toolchain; Rust 1.89 is pinned by Kyber). Clone
-   `https://github.com/instinctual/plank-kymux` (Plank's pinned Kyber crates:
-   kynet, kyproto, kymux, …; AGPL) OUTSIDE the repo, then
-   `cargo check` and `cargo check -p kymux --features backend-quinn,backend-wtransport`.
-   On the Mac both compile cleanly; a Windows cross-check from the Mac only failed
-   on missing Windows C headers for `ring`. Report pass/fail with the first error.
+4. ~~**Kyber Windows build check**~~ — **superseded 2026-09-22.** There is no
+   Kyber and no external clone. Install rustup (MSVC toolchain), then
+   `cargo build` in `agent/` and `python -m pytest -q` at the repo root; the
+   transport contract tests spawn two agents themselves. Report the test
+   counts and the first error if any.
 5. **Write** `spikes/parity/results/2026-09-17-win-loopback/notes.md` in the same
    table shape as the Mac notes, commit, push, and tell chris the headline.
 6. **Then wait for chris** to coordinate cross-machine runs with the Mac session:
