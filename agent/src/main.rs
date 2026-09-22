@@ -80,6 +80,10 @@ struct Agent {
     cfg: SharedConfig,
     /// Directory this instance owns: config, cert, agent.json.
     base: std::path::PathBuf,
+    /// The TOML itself. Only HostObserver held this before, so nothing in
+    /// replica role could persist anything; and `base.join("agent.toml")`
+    /// would be wrong under `--config other.toml`.
+    cfg_path: std::path::PathBuf,
     host_control: Arc<session::HostControl>,
     link: Arc<Link>,
     inb: Arc<Inbound>,
@@ -104,11 +108,50 @@ fn attach_reply(agent: &Agent) -> Value {
             .or_else(|| agent.host_obs.as_ref().map(|h| h.up.load(Relaxed))).unwrap_or(false),
         "video_port": agent.cfg.with(|c| if c.role == "host" { c.video_port } else { 0 }),
         "video_state": *agent.ctx.video_src.state.lock().unwrap(),
+        // The live settings, so the addon mirrors them instead of owning
+        // its own copy. The addon already received `role` and `port` and
+        // threw them away; now there is a reason to keep them.
+        "config": agent.cfg.with(config::live_view),
     });
     if let Some(h) = &agent.host_obs {
         v["peer_fingerprint"] = json!(h.fingerprint.lock().unwrap().clone());
     }
     v
+}
+
+/// Every settings change ends here, whether it came from the addon
+/// (`set_config`) or the tray, so the addon's panel never shows a stale
+/// value. `req` is echoed when the command carried one: T_CMD has no reply
+/// channel, so this event is the reply.
+fn push_config_event(agent: &Agent, req: Option<Value>, applied: &config::Applied) {
+    let mut v = json!({
+        "event": "config",
+        "config": agent.cfg.with(config::live_view),
+        "changed": applied.changed,
+        "needs_restart": applied.needs_restart,
+        "rejected": applied.rejected,
+    });
+    if let Some(r) = req {
+        v["req"] = r;
+    }
+    agent.link.event_try(v);
+}
+
+/// Point the host at `addr`, pinning `fp` if the agent has not already
+/// pinned one itself. Shared by `connect` and a `set_config` that changes
+/// `peer`.
+fn retarget(agent: &Agent, addr: String, fp: String) {
+    let pinned = agent.cfg.with(|c| c.fingerprint.clone());
+    let fp = if !pinned.is_empty() { pinned } else { fp };
+    let target = HostTarget {
+        addr,
+        fingerprint: (!fp.is_empty()).then(|| hex::decode(fp.to_lowercase().replace(':', "")).ok()).flatten(),
+        mtu: session::DEFAULT_MTU,
+    };
+    if agent.host_control.target.lock().unwrap().as_ref() != Some(&target) {
+        *agent.status.lock().unwrap() = format!("connecting to {}", target.addr);
+        agent.host_control.set(Some(target));
+    }
 }
 
 fn main() -> Result<()> {
@@ -164,6 +207,16 @@ fn main() -> Result<()> {
         rand::thread_rng().fill_bytes(&mut b);
         hex::encode(b)
     };
+    // Refuse to be the second agent of this role in this directory. A live
+    // pid in agent.json means one is already running; a dead one (a crash,
+    // a kill -9) is simply overwritten, as before.
+    if let Some(pid) = config::registered_live_pid(&base, &cfg.role) {
+        anyhow::bail!(
+            "another {} agent (pid {pid}) is already registered in {} — quit it \
+             first, or point --config at a different directory",
+            cfg.role, base.display()
+        );
+    }
     config::write_socket_info(&base, &cfg.role, local_port, &secret)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
@@ -249,7 +302,8 @@ fn main() -> Result<()> {
     }
 
     let agent = Arc::new(Agent {
-        cfg: shared.clone(), base: base.clone(), host_control: host_control.clone(), link: link.clone(),
+        cfg: shared.clone(), base: base.clone(), cfg_path: cfg_path.clone(),
+        host_control: host_control.clone(), link: link.clone(),
         inb: inb.clone(), ctx: ctx.clone(),
         lifecycle: lifecycle.clone(), host_obs, replica_fingerprint, local_port, status: status.clone(),
         quit: Arc::new(Notify::new()),
@@ -340,29 +394,43 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
                 return;
             }
             // The agent's pin wins over whatever the addon remembers.
-            let pinned = agent.host_obs.as_ref().map(|h| h.cfg.with(|c| c.fingerprint.clone())).unwrap_or_default();
-            let fp = if !pinned.is_empty() { pinned } else {
-                cmd.get("fingerprint").and_then(Value::as_str).unwrap_or("").to_string()
-            };
-            let target = HostTarget {
-                addr,
-                fingerprint: (!fp.is_empty()).then(|| hex::decode(fp.to_lowercase().replace(':', "")).ok()).flatten(),
-                mtu: session::DEFAULT_MTU,
-            };
-            if agent.host_control.target.lock().unwrap().as_ref() != Some(&target) {
-                *agent.status.lock().unwrap() = format!("connecting to {}", target.addr);
-                agent.host_control.set(Some(target));
-            }
+            let fp = cmd.get("fingerprint").and_then(Value::as_str).unwrap_or("").to_string();
+            retarget(agent, addr, fp);
         }
         Some("disconnect") if agent.cfg.is_host() => agent.host_control.set(None),
-        Some("forget_fingerprint") if agent.cfg.is_host() => {
-            if let Some(h) = &agent.host_obs {
-                let cfg = h.cfg.update(|c| {
-                    c.fingerprint.clear();
-                    c.clone()
-                });
-                let _ = config::save(&h.cfg_path, &cfg);
+        Some("set_config") => {
+            // Live fields are applied and persisted; restart-only ones are
+            // named back rather than silently ignored. Same read-modify-write
+            // shape forget_fingerprint used, so the snapshot saved is the one
+            // the lock protected.
+            let patch = cmd.get("set").cloned().unwrap_or(Value::Null);
+            let (applied, snapshot) = agent.cfg.update(|c| {
+                let a = config::apply_live(c, &patch);
+                (a, c.clone())
+            });
+            if !applied.changed.is_empty() {
+                if let Err(e) = config::save(&agent.cfg_path, &snapshot) {
+                    eprintln!("[agent] could not persist config: {e}");
+                }
+                if applied.changed.iter().any(|f| f == "peer") && agent.cfg.is_host() {
+                    retarget(agent, snapshot.peer.clone(), snapshot.fingerprint.clone());
+                }
+                // Phase C: a changed `discovery` or `phonebook` starts or
+                // stops the beacon here.
             }
+            push_config_event(agent, cmd.get("req").cloned(), &applied);
+        }
+        Some("forget_fingerprint") if agent.cfg.is_host() => {
+            let snapshot = agent.cfg.update(|c| {
+                c.fingerprint.clear();
+                c.clone()
+            });
+            if let Err(e) = config::save(&agent.cfg_path, &snapshot) {
+                eprintln!("[agent] could not persist config: {e}");
+            }
+            // It used to persist and tell nobody.
+            let applied = config::Applied { changed: vec!["fingerprint".into()], ..Default::default() };
+            push_config_event(agent, cmd.get("req").cloned(), &applied);
         }
         Some("detach") => {}
         Some("shutdown") => {

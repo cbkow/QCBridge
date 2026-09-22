@@ -47,5 +47,10 @@ tray-icon = "0.20"
 muda = "0.16"
 tao = "0.31"
 
+# gethostname and kill(pid, 0), for the beacon's machine name and the
+# single-instance guard. Already in the lock via quinn; adds no packages.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 debug = 1

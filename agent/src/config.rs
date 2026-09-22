@@ -23,7 +23,10 @@ pub struct Config {
     /// Replica, native capture: stream resolution as a fraction of the
     /// captured pixels (1.0 = native; 0.5 halves each dimension).
     pub capture_scale: f64,
-    /// Host: local TCP port serving the stream to the viewer (0 = off).
+    /// Host: local TCP port re-serving the stream to the viewer (0 = off).
+    /// Off by default since the quinn port: video no longer rides the
+    /// connection, QCView opens the replica's srt:// directly, and nothing
+    /// feeds this listener. Kept for compatibility with existing TOMLs.
     pub video_port: u16,
     /// Local socket for the addon (0 = pick a free port).
     pub local_port: u16,
@@ -35,6 +38,13 @@ pub struct Config {
     pub idle_secs: u64,
     /// Show the tray icon (false = headless, for tests and services).
     pub tray: bool,
+    /// Shown to peers and in the tray. Empty = the OS hostname.
+    pub name: String,
+    /// "off" | "direct" | "discoverable". Direct is the default: beaconing
+    /// on a facility network is opt-in, and the VPN cannot use it anyway.
+    pub discovery: String,
+    /// Shared directory for the phonebook (MinRender's pattern). Empty = off.
+    pub phonebook: String,
 }
 
 impl Default for Config {
@@ -47,13 +57,16 @@ impl Default for Config {
             fingerprint: String::new(),
             cap_mbps: 400.0,
             capture_scale: 1.0,
-            video_port: 19997,
+            video_port: 0,
             local_port: 0,
             blender_path: default_blender_path(),
             blender_args: Vec::new(),
             kiosk: true,
             idle_secs: 300,
             tray: true,
+            name: String::new(),
+            discovery: "direct".into(),
+            phonebook: String::new(),
         }
     }
 }
@@ -66,6 +79,174 @@ fn default_blender_path() -> String {
     } else {
         "blender".into()
     }
+}
+
+pub const DISCOVERY_MODES: &[&str] = &["off", "direct", "discoverable"];
+
+/// What the machine is called, for the beacon and the tray. No crate: libc
+/// is already in the tree via quinn, and Windows always sets COMPUTERNAME.
+pub fn machine_name() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc == 0 {
+            if let Some(n) = buf.iter().position(|&b| b == 0) {
+                if let Ok(name) = std::str::from_utf8(&buf[..n]) {
+                    if !name.is_empty() {
+                        return name.to_string();
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(name) = std::env::var("COMPUTERNAME") {
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    "qcbridge".into()
+}
+
+impl Config {
+    /// The configured name, or the machine's when none is set.
+    pub fn display_name(&self) -> String {
+        if self.name.trim().is_empty() { machine_name() } else { self.name.clone() }
+    }
+}
+
+/// Fields that can change on a running agent, and are therefore accepted by
+/// `set_config` and reported in the `config` event. Anything that needs a
+/// rebuilt endpoint — role, listen, local_port, tray — is deliberately not
+/// here: the command says "needs_restart" rather than pretending.
+pub const LIVE_FIELDS: &[&str] = &[
+    "peer", "token", "fingerprint", "name", "discovery", "phonebook",
+    "blender_path", "blender_args", "kiosk", "idle_secs", "cap_mbps", "capture_scale",
+];
+pub const RESTART_FIELDS: &[&str] = &["role", "listen", "local_port", "tray"];
+
+/// What `apply_live` did with a patch. Reported back verbatim.
+#[derive(Debug, Default, PartialEq)]
+pub struct Applied {
+    pub changed: Vec<String>,
+    pub needs_restart: Vec<String>,
+    pub rejected: Vec<String>,
+}
+
+/// Apply the live fields of a JSON patch (`{"peer": "...", "idle_secs": 60}`)
+/// to a config, in place. Pure, so it can be unit-tested without an agent.
+/// Type mismatches and invalid values are rejected, not coerced.
+pub fn apply_live(cfg: &mut Config, patch: &serde_json::Value) -> Applied {
+    let mut out = Applied::default();
+    let Some(obj) = patch.as_object() else { return out };
+    for (key, val) in obj {
+        let k = key.as_str();
+        if RESTART_FIELDS.contains(&k) {
+            out.needs_restart.push(key.clone());
+            continue;
+        }
+        if !LIVE_FIELDS.contains(&k) {
+            out.rejected.push(key.clone());
+            continue;
+        }
+        let ok = match k {
+            "peer" => set_str(&mut cfg.peer, val),
+            "token" => set_str(&mut cfg.token, val),
+            "fingerprint" => set_str(&mut cfg.fingerprint, val),
+            "name" => set_str(&mut cfg.name, val),
+            "phonebook" => set_str(&mut cfg.phonebook, val),
+            "blender_path" => set_str(&mut cfg.blender_path, val),
+            "discovery" => match val.as_str() {
+                Some(m) if DISCOVERY_MODES.contains(&m) => { cfg.discovery = m.into(); true }
+                _ => false,
+            },
+            "blender_args" => match val.as_array() {
+                Some(a) if a.iter().all(|v| v.is_string()) => {
+                    cfg.blender_args = a.iter().map(|v| v.as_str().unwrap().to_string()).collect();
+                    true
+                }
+                _ => false,
+            },
+            "kiosk" => match val.as_bool() { Some(b) => { cfg.kiosk = b; true } None => false },
+            "idle_secs" => match val.as_u64() { Some(n) => { cfg.idle_secs = n; true } None => false },
+            "cap_mbps" => match val.as_f64() { Some(f) if f > 0.0 => { cfg.cap_mbps = f; true } _ => false },
+            "capture_scale" => match val.as_f64() { Some(f) if f > 0.0 && f <= 1.0 => { cfg.capture_scale = f; true } _ => false },
+            _ => false,
+        };
+        if ok { out.changed.push(key.clone()) } else { out.rejected.push(key.clone()) }
+    }
+    out
+}
+
+fn set_str(slot: &mut String, val: &serde_json::Value) -> bool {
+    match val.as_str() {
+        Some(v) => { *slot = v.to_string(); true }
+        None => false,
+    }
+}
+
+/// The live fields as JSON — the body of the `config` event and part of the
+/// attach reply. The token is included: this crosses the loopback socket
+/// under a per-start secret, the same trust domain that already carries it
+/// in QCB_AGENT_TOKEN.
+pub fn live_view(cfg: &Config) -> serde_json::Value {
+    serde_json::json!({
+        "peer": cfg.peer,
+        "token": cfg.token,
+        "fingerprint": cfg.fingerprint,
+        "name": cfg.display_name(),
+        "name_is_default": cfg.name.trim().is_empty(),
+        "discovery": cfg.discovery,
+        "phonebook": cfg.phonebook,
+        "blender_path": cfg.blender_path,
+        "blender_args": cfg.blender_args,
+        "kiosk": cfg.kiosk,
+        "idle_secs": cfg.idle_secs,
+        "cap_mbps": cfg.cap_mbps,
+        "capture_scale": cfg.capture_scale,
+        // Restart-only, reported so the addon can show them read-only.
+        "role": cfg.role,
+        "listen": cfg.listen,
+    })
+}
+
+/// Some(true)/Some(false) when the OS can say; None when it cannot (Windows
+/// without windows-sys — tracked for the port). Never claims "alive" on a
+/// guess: an unknown answer must not stop an agent from starting.
+pub fn pid_alive(pid: u32) -> Option<bool> {
+    if pid == std::process::id() {
+        return Some(true);
+    }
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if rc == 0 {
+            return Some(true);
+        }
+        return Some(std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Another agent of this role, still running, registered in this directory.
+/// agent.json has always recorded a pid; nothing read it, so two agents of
+/// one role silently overwrote each other. With discovery, two of them
+/// would also both beacon.
+pub fn registered_live_pid(base: &Path, role: &str) -> Option<u32> {
+    let text = std::fs::read_to_string(socket_info_path(base)).ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let pid = doc.get(role)?.get("pid")?.as_u64()? as u32;
+    if pid == std::process::id() {
+        return None;
+    }
+    (pid_alive(pid) == Some(true)).then_some(pid)
 }
 
 pub fn config_dir() -> PathBuf {
@@ -222,6 +403,59 @@ mod tests {
 
         assert_eq!(b.with(|c| c.fingerprint.clone()), "abc123");
         assert_eq!(a.snapshot().fingerprint, "abc123");
+    }
+
+    #[test]
+    fn a_toml_without_the_new_fields_gets_their_defaults() {
+        let cfg: Config = toml::from_str("role = \"host\"\ntoken = \"t\"\n").unwrap();
+        assert_eq!(cfg.discovery, "direct");
+        assert!(cfg.name.is_empty() && cfg.phonebook.is_empty());
+        assert!(!cfg.display_name().is_empty(), "falls back to the machine name");
+    }
+
+    #[test]
+    fn machine_name_is_never_empty() {
+        assert!(!machine_name().is_empty());
+    }
+
+    #[test]
+    fn apply_live_changes_live_fields_and_reports_the_rest() {
+        let mut cfg = Config::default();
+        let a = apply_live(&mut cfg, &serde_json::json!({
+            "peer": "10.0.0.5:19990", "idle_secs": 60, "discovery": "discoverable",
+            "listen": "0.0.0.0:1", "role": "host",
+            "nonsense": 1,
+        }));
+        assert_eq!(cfg.peer, "10.0.0.5:19990");
+        assert_eq!(cfg.idle_secs, 60);
+        assert_eq!(cfg.discovery, "discoverable");
+        // Order is not a contract: a JSON object iterates by sorted key.
+        let sorted = |v: &Vec<String>| { let mut v = v.clone(); v.sort(); v };
+        assert_eq!(sorted(&a.changed), vec!["discovery", "idle_secs", "peer"]);
+        assert_eq!(sorted(&a.needs_restart), vec!["listen", "role"]);
+        assert_eq!(a.rejected, vec!["nonsense"]);
+        // Restart-only fields were not touched.
+        assert_eq!(cfg.listen, Config::default().listen);
+        assert_eq!(cfg.role, Config::default().role);
+    }
+
+    #[test]
+    fn apply_live_rejects_bad_values_instead_of_coercing() {
+        let mut cfg = Config::default();
+        let a = apply_live(&mut cfg, &serde_json::json!({
+            "discovery": "loud", "idle_secs": "sixty", "capture_scale": 2.0, "kiosk": 1,
+        }));
+        assert!(a.changed.is_empty());
+        assert_eq!(a.rejected.len(), 4);
+        assert_eq!(cfg.discovery, "direct");
+    }
+
+    #[test]
+    fn our_own_pid_is_alive_and_a_nonsense_pid_is_not() {
+        assert_eq!(pid_alive(std::process::id()), Some(true));
+        if cfg!(unix) {
+            assert_eq!(pid_alive(u32::MAX - 7), Some(false));
+        }
     }
 
     /// A snapshot is a copy on purpose — it is what gets written to disk —
