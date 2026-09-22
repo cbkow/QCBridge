@@ -70,7 +70,9 @@ def main() -> None:
             "mux-srt-L5": "+ mpegts/SRT @ latency 5",
             "mux-srt-L20": "+ mpegts/SRT @ latency 20",
             "mux-srt-L120": "+ mpegts/SRT @ latency 120",
-            "mux-full": "full path (SRT 20 + host demux + TCP)",
+            "mux-inproc-L20": "in-process mux/SRT @ 20 (no sender hop)",
+            "mux-full": "ffmpeg sender + host demux + TCP",
+            "mux-inproc-full": "in-process sender + host demux + TCP",
         }
         print("\nover the floor (p50):")
         for label, name in names.items():
@@ -85,6 +87,14 @@ def main() -> None:
         if "mux-srt-L20" in p50 and "mux-raw-tcp" in p50:
             print(f"  mpegts+SRT@20 over a bare socket: "
                   f"{p50['mux-srt-L20'] - p50['mux-raw-tcp']:+.1f} ms")
+        # What a process boundary costs, measured twice.
+        for child, inproc, what in (("mux-srt-L20", "mux-inproc-L20", "sender hop"),
+                                    ("mux-full", "mux-inproc-full", "sender hop (with host leg)")):
+            if child in p50 and inproc in p50:
+                print(f"  {what}: {p50[child] - p50[inproc]:+.1f} ms")
+        if "mux-inproc-full" in p50 and "mux-inproc-L20" in p50:
+            print(f"  host demux hop: "
+                  f"{p50['mux-inproc-full'] - p50['mux-inproc-L20']:+.1f} ms")
 
 
 if __name__ == "__main__":

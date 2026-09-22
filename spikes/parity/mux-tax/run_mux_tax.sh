@@ -154,6 +154,20 @@ for L in 5 20 120; do
     cleanup
 done
 
+# ---- in-process mux: the sender hop removed --------------------------------
+# qcb-stamp muxes mpegts and opens the SRT itself (muxsend.c), so this is the
+# same wire as srt-L20 with one fewer process. Note there is no host leg at
+# all: QCView's LiveStreamDecoder opens srt:// directly, which is what the
+# pre-Kyber flow did.
+SP=$(( PORT++ ))
+echo "==> inproc   in-process mpegts/SRT, no sender hop  (udp/$SP)"
+"$STAMP" --fps "$FPS" --size "$SIZE" --bitrate "$BITRATE" --seconds "$STAMP_SECS" \
+    --mux-url "srt://127.0.0.1:$SP?mode=listener&latency=20000" \
+    2>"$OUT/inproc.stamp.log" &
+pids+=($!)
+wait_listen udp "$SP" && reader "mux-inproc-L20" --srt "127.0.0.1:$SP" --latency 20
+cleanup
+
 # ---- the full option-(1) topology ------------------------------------------
 SP=$(( PORT++ )); TP=$(( PORT++ ))
 echo "==> full     + host demux -> local TCP  (udp/$SP -> tcp/$TP)"
@@ -170,6 +184,24 @@ if wait_listen udp "$SP"; then
         -c copy -f hevc "tcp://127.0.0.1:$TP?listen=1" 2>"$OUT/full.host.log" &
     pids+=($!)
     wait_listen tcp "$TP" && reader "mux-full" --tcp "127.0.0.1:$TP"
+fi
+cleanup
+
+# ---- in-process sender, but keeping the host fan-out hop -------------------
+# Isolates the two hops from each other: this is inproc plus the host leg.
+SP=$(( PORT++ )); TP=$(( PORT++ ))
+echo "==> inproc-full  in-process sender + host demux -> local TCP  (udp/$SP -> tcp/$TP)"
+"$STAMP" --fps "$FPS" --size "$SIZE" --bitrate "$BITRATE" --seconds "$STAMP_SECS" \
+    --mux-url "srt://127.0.0.1:$SP?mode=listener&latency=20000" \
+    2>"$OUT/inproc-full.stamp.log" &
+pids+=($!)
+if wait_listen udp "$SP"; then
+    "$FFMPEG" -hide_banner -loglevel warning -nostats \
+        -fflags nobuffer -flags low_delay \
+        -i "srt://127.0.0.1:$SP?mode=caller&latency=20000" \
+        -c copy -f hevc "tcp://127.0.0.1:$TP?listen=1" 2>"$OUT/inproc-full.host.log" &
+    pids+=($!)
+    wait_listen tcp "$TP" && reader "mux-inproc-full" --tcp "127.0.0.1:$TP"
 fi
 cleanup
 

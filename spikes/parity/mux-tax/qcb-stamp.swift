@@ -34,6 +34,10 @@ struct Opts {
     var mbps = 50
     var seconds = 30.0
     var noise = true
+    // Empty: write Annex-B to stdout (pipe it to an ffmpeg child, as the
+    // early rungs did). Set: mux to mpegts and send from THIS process, so
+    // the cost of that child can be measured by its absence.
+    var muxURL = ""
 }
 
 func parse() -> Opts {
@@ -49,6 +53,7 @@ func parse() -> Opts {
         case "--bitrate": o.mbps = Int(it.next()!)!
         case "--seconds": o.seconds = Double(it.next()!)!
         case "--static": o.noise = false
+        case "--mux-url": o.muxURL = it.next()!
         default:
             FileHandle.standardError.write("unknown argument: \(a)\n".data(using: .utf8)!)
             exit(2)
@@ -61,6 +66,12 @@ let o = parse()
 
 func err(_ s: String) {
     FileHandle.standardError.write((s + "\n").data(using: .utf8)!)
+}
+
+/// Last failure text from the C sender.
+func msErr() -> String {
+    guard let p = ms_error() else { return "unknown" }
+    return String(cString: p)
 }
 
 // ---- probe strip (mirror of qcbridge/ring1/probe.py) ------------------------
@@ -118,6 +129,7 @@ func drawStrip(_ base: UnsafeMutableRawPointer, _ bpr: Int, _ bits: [UInt8]) {
 
 // ---- Annex-B writer ---------------------------------------------------------
 
+let muxing = !o.muxURL.isEmpty
 let stdoutFH = FileHandle.standardOutput
 let startCode = Data([0, 0, 0, 1])
 var bytesOut = 0
@@ -198,7 +210,19 @@ func emit(_ sbuf: CMSampleBuffer) {
     }
 
     outLock.lock()
-    writeOut(out)
+    if muxing {
+        let pts = Int64(framesOut)
+        out.withUnsafeBytes { raw in
+            if let base = raw.bindMemory(to: UInt8.self).baseAddress {
+                if ms_write(base, Int32(out.count), pts, isKey ? 1 : 0) < 0 {
+                    err("mux write failed: \(msErr())")
+                }
+            }
+        }
+        bytesOut += out.count
+    } else {
+        writeOut(out)
+    }
     framesOut += 1
     outLock.unlock()
 }
@@ -256,9 +280,23 @@ CVPixelBufferPoolCreate(nil, nil, srcAttrs as CFDictionary, &pool)
 
 let total = Int(o.seconds * Double(o.fps))
 let period = 1.0 / Double(o.fps)
-let start = Date()
 err("qcb-stamp: \(o.codec) \(o.width)x\(o.height)@\(o.fps) \(o.mbps)M, "
     + "\(total) frames, strip at y=\(stripY) w=\(stripW)")
+
+// Open the wire BEFORE the clock starts. A listener URL blocks here until
+// the reader connects, and if `start` were already running the pacing loop
+// would burst to catch up on the frames it "missed" while waiting.
+if muxing {
+    err("qcb-stamp: opening \(o.muxURL)")
+    if ms_open(o.muxURL, Int32(o.width), Int32(o.height), Int32(o.fps),
+               o.codec == "hevc" ? 1 : 0) < 0 {
+        err("qcb-stamp: mux open failed: \(msErr())")
+        exit(3)
+    }
+    err("qcb-stamp: connected")
+}
+
+let start = Date()
 
 for i in 0..<total {
     var pb: CVPixelBuffer?
@@ -296,6 +334,7 @@ for i in 0..<total {
 }
 
 VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid)
+if muxing { ms_close() }
 let secs = Date().timeIntervalSince(start)
 err(String(format: "qcb-stamp: %d frames out, %.1f Mbps over %.1f s",
            framesOut, Double(bytesOut * 8) / secs / 1e6, secs))

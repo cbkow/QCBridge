@@ -11,3 +11,4 @@ dist/
 
 # built bench binaries (spikes/parity/mux-tax)
 spikes/parity/mux-tax/qcb-stamp
+spikes/parity/mux-tax/muxsend.o
