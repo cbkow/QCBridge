@@ -1,6 +1,6 @@
 # The sync, audited
 
-*2026-09-23, branch `spike/quinn`, Blender 5.2.2 LTS, macOS, loopback.*
+*2026-09-23, on what was then branch `spike/quinn` (merged to `main` that evening), Blender 5.2.2 LTS, macOS, loopback.*
 
 The question: now that the connection is one QUIC session with three lanes,
 what in the host→replica control system could be synced better or faster,

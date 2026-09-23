@@ -1,6 +1,6 @@
 # What reaches the replica — a coverage survey
 
-*2026-09-23, branch `spike/quinn`, Blender 5.2.2 LTS, agent transport,
+*2026-09-23, on what was then branch `spike/quinn` (merged to `main` that evening), Blender 5.2.2 LTS, agent transport,
 loopback.* Companion to `SYNC-AUDIT.md` (the mechanisms) and `CACHES.md`
 (simulation caches). This one answers a single question per user action:
 **does it reach the replica, and how fast?**

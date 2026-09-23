@@ -12,7 +12,7 @@ while to pin down; those findings are recorded here and in the comments they
 point at, so nobody re-derives them.
 
 This describes `main`: the ZMQ transport, ffmpeg capture, no sidecar agent.
-The Rust agent and the QUIC transport live on `spike/parity` — see
+The Rust agent and the QUIC transport are on `main` (merged 2026-09-23; they were developed on `spike/parity`, then `spike/quinn`) — see
 [Where the other half lives](#where-the-other-half-lives).
 
 Line numbers are a reading aid, not a contract. Version-specific findings say
@@ -276,7 +276,7 @@ project.
 
 ## Where the other half lives
 
-Branch `spike/parity` carries the sidecar work: a Rust tray agent
+`agent/` on `main` (developed on `spike/parity`, merged 2026-09-23) carries the sidecar work: a Rust tray agent
 (`agent/`), a QUIC transport (`ring1/transport_kyber.py`), `agent_launch.py`
 for a Blender the agent starts, and the motion-to-photon probe. Measurements
 are in `spikes/parity/results/<date>-<slug>/notes.md`, and the roadmap plus
