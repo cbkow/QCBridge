@@ -212,6 +212,13 @@ def apply_blob(
         bpy.data.libraries, local_project_dir, mappings
     )
     errors += lib_errors
+    # Cache and bake directories on the arrived objects' modifiers; the
+    # point-cache reassignment also rescans the external frames.
+    _f, _u, obj_errors = bootstrap.localize_object_paths(
+        [db for db, _, _ in pairs if isinstance(db, bpy.types.Object)],
+        local_project_dir, mappings,
+    )
+    errors += obj_errors
     # New objects aren't linked into any scene collection by append-into-data;
     # link the ones that ended up orphaned.
     for new_db, old_db, _ in pairs:

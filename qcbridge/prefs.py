@@ -174,6 +174,7 @@ _SETTINGS_FIELDS = (
     "role", "replica_address", "bind_address", "port_control", "port_hot",
     "port_cold", "token", "enable_stream", "srt_port", "srt_url",
     "srt_latency_ms", "encoder_rung", "ffmpeg_path", "replica_kiosk",
+    "cache_root",
 )
 
 
@@ -489,6 +490,22 @@ class QCBridgePreferences(AddonPreferences):
     path_mappings: CollectionProperty(type=QCB_PathMapping)
     active_mapping_index: IntProperty(default=0)
 
+    # Simulation caches (CACHES.md §4 B): a disk cache lives in
+    # //blendcache_<file>/, which the replica's temp copy can never share.
+    # With a root on the mapped volume the host externalizes every unbaked
+    # point cache there BEFORE it is baked, and a bake on the host is a
+    # bake on the replica after a settings-only resend. Opt-in: it moves
+    # where the user's caches live.
+    cache_root: StringProperty(
+        name="Shared cache root",
+        description="Directory on the shared volume (path-mapped) where point "
+                    "caches are written so the replica reads the same frames. "
+                    "Set it before baking: an existing bake must be re-baked "
+                    "to move. Empty = off",
+        subtype="DIR_PATH",
+        default="",
+    )
+
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "role")
@@ -547,6 +564,11 @@ class QCBridgePreferences(AddonPreferences):
         row = layout.row(align=True)
         row.operator("qcbridge.settings_save", icon="EXPORT")
         row.operator("qcbridge.settings_load", icon="IMPORT")
+
+        box = layout.box()
+        box.label(text="Simulation caches")
+        box.prop(self, "cache_root")
+        box.label(text="Set before baking; baked caches stay put until re-baked.", icon="INFO")
 
         box = layout.box()
         box.label(text="Path Mappings (Windows root ↔ macOS root)")

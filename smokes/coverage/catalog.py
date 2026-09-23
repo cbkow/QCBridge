@@ -164,6 +164,22 @@ def setup():
     _new_mesh_obj("CovVParentTarget")
     # object to receive light linking
     _new_mesh_obj("CovLLTarget")
+    # a geometry-nodes simulation zone: its bake is RNA-invisible (CACHES.md)
+    with ops_ctx():
+        bpy.ops.mesh.primitive_cube_add(size=1, location=(6, 0, 0))
+    sim = bpy.context.active_object; sim.name = "CovSim"
+    ng = bpy.data.node_groups.new("CovSimTree", "GeometryNodeTree")
+    ng.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    ng.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    gi = ng.nodes.new("NodeGroupInput"); go = ng.nodes.new("NodeGroupOutput")
+    si = ng.nodes.new("GeometryNodeSimulationInput"); so = ng.nodes.new("GeometryNodeSimulationOutput")
+    si.pair_with_output(so); so.state_items.new("GEOMETRY", "Geometry")
+    sp = ng.nodes.new("GeometryNodeSetPosition"); off = ng.nodes.new("FunctionNodeInputVector"); off.vector = (0.0, 0.0, 0.1)
+    L = ng.links.new
+    L(gi.outputs["Geometry"], si.inputs["Geometry"]); L(si.outputs["Geometry"], sp.inputs["Geometry"])
+    L(off.outputs["Vector"], sp.inputs["Offset"]); L(sp.outputs["Geometry"], so.inputs["Geometry"])
+    L(so.outputs["Geometry"], go.inputs["Geometry"])
+    sim.modifiers.new("Sim", "NODES").node_group = ng
     # a keyed rig: scrubbing it must not resend the armature object per frame
     with ops_ctx():
         bpy.ops.object.armature_add(location=(0, 6, 0))
@@ -1042,6 +1058,23 @@ def anim_drv_edit():
 def _():
     o = obj("CovDrv"); ad = None if o is None else o.animation_data
     return None if ad is None or not ad.drivers else ad.drivers[0].driver.expression
+
+
+@action("gn_sim_bake", "physics", "bake a simulation zone (packed) — replica must use it at frame 10")
+def gn_sim_bake():
+    o = obj("CovSim")
+    bpy.context.scene.frame_set(1)
+    with obj_ctx(o):
+        bpy.ops.object.simulation_nodes_cache_bake(selected=True)
+    bpy.context.scene.frame_set(10)
+    bpy.context.view_layer.update()
+@probe(gn_sim_bake)
+def _():
+    o = obj("CovSim")
+    if o is None or bpy.context.scene.frame_current != 10:
+        return None
+    ev = o.evaluated_get(bpy.context.evaluated_depsgraph_get())
+    return round(max(v.co.z for v in ev.data.vertices), 3)
 
 
 @action("anim_rig_scrub", "animation", "scrub 12 frames of a keyed rig (D1: no rig blob per frame)")

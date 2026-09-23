@@ -331,6 +331,7 @@ def _start_host(prefs) -> None:
         transport,
         paused_fn=lambda: state["paused"],
         mappings=_prefs_mappings(prefs),
+        cache_root=getattr(prefs, "cache_root", "") or "",
     )
 
 
@@ -675,6 +676,8 @@ def status_text() -> str:
             bits.append(f"⚠ {dropped} frames dropped by the agent")
         if getattr(sync, "bake_note", ""):
             bits.append(f"⚠ {sync.bake_note} — Force Resync ships it")
+        if getattr(sync, "cache_note", ""):
+            bits.append(sync.cache_note)
     if state["role"] == "REPLICA":
         bits.append(_replica_overlay_text())
         bits.append(state.get("ffmpeg_note", ""))

@@ -79,10 +79,15 @@ _SWEPT_COLLECTIONS = (
 
 
 class HostSync:
-    def __init__(self, transport, paused_fn, mappings=()) -> None:
+    def __init__(self, transport, paused_fn, mappings=(), cache_root: str = "") -> None:
         self.transport = transport
         self.paused_fn = paused_fn
         self.mappings = list(mappings)
+        # Shared cache root (CACHES.md §4 B): unbaked point caches become
+        # external files under it, so the replica reads the same frames.
+        self.cache_root = os.path.abspath(bpy.path.abspath(cache_root)) if cache_root else ""
+        self.cache_note = ""
+        self.externalized = 0
         self._boot_outbox: list[tuple[dict, bytes]] = []
         # Tier-2 blobs mid-flight under backpressure, per uuid: the next
         # tick resumes from the chunk that was refused instead of
@@ -129,6 +134,7 @@ class HostSync:
         self._in_handler = False
         self._drop_next_batch = False
         self._initial_scan()
+        self._externalize_caches()  # before the bootstrap: the file carries the paths
 
     def _sweep_visibility(self) -> None:
         """Visibility changes don't reliably produce depsgraph events: the
@@ -289,6 +295,18 @@ class HostSync:
                 uuid = identity.ensure_uuid(db, self.registry)
                 self._uuid_to_db[uuid] = db
                 tier = classify_update(type_key, update.is_updated_geometry)
+                if (
+                    tier == Tier.T1
+                    and update.is_updated_geometry
+                    and not update.is_updated_transform
+                    and isinstance(db, bpy.types.Object)
+                    and _has_bake_nodes(db)
+                ):
+                    # A simulation-zone / Bake-node bake (or its delete) is
+                    # exactly one geometry update on the object and nothing
+                    # the snapshot can diff (CACHES.md §2): resend the object
+                    # — the packed bake rides the blob and is used.
+                    tier = Tier.T2
                 if _DEBUG:
                     print(
                         f"qcb classify {type(db).__name__}:{db.name} -> T{int(tier)}"
@@ -371,6 +389,7 @@ class HostSync:
             # else: keep it pending until the interval allows
         if now - self._last_sweep >= _SWEEP_INTERVAL:
             self._sweep_deletions()
+            self._externalize_caches()
             self._last_sweep = now
         if self.paused_fn() or not len(self.dirty):
             return _FLUSH_TICK
@@ -556,6 +575,50 @@ class HostSync:
         if not self.transport.send_fast(header):
             self.seq_fast -= 1
             self.dirty.requeue_tombstone(uuid)
+
+    def _externalize_caches(self) -> None:
+        """Point caches without an external path get one under the shared
+        cache root — BEFORE they are baked, because Blender does not migrate
+        frames on conversion (CACHES.md §2 finding 6). Baked caches are left
+        alone and counted so the panel can say "re-bake to share"."""
+        if not self.cache_root:
+            return
+        if not os.path.isdir(self.cache_root):
+            self.cache_note = f"⚠ cache root not found: {self.cache_root}"
+            return
+        if not bpy.data.filepath:
+            # Blender silently ignores use_disk_cache on an unsaved file
+            # (probed 2026-09-18): the bake would stay in memory and write
+            # nothing under the root. Say so instead of pretending.
+            self.cache_note = "⚠ shared cache root needs a saved .blend — save the project first"
+            return
+        stem = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0] or "untitled"
+        baked_kept = 0
+        for obj in bpy.data.objects:
+            uuid = self.registry.uuid_for(obj.session_uid)
+            if uuid is None:
+                continue
+            for tag, pc in _iter_point_caches(obj):
+                if pc.use_external:
+                    continue
+                if pc.is_baked:
+                    baked_kept += 1
+                    continue
+                safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in tag)
+                path = os.path.join(self.cache_root, stem, uuid[:12], safe)
+                try:
+                    os.makedirs(path, exist_ok=True)
+                    pc.use_disk_cache = True
+                    pc.use_external = True
+                    pc.filepath = path
+                    self.externalized += 1
+                except (OSError, AttributeError) as exc:
+                    self.cache_note = f"⚠ cache root: {exc!s:.60}"
+                    return
+        self.cache_note = (
+            f"⚠ {baked_kept} baked cache(s) not shared — re-bake to move them to the cache root"
+            if baked_kept else ""
+        )
 
     def _sweep_deletions(self) -> None:
         self._sweep_visibility()
@@ -913,6 +976,41 @@ def _anim_signature(anim) -> list | None:
     ]
 
 
+def _iter_point_caches(obj):
+    """(tag, PointCache) for every sim on the object."""
+    for m in obj.modifiers:
+        pc = getattr(m, "point_cache", None)
+        if pc is not None:
+            yield m.name, pc
+        canvas = getattr(m, "canvas_settings", None)
+        if canvas is not None:
+            for surf in canvas.canvas_surfaces:
+                if surf.point_cache is not None:
+                    yield f"{m.name}/{surf.name}", surf.point_cache
+    for psys in obj.particle_systems:
+        yield f"psys/{psys.name}", psys.point_cache
+
+
+_BAKE_NODE_IDS = {"GeometryNodeSimulationOutput", "GeometryNodeBake"}
+
+
+def _has_bake_nodes(obj) -> bool:
+    """A NODES modifier whose tree (one level of groups deep) has a
+    simulation zone or a Bake node: its bake changes no RNA the diff can see
+    (mod.bakes is RNA-invisible, CACHES.md), only the evaluated geometry."""
+    for m in obj.modifiers:
+        ng = getattr(m, "node_group", None)
+        if ng is None:
+            continue
+        for node in ng.nodes:
+            if node.bl_idname in _BAKE_NODE_IDS:
+                return True
+            inner = getattr(node, "node_tree", None)
+            if inner is not None and any(n.bl_idname in _BAKE_NODE_IDS for n in inner.nodes):
+                return True
+    return False
+
+
 def _pcache_signature(obj: bpy.types.Object) -> list:
     """Point-cache state per sim on this object (cloth, soft body, particles,
     dynamic paint surfaces). Bake/Delete-Bake changes exactly these fields —
@@ -925,7 +1023,8 @@ def _pcache_signature(obj: bpy.types.Object) -> list:
     def add(tag, pc):
         if pc is not None:
             sig.append([
-                tag, pc.is_baked, pc.use_disk_cache, pc.frame_start, pc.frame_end
+                tag, pc.is_baked, pc.use_disk_cache, pc.frame_start, pc.frame_end,
+                pc.use_external, pc.filepath,
             ])
 
     for m in obj.modifiers:
@@ -1157,9 +1256,9 @@ def _flush_timer():
     return _sync.flush_tick()
 
 
-def start(transport, paused_fn, mappings=()) -> HostSync:
+def start(transport, paused_fn, mappings=(), cache_root: str = "") -> HostSync:
     global _sync
-    _sync = HostSync(transport, paused_fn, mappings)
+    _sync = HostSync(transport, paused_fn, mappings, cache_root=cache_root)
     bpy.app.handlers.depsgraph_update_post.append(_depsgraph_handler)
     bpy.app.handlers.load_post.append(_load_post_handler)
     bpy.app.timers.register(_flush_timer, first_interval=_FLUSH_TICK, persistent=True)

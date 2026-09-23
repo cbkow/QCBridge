@@ -136,6 +136,26 @@ Findings, each of which changes something:
    zero files at the new path, and z = 0.0 — a frozen sim. **The external
    path must be set before the bake**, or the conversion must trigger a
    re-bake and say so.
+7. **An unbaked external cache on the replica writes into the shared
+   directory and poisons the host's bake** (`probes/caches/shared_dir_*.py`,
+   found by `run_smoke_cache`). Sequence: the replica receives the external
+   path while the directory is still empty, evaluates a frame or two (it
+   writes `_000001`, `_000002`), the host then bakes — and ends up with
+   **2** files, not 24; the replica later reads its own two frames as
+   "baked". With the replica keeping the cache in memory until frames exist
+   on disk (`use_external = False` while the directory has no `.bphys`), the
+   host bakes 24, the replica's jump simulates locally without writing, and
+   after the settings resend it reads the host's value exactly (1.540838).
+8. **On the replica, an appended external cache needs nothing but its path.**
+   (`probes/caches/shared_dir_append.py`.) The arriving object reads every
+   frame on every seek with `is_baked` false and the files untouched;
+   assigning `filepath` (the same path, or a mapped alias) sets `is_baked`
+   and is safe; toggling `use_external` off→on is safe. What **wipes the
+   directory to 2 files** is re-setting `use_disk_cache`/`use_external` on a
+   cache that is already external and already evaluated, then seeking. The
+   replica therefore assigns the path, switches external on only when it had
+   switched it off (finding 7), never touches the disk flag, and never
+   re-seeks.
 
 ### Geometry nodes — probed
 
@@ -196,7 +216,7 @@ external path means "frozen — the frames are on the host's disk". Report it in
 the replica status and the host panel instead of a green flag. This is the
 cheapest change and it removes the silent failure.
 
-**B. A shared cache root, set before baking.** A host-side preference —
+**B. A shared cache root, set before baking.** *(Done 2026-09-23: `cache_root` preference; the host externalizes unbaked point caches under `<root>/<file>/<uuid>/<sim>` at session start and on the sweep, refuses on an unsaved file (Blender ignores disk cache there) and counts baked caches it left alone; `use_external`/`filepath` are in the signature; the replica keeps a pathless cache in memory until frames exist and assigns the mapped path when they do — findings 7 and 8. `smokes/run_smoke_cache.sh`: a host bake is a replica bake with no Force Resync, mean z at frame 20 identical, 5/5.)* A host-side preference —
 "cache root on shared storage", one absolute directory on the mapped volume.
 When enabled, the addon sets `use_disk_cache`, `use_external` and
 `filepath = <root>/<project>/<object-uuid>/<cache-index>` on every point cache
@@ -215,14 +235,14 @@ This replaces the `use_disk_cache` idea with the thing it was reaching for.
 replica cannot share; `use_external` decouples them and makes the path a
 property the addon already knows how to translate.
 
-**C. Detect geometry-nodes bakes.** For an object whose NODES modifier's tree
+**C. Detect geometry-nodes bakes.** *(Done 2026-09-23: `_has_bake_nodes` + a geometry-only update on such an object escalates it to tier 2; the survey's `gn_sim_bake` row shows the replica using the packed bake at frame 10, 367 ms after the bake.)* For an object whose NODES modifier's tree
 contains a simulation zone or bake node, treat a depsgraph update that is
 `is_updated_geometry` without transform and produces an empty tier-1 diff as a
 bake or delete, and escalate to tier 2. Playback contributes no updates, so it
 cannot storm; a node edit already escalates through the socket snapshot. PACKED
 bakes then cross and are used with no further work.
 
-**D. Path-map the bake directory.** Carry `NodesModifier.bake_directory` (and
+**D. Path-map the bake directory.** *(Done 2026-09-23: `bootstrap.localize_object_paths` maps `NodesModifier.bake_directory`, `bakes[i].directory` (custom paths), `FluidDomainSettings.cache_directory` and external `PointCache.filepath` at bootstrap and after every tier-2 arrival. Fluid remains unprobed.)* Carry `NodesModifier.bake_directory` (and
 `bakes[i].directory` when `use_custom_path`) as tier-1 dynamic paths through
 the mapping table, and apply them after tier-2 arrivals as well — setting the
 directory on the replica was enough to make a DISK bake readable, with no
