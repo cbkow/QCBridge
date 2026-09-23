@@ -3,13 +3,14 @@
 Written 2026-09-17 by the Mac session. Read this, then `spikes/parity/README.md`
 and `spikes/parity/results/2026-09-17-mac-loopback/notes.md`.
 
-> **Superseded in part, 2026-09-22.** Task 4 below was the Kyber go/no-go.
-> Kyber is gone: the transport is plain `quinn` and video no longer rides the
-> connection. Skip task 4 and build `agent/` instead (`cargo build`, then
-> `pytest -q` — the transport contract tests spawn the agent themselves). The
-> ground rules, ports, addresses and clock-correction notes all still apply.
-> Current plan: `PLAN.md`; what the port had to match:
-> `results/2026-09-22-quinn-port/notes.md`.
+> **Superseded, 2026-09-23.** Windows work on this repo is now driven from
+> the QCBridgeAE repo's `lab/` — start at `WINDOWS-SESSION.md` there, then
+> `PLAN-windows.md` and `TRACKING-windows.md`. The ground rules below no
+> longer apply: everything is on `main` (the spike branches are behind it),
+> and pushing is by agreement, not by branch. Kept for the history of the
+> parity spikes and for the port/address/clock-correction notes, which still
+> hold. Earlier partial supersession (2026-09-22): Kyber is gone, the
+> transport is plain `quinn`, video does not ride the connection.
 
 ## Context in five lines
 

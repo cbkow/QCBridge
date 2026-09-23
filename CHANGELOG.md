@@ -6,6 +6,66 @@ matching versions on **both machines**: the ends now tell each other their
 version at connect, and the panel warns if they don't match. Mismatched ends
 mostly work, but they degrade in confusing ways — update both.
 
+## Unreleased — the agent line (merged to `main` 2026-09-23)
+
+Not a release yet: the version stays 0.1.6 until Windows is verified and the
+coordinated release with QCView happens. Everything below has run on macOS
+only, both roles on one machine, with the suites in `smokes/`.
+
+**The connection lives in an agent.** A small tray app (Rust) on each
+machine owns the QUIC session, so a Blender restart or a dropped link no
+longer means a lost connection. It finds replicas three ways — a direct
+address (the VPN path), a phonebook on shared storage, or multicast on the
+LAN (opt-in, and never colliding with the sister tools' beacons) — and
+takes settings at runtime from a tray menu. Blender's own preferences panel
+mirrors the agent's settings rather than owning a second copy. The zmq
+transport from 0.1.6 stays as a fallback.
+
+**Faster, and honest about it.** An edit reaches the replica in about
+105 ms (it was ~185), a visibility toggle or rename in about 200 ms (it
+was ~500), and a small edit no longer waits behind a large mesh: deltas
+ride their own lane and the replica applies them in the right order
+relative to the blob they follow. Blobs the replica already holds are not
+resent (an undo costs 6 transfers where it cost 34). Link stats — round
+trip, loss, throughput — show on the host panel and in the burn-in.
+
+**More of what you do reaches the replica.** 120 of the 122 user actions in
+the coverage survey cross now, from 72. New: object display and instancing
+settings, ray visibility and holdout, delta transforms, every light and
+camera setting that shows in a render, world colour and world switching,
+scene frame range, fps, units, gravity, render region, Cycles/EEVEE render
+settings, view layers, passes and the compositor (through an automatic
+bootstrap), custom properties on any datablock, shader-node settings and
+ColorRamps, node groups, NLA strips, particle settings, force fields,
+rigid-body world, legacy texture settings, fluid and geometry-nodes bake
+directories, metaballs, grease pencil, volumes, hair, point clouds, light
+probes, Alembic/USD caches, and linked libraries. A whole-mesh resend that
+used to follow every material slider is gone.
+
+**It recovers on its own.** A replica that restarts is re-bootstrapped
+without anyone pressing anything; a dropped frame is detected as a gap and
+the replica asks for — and gets — a resync; the host says when frames were
+lost. Edits made on the replica are reported to the host ("edited here")
+rather than diverging silently.
+
+**Simulation caches.** An opt-in **shared cache root** in the host's
+preferences: point caches are externalized there before they are baked, so
+a bake on the host is a bake on the replica with no Force Resync, and disk
+caches no longer freeze the replica after a resync. The replica says when
+a disk cache is frozen and the host panel says what to do. Geometry-nodes
+simulation and bake nodes cross and are used.
+
+**Paths.** A mac host's absolute paths are now mapped on a Windows replica
+(they never were); whatever cannot be resolved is counted and shown on
+both panels instead of silently skipped. Libraries the replica had to
+repoint are reloaded.
+
+**Known limits.** Windows is unverified for all of the above. Native
+capture on the replica is macOS only; the ffmpeg path works everywhere. An
+unused datablock has nothing to cross until it is used; pixels painted on
+an unpacked generated image do not cross (pack it). The replica is still
+not read-only — it tells you, it does not stop you.
+
 ## 0.1.6 — 2026-08-02
 
 - The replica now lands in camera view on its own at session start, kiosk

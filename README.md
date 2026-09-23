@@ -15,9 +15,49 @@ A few things worth knowing about:
 
 ---
 
-**Requirements:** Blender 4.5+ on both machines that live on the same network. It works over most VPNs.
+## What is on `main` now, ahead of the next release
 
-**Note:** I have only tested with macOS as the host and Windows as the replica. This is still very much a WIP experiment and was developed out of a need for a specific project.
+Since 0.1.6 the connection has moved out of Blender into a small **agent**
+— a tray app (Rust) on each machine that owns the QUIC session, finds
+peers, and takes settings at runtime — and the sync between the two
+Blenders was audited and reworked end to end. The short version, measured
+on macOS (both roles on one machine, `smokes/bench_latency.sh`):
+
+- an edit reaches the replica in ~105 ms, a camera move in ~30 ms, and a
+  small edit no longer waits behind a large one (tier-1 deltas ride their
+  own lane);
+- 120 of 122 surveyed user actions reach the replica (`COVERAGE.md`),
+  including shader-node settings, visibility and instancing, view layers
+  and markers (through an automatic bootstrap), NLA, particles, force
+  fields, geometry-nodes bakes, and linked libraries;
+- the replica recovers on its own: a restarted replica is re-bootstrapped,
+  a dropped frame triggers a resync, and edits made *on* the replica are
+  reported to the host;
+- simulation caches can share a **cache root** on the mapped volume so a
+  bake on the host is a bake on the replica with no Force Resync
+  (`CACHES.md`);
+- paths from either OS are mapped, and what cannot be resolved is counted
+  and shown, never silent.
+
+How it fits together, as it is now: `SYNC-AUDIT.md` (§2 for the
+transport), `COVERAGE.md`, `CACHES.md`, and `smokes/README.md` for the
+suites that prove it. `ARCHITECTURE.md` describes the design before this
+work and says so at its top. Running it from a checkout: build the agent
+(`cargo build --release` in `agent/`); the addon finds the binary, or set
+`QCB_TRANSPORT=agent QCB_AGENT=spawn` to have each Blender start a private
+one. The zmq transport from 0.1.6 remains as a fallback.
+
+None of the agent line has run on Windows yet. That verification — and the
+coordinated release with QCView — is tracked in the QCBridgeAE repo's
+`lab/` (start at `WINDOWS-SESSION.md` there).
+
+---
+
+**Requirements:** Blender 4.5 is the manifest minimum; the agent line was
+developed and tested on Blender 5.2 LTS, and 4.5 has not been exercised
+since. Both machines on the same network; it works over most VPNs.
+
+**Note:** 0.1.6 was tested with macOS as the host and Windows as the replica. The agent line has only been exercised on macOS so far. This is still very much a WIP experiment and was developed out of a need for a specific project.
 
 ---
 

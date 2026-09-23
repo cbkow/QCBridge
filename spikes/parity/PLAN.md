@@ -5,6 +5,10 @@ Committed 2026-09-17 (chris). The living, commentable version is the Claude Doc
 (https://claude.ai/code/artifact/e1d99609-52ad-49e1-bd70-d2949709c00b), section
 "Committed plan". This file is the repo copy for whoever picks up the work.
 
+**Status 2026-09-23:** done and merged to `main`. What followed — the audit
+of the sync, its measurements and the rework — is in `SYNC-AUDIT.md`,
+`COVERAGE.md` and `CACHES.md` at the repo root.
+
 ## Decision
 
 QCBridge moves to **one QUIC connection** for sync, and to **native capture
