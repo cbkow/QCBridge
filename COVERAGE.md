@@ -59,6 +59,11 @@ also *follow* that target's blob (`after`), or the fast lane outruns it.
 the new keyed-rig scrub row is in (`anim_rig_scrub`). Results in
 `full-agent-after-p3.json`.
 
+*End of day:* linked libraries cross too — **119 of 123**. What remains is
+by design (an unused datablock has nothing to cross until it is used), a
+documented limitation (pixels of an unpacked generated image), and undo,
+which is correct and now cheap (6 blobs).
+
 **Still not crossing, and why:**
 
 | row | why |
