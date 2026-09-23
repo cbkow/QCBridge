@@ -70,14 +70,30 @@ for key in host["order"]:
         status = "inconclusive"
     else:
         status = "NOT crossed"
+    # Cost: tier-2 blobs (and tier-1 messages) the replica applied between
+    # this action and the next one's start (or the settle window at the end).
+    order = host["order"]; idx = order.index(key)
+    t_next = host["t_done"].get(order[idx + 1]) if idx + 1 < len(order) else None
+    t_end = t_next if t_next is not None else ((t0 or 0) + settle)
+    bl = replica.get("blobs", [])
+    def counts_at(t):
+        c = (0, 0)
+        for tt, a2, a1 in bl:
+            if tt <= t:
+                c = (a2, a1)
+        return c
+    c0 = counts_at(t0) if t0 is not None else (0, 0)
+    c1 = counts_at(t_end) if t0 is not None else (0, 0)
+    cost = {"t2": c1[0] - c0[0], "t1": c1[1] - c0[1]}
     rows.append({"key": key, "group": host["groups"][key], "desc": host["desc"][key],
                  "status": status, "latency_ms": None if matched is None else round((matched - t0) * 1000),
+                 "cost": cost,
                  "expected": canon, "last_seen": last, "error": err})
 
 counts = {}
 for r in rows:
     counts[r["status"]] = counts.get(r["status"], 0) + 1
-print(f"{'action':28} {'group':11} {'status':12} {'ms':>6}  note")
+print(f"{'action':28} {'group':11} {'status':12} {'ms':>6} {'t2':>3} {'t1':>3}  note")
 for r in rows:
     note = ""
     if r["status"] == "unchanged":
@@ -88,7 +104,7 @@ for r in rows:
         note = f"expected {r['expected'][:40]}  replica {str(r['last_seen'])[:40]}"
     elif r["status"] == "host-error":
         note = r["error"][:80]
-    print(f"{r['key']:28} {r['group']:11} {r['status']:12} {str(r['latency_ms'] or ''):>6}  {note}")
+    print(f"{r['key']:28} {r['group']:11} {r['status']:12} {str(r['latency_ms'] or ''):>6} {r['cost']['t2']:>3} {r['cost']['t1']:>3}  {note}")
 print(json.dumps(counts), flush=True)
 print("replica stats:", json.dumps(replica.get("stats")), flush=True)
 with open(os.path.join(OUT, "coverage.json"), "w") as f:

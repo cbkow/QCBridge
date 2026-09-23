@@ -130,6 +130,20 @@ class HostSync:
         # bootstrap (a full save writes no orphans) plus every blob since.
         # A pointer to anything else ships that datablock first.
         self._shipped: set[str] = set()
+        # blake2b of the last blob sent per uuid. libraries.write is
+        # deterministic for unchanged data (probed 2026-09-23), so an
+        # identical blob — an edit-mode pause with no edit, an undo that
+        # touched everything and changed nothing — need not go again. Cleared
+        # at every bootstrap: the file may carry state no blob did.
+        self._blob_hash: dict[str, bytes] = {}
+        self.t2_skipped = 0
+        # After a bootstrap the map is empty, so an undo that touches
+        # everything and changes nothing would still resend everything
+        # (measured: 34 blobs for one Ctrl-Z). Idle ticks prime it: two
+        # datablocks per tick, serialized and hashed, until every tier-2
+        # capable one has an entry.
+        self._prime_queue: list[str] = []
+        self.primed = 0
         self._auto_boot_at = 0.0     # monotonic; 0 = none pending
         self._last_auto_boot = float("-inf")
         self.auto_boots = 0
@@ -351,6 +365,13 @@ class HostSync:
             uuid for uuid, db in self._uuid_to_db.items()
             if _alive(db) and (db.users > 0 or db.use_fake_user)
         }
+        self._blob_hash.clear()
+        self._prime_queue = [
+            uuid for uuid, db in self._uuid_to_db.items()
+            if _alive(db) and (db.users > 0 or db.use_fake_user)
+            and not isinstance(db, (bpy.types.Scene, bpy.types.Key))
+            and tier2_io.collection_of(db) is not None
+        ]
         self.sent_boot += 1
         # bake_note / t2_unsupported clear when the last chunk actually
         # leaves (flush), not here: a queued bootstrap is not a shipped one.
@@ -404,6 +425,7 @@ class HostSync:
             self._externalize_caches()
             self._last_sweep = now
         if self.paused_fn() or not len(self.dirty):
+            self._prime_hashes()
             return _FLUSH_TICK
         ready_set = set(self.debounce.ready(now))
         tombstones, dirty = self.dirty.drain()
@@ -416,7 +438,12 @@ class HostSync:
                 continue
             if tier == Tier.T2:
                 if t2_budget <= 0:
-                    self.dirty.requeue(uuid, tier)  # next tick: keep the UI breathing
+                    # Next tick. ready() consumed its debounce entry, so it
+                    # must be touched back as ready or it would read as
+                    # "still being edited" and requeue forever (bitten
+                    # 2026-09-23: 33 blobs silently never left).
+                    self.dirty.requeue(uuid, tier)
+                    self._touch_ready(uuid, now)
                     continue
                 t2_budget -= 1
                 self._flush_t2(uuid)
@@ -552,9 +579,19 @@ class HostSync:
                 print(f"qcb t2 UNSUPPORTED {type(db).__name__}:{db.name} → auto bootstrap", flush=True)
             return
         # Refresh the shadow so tier-1 doesn't re-send state the blob carries.
-        self.shadow.diff_and_update(
-            uuid, snapshot if snapshot is not None else build_snapshot(db)
-        )
+        snapshot = snapshot if snapshot is not None else build_snapshot(db)
+        self.shadow.diff_and_update(uuid, snapshot)
+        # The digest covers the blob AND the point-cache signature: a bake
+        # changes is_baked, which libraries.write does not carry (CACHES.md
+        # finding 4), so the post-bake blob is byte-identical to the
+        # pre-bake one — and the replica needs that resend to rescan.
+        digest = self._blob_digest(db, data, snapshot)
+        if uuid in self._shipped and self._blob_hash.get(uuid) == digest:
+            self.t2_skipped += 1  # the replica already holds exactly this
+            if _DEBUG:
+                print(f"qcb t2 skip {db.name} (unchanged blob)", flush=True)
+            return
+        self._blob_hash[uuid] = digest
         blob_id = f"{uuid}.{self.seq + 1}"
         meta = {"uuid": uuid, "name": db.name, "coll": tier2_io.collection_of(db)}
         self._t2_outbox[uuid] = list(protocol.chunk_blob("t2", blob_id, data, meta=meta))
@@ -562,6 +599,33 @@ class HostSync:
         if _DEBUG:
             print(f"qcb t2 send {db.name} ({len(data)} bytes)", flush=True)
         self._drain_t2_outbox(uuid)
+
+    def _blob_digest(self, db, data: bytes, snapshot: dict | None = None) -> bytes:
+        pc = snapshot.get("~pcache") if snapshot is not None else (
+            _pcache_signature(db) if isinstance(db, bpy.types.Object) else None)
+        return hashlib.blake2b(
+            data + json.dumps(pc, sort_keys=True, default=str).encode(), digest_size=16
+        ).digest()
+
+    def _prime_hashes(self) -> None:
+        """Idle work: hash what the replica holds since the bootstrap."""
+        n = 0
+        while self._prime_queue and n < _T2_PER_TICK:
+            uuid = self._prime_queue.pop()
+            if uuid in self._blob_hash:
+                continue
+            db = self._uuid_to_db.get(uuid)
+            if db is None or not _alive(db):
+                continue
+            try:
+                data = tier2_io.serialize(db)
+            except Exception:
+                continue
+            if data is None:
+                continue
+            self._blob_hash[uuid] = self._blob_digest(db, data)
+            self.primed += 1
+            n += 1
 
     def _drain_t2_outbox(self, only: str | None = None) -> bool:
         """Send queued tier-2 chunks in order; False on backpressure (the

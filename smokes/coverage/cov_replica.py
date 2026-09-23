@@ -26,6 +26,7 @@ prefs = SimpleNamespace(
 session.start(prefs)
 
 history: dict = {}  # key -> [[value, t_first_seen], ...] on change only
+blobs: list = []     # [[t, applied_t2, applied_t1]] whenever a count moves — the cost column
 
 
 def _dump():
@@ -39,8 +40,11 @@ def _dump():
         canon = json.dumps(v, sort_keys=True, default=str)
         if not hist or hist[-1][0] != canon:
             hist.append([canon, now])
-    d = {"history": history,
-         "stats": {k: v for k, v in replica_apply.stats.items() if k != "applying"}}
+    st = replica_apply.stats
+    if not blobs or blobs[-1][1] != st["applied_t2"] or blobs[-1][2] != st["applied_t1"]:
+        blobs.append([now, st["applied_t2"], st["applied_t1"]])
+    d = {"history": history, "blobs": blobs,
+         "stats": {k: v for k, v in st.items() if k != "applying"}}
     tmp = os.path.join(OUT, "replica.json.tmp")
     with open(tmp, "w") as f:
         json.dump(d, f)

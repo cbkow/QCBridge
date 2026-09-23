@@ -669,6 +669,8 @@ def status_text() -> str:
             bits.append("⟳ replica asked for a resync — sending")
         if state.get("auto_resyncs"):
             bits.append(f"auto-resyncs {state['auto_resyncs']}")
+        if getattr(sync, "t2_skipped", 0):
+            bits.append(f"unchanged blobs skipped {sync.t2_skipped}")
         if peer.get("unmapped"):
             bits.append(f"⚠ replica: {peer['unmapped']} unmapped paths — check path mappings")
         if peer.get("frozen"):

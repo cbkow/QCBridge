@@ -73,7 +73,10 @@ actions from `coverage/catalog.py` through a live pair and reports, per
 action, whether the property that matters reached the replica and how fast.
 A match after the settle window is reported as *piggybacked* — a later action
 shipped the datablock, the edit itself was not detected. `QCB_COV_ONLY`
-isolates rows so nothing later can rescue them. The results and their
+isolates rows so nothing later can rescue them. Two cost columns, `t2` and
+`t1`, count the blobs and deltas the replica applied between an action and
+the next one — the price of an edit, not just whether it arrived (a
+whole-mesh blob for a slider tick shows up here). The results and their
 reading are `COVERAGE.md`; adding an action is one function with a `@probe`.
 Run it after any change to detection, and expect the counts to move.
 
