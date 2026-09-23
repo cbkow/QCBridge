@@ -75,7 +75,8 @@ async fn ack_cold(link: &Link, n: u32) {
 /// codec 0 = raw, 1 = zstd (level 3: ~5× on .blend partials, fast).
 const CODEC_RAW: u8 = 0;
 const CODEC_ZSTD: u8 = 1;
-const ZSTD_LEVEL: i32 = 3;
+const ZSTD_LEVEL: i32 = 1; // level 3 single-threaded took 300 ms on a 61 MB partial (measured)
+const CODEC_PIPELINE: usize = 4; // chunks compressing/decompressing in parallel, delivered in order
 const ZSTD_MIN: usize = 4096; // below this, compressing costs more than it saves
 
 fn cold_wire_encode(raw: &[u8]) -> Vec<u8> {
@@ -570,21 +571,30 @@ async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Resu
                 }
             }
         });
+        // Cold: compress chunks in parallel on blocking threads, send in
+        // order. Sequential level-3 zstd took 300 ms for a 61 MB partial and
+        // was the whole cost of a big blob on loopback (measured 2026-09-23).
+        // Credits are bytes and return when a chunk is accepted here: the
+        // window bounds what sits between the addon and the wire.
+        let (ptx, mut prx) = mpsc::channel::<tokio::task::JoinHandle<Vec<u8>>>(CODEC_PIPELINE);
         let c = ctx.clone();
         tasks.spawn(async move {
             let mut rx = c.cold_rx.lock().await;
             while let Some(body) = rx.recv().await {
-                // Credits are bytes: the window bounds what sits between the
-                // addon and quinn, not a message count a 4 MiB chunk and a
-                // 200-byte delta would share (SYNC-AUDIT §3 B3/D4).
                 let len = body.len() as u32;
-                // Compress on this task, not in Blender: block_in_place keeps
-                // the other tasks on this worker moving (multi-thread rt).
                 let raw = body.slice(1..);
-                let wire = tokio::task::block_in_place(|| cold_wire_encode(&raw));
-                let sent = send_msg(&mut cold_send, &wire).await;
+                let job = tokio::task::spawn_blocking(move || cold_wire_encode(&raw));
                 ack_cold(&c.link, len).await;
-                sent?;
+                if ptx.send(job).await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        });
+        tasks.spawn(async move {
+            while let Some(job) = prx.recv().await {
+                let wire = job.await.map_err(|e| anyhow!("compress task: {e}"))?;
+                send_msg(&mut cold_send, &wire).await?;
             }
             Ok(())
         });
@@ -616,10 +626,21 @@ async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Resu
             }
             Ok(())
         });
-        let c = ctx.clone();
+        // Cold: decompress in parallel, deliver to the addon in order.
+        let (dtx, mut drx) = mpsc::channel::<tokio::task::JoinHandle<Result<Vec<u8>>>>(CODEC_PIPELINE);
         tasks.spawn(async move {
             while let Some(payload) = recv_msg(&mut cold_recv).await? {
-                let raw = tokio::task::block_in_place(|| cold_wire_decode(&payload))?;
+                let job = tokio::task::spawn_blocking(move || cold_wire_decode(&payload));
+                if dtx.send(job).await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        });
+        let c = ctx.clone();
+        tasks.spawn(async move {
+            while let Some(job) = drx.recv().await {
+                let raw = job.await.map_err(|e| anyhow!("decompress task: {e}"))??;
                 c.link.frame(T_COLD, lane_body(0, &raw)).await;
             }
             Ok(())

@@ -84,6 +84,11 @@ What the numbers say:
   against a 108 ms `t1`; `heavy` unchanged at 360 — so the copies were
   not the 60 ms, the agent's single-threaded zstd on 61 MB is the next
   suspect.*
+- *Confirmed and fixed (`agent-after-pipeline/`): zstd level 3 on one thread
+  is 300 ms for the 61 MB partial. The agent now compresses and decompresses
+  chunks in parallel on blocking threads (four in flight, delivered in
+  order) at level 1: `heavy` **327 ms** — back in the band it had before
+  compression moved off Blender — with `hol150` 132 and `t1` 105.*
 - *After P2 (2026-09-23): with tier-1 on its own stream `hol150` reads
   240 ms against a 189 ms `t1` — the wire share is gone; the ~50 ms left is
   the replica's indivisible apply of the 640k-vertex blob on its main
