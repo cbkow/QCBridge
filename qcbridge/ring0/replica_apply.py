@@ -348,6 +348,9 @@ def _quiet(seconds: float) -> None:
 def _apply_t1(header: dict, payload: bytes) -> None:
     db = _resolve(header["uuid"])
     _note_touched(header["uuid"])
+    # A delta on one datablock wakes its dependents (a camera's data → its
+    # object); the detector judges only while the host has been quiet.
+    _quiet(_FRAME_GRACE)
     if db is None:
         stats["unknown_uuid"] += 1
         stats["want_resync"] = True  # a blob we never got
