@@ -112,7 +112,10 @@ class HostSync:
         Point-cache state rides the same sweep for the same reason: a bake
         finishing (job thread) or Delete Bake gives no dependable event for
         the owning object; the flush diff sees "~pcache" change and
-        escalates to tier 2 so the baked cache travels in the resend."""
+        escalates to tier 2. That partial blend carries a memory cache's
+        frames but not the baked flag, and an unbaked cache is re-simulated
+        on a frame jump (probed 2026-09-23, CACHES.md) — so what crosses is
+        inert. Hence bake_note and the nag for a Force Resync."""
         now = time.monotonic()
         for obj in bpy.data.objects:
             uuid = self.registry.uuid_for(obj.session_uid)
@@ -122,11 +125,11 @@ class HostSync:
             old = self._vis_state.get(uuid)
             if old != vector:
                 if old is not None and len(old) >= 4:
-                    # A bake appearing/disappearing needs tier 3: the tier-2
-                    # partial blend does NOT contain cache data (probed —
-                    # only the full save does). Settings still resend via
-                    # the "~pcache" escalation; the bake itself waits on a
-                    # manual Force Resync (resync stays manual, decision #8).
+                    # A bake appearing/disappearing needs tier 3: the frames
+                    # in the tier-2 partial arrive unbaked and are not read
+                    # on a frame jump (CACHES.md §2). Settings still resend
+                    # via the "~pcache" escalation; the bake itself waits on
+                    # a manual Force Resync (resync stays manual, decision #8).
                     old_on = {row[0] for row in old[3] if row[1]}
                     new_on = {row[0] for row in vector[3] if row[1]}
                     if old_on != new_on:
