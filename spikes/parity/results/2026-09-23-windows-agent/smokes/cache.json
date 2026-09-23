@@ -1,0 +1,10 @@
+{
+ "pass": true,
+ "checks": {
+  "externalized_before_bake": true,
+  "host_baked_to_root": true,
+  "replica_external_same_path": true,
+  "replica_reads_bake_no_resync": true,
+  "replica_clean": true
+ }
+}

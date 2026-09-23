@@ -1,0 +1,10 @@
+{
+ "pass": false,
+ "checks": {
+  "relative_image_mapped_to_replica_root": false,
+  "absolute_image_loads_untranslated_same_os": true,
+  "stray_image_left_alone": true,
+  "unmapped_counted_and_on_host_panel": true,
+  "replica_clean": true
+ }
+}

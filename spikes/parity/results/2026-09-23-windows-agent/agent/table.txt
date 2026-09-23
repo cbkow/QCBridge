@@ -1,0 +1,9 @@
+transport=agent  heavy=641601 verts  replica sample tick median/p95 = 5.5/9.1 ms
+phase      n lost     min     p50     p90     max   ms edit→visible
+t1        20    0    85.9   107.4   114.8   117.1
+t2        10    0   129.1   144.8   155.5   167.4
+hot       20    0    14.0    28.8    44.1    44.4
+sweep     20    0    47.4   186.8   273.1   295.4
+hol0       8    0   169.9   176.1   193.7   247.0
+hol150     8    0   100.7   111.7   115.4   124.1
+heavy     16        583.2   613.4   672.6   687.8   (tier-2 blob of Heavy, toggle→visible)
