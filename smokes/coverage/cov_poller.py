@@ -52,8 +52,13 @@ for key in host["order"]:
             break
     last = hist[-1][0] if hist else None
     settle = float(os.environ.get("QCB_COV_SETTLE", "2.5"))
+    before = [v for v, t in hist if t0 is not None and t < t0]
     if err:
         status = "host-error"
+    elif matched is None and before and before[-1] == canon and last == canon:
+        # The action left the property where the replica already had it
+        # (undo, or an edit that cancelled out): nothing needed to cross.
+        status = "unchanged"
     elif matched is not None and (matched - t0) > settle:
         # It arrived, but only after the settle window: a later action
         # shipped the same datablock (or carried it as a dependency). The
@@ -75,7 +80,9 @@ for r in rows:
 print(f"{'action':28} {'group':11} {'status':12} {'ms':>6}  note")
 for r in rows:
     note = ""
-    if r["status"] == "piggybacked":
+    if r["status"] == "unchanged":
+        note = "replica already held the final value; nothing needed to cross"
+    elif r["status"] == "piggybacked":
         note = "arrived only with a later action"
     elif r["status"] == "NOT crossed":
         note = f"expected {r['expected'][:40]}  replica {str(r['last_seen'])[:40]}"

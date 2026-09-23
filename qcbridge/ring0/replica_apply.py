@@ -30,6 +30,7 @@ _SCANNED_COLLECTIONS = (
     "curves", "node_groups", "images", "collections", "actions", "shape_keys",
     "lattices", "armatures", "metaballs", "volumes", "hair_curves",
     "pointclouds", "lightprobes", "grease_pencils", "textures", "particles",
+    "cache_files",
 )
 
 _transport = None
@@ -57,6 +58,12 @@ stats = {
     "want_resync": False,
     "seq_fast": 0,     # fast lane (tier-1 deltas, tombstones)
     "parked": 0,       # fast messages waiting for their blob to apply
+    # Edits made ON the replica: nothing forbids them and the host will
+    # never overwrite one unless it changes that same property (SYNC-AUDIT
+    # A9). Heuristic count — an update on a stamped datablock we did not
+    # touch recently, outside a frame change and outside a blob's wake.
+    "local_edits": 0,
+    "last_local_edit": "",
     # Baked disk caches with no external path: their blendcache_<name>/ dir
     # belongs to the host's file name, which this machine never had
     # (CACHES.md §2) — frozen at rest with every flag green.
@@ -74,6 +81,11 @@ _inbox: collections.deque = collections.deque()  # polled-but-unprocessed cold m
 _inbox_fast: collections.deque = collections.deque()  # fast lane: never waits on a blob apply
 _blob_by_uuid: dict[str, str] = {}   # uuid → latest in-flight blob id
 _at_state: dict[str, dict[str, object]] = {}  # uuid → last "@" values applied
+_touched: dict[str, float] = {}   # uuid → monotonic time we last wrote it
+_quiet_until = 0.0                # no local-edit attribution before this (blob/boot/frame wake)
+_TOUCH_GRACE = 1.5
+_BLOB_GRACE = 3.0
+_FRAME_GRACE = 0.5
 _pending_t2_seq: int | None = None  # cold seq of the blob's last chunk
 _pending_t2: tuple[dict, bytes] | None = None  # applied on the NEXT tick so
                                                # the "⟳ applying" label gets a redraw first
@@ -320,8 +332,18 @@ def _write_rna(db, path: str, value) -> None:
     setattr(parent, attr, value)
 
 
+def _note_touched(uuid: str) -> None:
+    _touched[uuid] = time.monotonic()
+
+
+def _quiet(seconds: float) -> None:
+    global _quiet_until
+    _quiet_until = max(_quiet_until, time.monotonic() + seconds)
+
+
 def _apply_t1(header: dict, payload: bytes) -> None:
     db = _resolve(header["uuid"])
+    _note_touched(header["uuid"])
     if db is None:
         stats["unknown_uuid"] += 1
         stats["want_resync"] = True  # a blob we never got
@@ -343,6 +365,7 @@ def _apply_t1(header: dict, payload: bytes) -> None:
 
 def _apply_tombstone(header: dict) -> None:
     global _last_hot
+    _note_touched(header["uuid"])
     db = _resolve(header["uuid"])
     if db is None:
         return
@@ -417,6 +440,8 @@ def _apply_pending_t2() -> None:
     header, blob = _pending_t2
     _pending_t2 = None
     blob_tag = header["blob"]["id"].replace(".", "-")
+    _note_touched(header.get("uuid", ""))
+    _quiet(_BLOB_GRACE)  # a blob (and its dependencies) wakes the depsgraph broadly
     try:
         if header.get("kind") == "boot":
             errors, unmapped, _project_dir_local = bootstrap.apply_mainfile(
@@ -571,6 +596,7 @@ def _camera_view_bound(rv3d, cam) -> bool:
 
 
 def _apply_hot(packed: bytes, reassert: bool = False) -> None:
+    _quiet(_FRAME_GRACE)
     global _last_frame_apply
     state = protocol.unpack_hot(packed)
     if state is None:
@@ -799,6 +825,30 @@ def _tick_inner(transport):
     return _TICK
 
 
+@bpy.app.handlers.persistent
+def _on_depsgraph_replica(scene, depsgraph) -> None:
+    """Count edits this replica made itself. Attribution is by exclusion:
+    a stamped datablock we did not write in the last 1.5 s, updated outside
+    the 3 s after a blob/bootstrap and the 0.5 s after a frame change."""
+    if _transport is None:
+        return
+    now = time.monotonic()
+    if now < _quiet_until:
+        return
+    for update in depsgraph.updates:
+        db = update.id.original
+        if isinstance(db, (bpy.types.Scene, bpy.types.WindowManager, bpy.types.Screen)):
+            continue
+        uuid = db.get(UUID_PROP) if hasattr(db, "get") else None
+        if not uuid:
+            continue
+        if now - _touched.get(uuid, float("-inf")) < _TOUCH_GRACE:
+            continue
+        stats["local_edits"] += 1
+        stats["last_local_edit"] = f"{type(db).__name__}:{db.name}"
+        return  # one per batch is enough to raise the flag
+
+
 def start(transport, mappings=()) -> None:
     global _transport, _last_hot, _last_hot_applied, \
         _reassembler, _mappings, _pending_t2
@@ -819,6 +869,11 @@ def start(transport, mappings=()) -> None:
         want_resync=False, frozen_caches=0, seq_fast=0, parked=0,
     )
     _rebuild_uuid_map()
+    _touched.clear()
+    stats.update(local_edits=0, last_local_edit="")
+    _quiet(_BLOB_GRACE)
+    if _on_depsgraph_replica not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_replica)
     # persistent: the apply loop must survive the bootstrap's open_mainfile
     # (non-persistent timers are dropped on file load)
     bpy.app.timers.register(_tick, first_interval=_TICK, persistent=True)
@@ -827,3 +882,5 @@ def start(transport, mappings=()) -> None:
 def stop() -> None:
     global _transport
     _transport = None
+    if _on_depsgraph_replica in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_replica)

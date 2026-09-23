@@ -50,7 +50,7 @@ if wait_for 'r.get("tag")=="a" and r.get("stats",{}).get("bootstraps",0)>=1 and 
 echo "killing replica a"
 kill -9 $R1 2>/dev/null; sleep 3
 rm -f "$SCRATCH/replica.json"
-R2=$(start_replica b QCB_TEST_DROP_FIRST_T1=1)
+R2=$(start_replica b QCB_TEST_DROP_FIRST_T1=1 QCB_SMOKE_LOCAL_EDIT=1)
 
 if wait_for 'r.get("tag")=="b" and r.get("stats",{}).get("bootstraps",0)>=1 and r.get("probe") is not None and h.get("sent_boot",0)>=2' 60; then
   checks+=("rebootstrap_after_restart:pass"); else checks+=("rebootstrap_after_restart:FAIL"); fi
@@ -61,6 +61,9 @@ if wait_for 'h.get("done") and r.get("stats",{}).get("bootstraps",0)>=2 and r.ge
 if wait_for 'h.get("auto_resyncs",0)>=1' 5; then checks+=("host_counted_auto_resync:pass"); else checks+=("host_counted_auto_resync:FAIL"); fi
 if wait_for 'not r.get("stats",{}).get("want_resync") and r.get("stats",{}).get("gaps",0)>=1' 10; then
   checks+=("flag_cleared_gap_kept:pass"); else checks+=("flag_cleared_gap_kept:FAIL"); fi
+# replica b edits itself at 12 s; the host's pong must carry it
+if wait_for 'h.get("peer_status",{}).get("local_edits",0)>=1 and "Probe" in h.get("peer_status",{}).get("last_local_edit","")' 25; then
+  checks+=("local_edit_reported_to_host:pass"); else checks+=("local_edit_reported_to_host:FAIL"); fi
 
 kill $HOST_PID $R2 2>/dev/null; sleep 2; kill -9 $HOST_PID $R2 2>/dev/null
 echo "--- host notes:"; python3 -c "import json;print(json.load(open('$SCRATCH/host.json'))['notes'])" 2>/dev/null

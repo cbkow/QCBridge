@@ -66,7 +66,7 @@ the new keyed-rig scrub row is in (`anim_rig_scrub`). Results in
 | new *unused* image / edits to an *unused* node group | Blender fires no depsgraph update for a datablock nothing uses, and a full save does not write it. It appears on the replica the moment it is used (the pointer rule ships it first). By design. |
 | pixel edits on an unpacked generated image | `libraries.write` carries no pixels for it; pack the image, or paint on a file-backed one. Documented limitation. |
 | linking an object from another `.blend` | linked IDs cannot be stamped; needs its own message ("link `X` from `<mapped path>`"). Deferred. |
-| undo | not surveyed (segfaults background Blender). |
+| undo | run in a GUI Blender (`QCB_COV_UNDO=1`): no crash; the move and its undo cancel before the debounce flushes, so nothing crosses and both sides agree — but the memfile undo floods the depsgraph and every Mesh update is unconditional tier 2: **35 blobs** for one Ctrl-Z. Correct, expensive; an undo-aware Mesh digest is the fix (open). |
 
 ## Method
 

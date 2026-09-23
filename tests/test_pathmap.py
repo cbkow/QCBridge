@@ -154,3 +154,18 @@ def test_is_mapped():
     assert not is_mapped("mac", "/Users/chris/Desktop/x", NAS)
     assert is_mapped("win", "C:\\Volumes\\studio-nas\\jobs\\x", NAS)
     assert not is_mapped("win", "D:\\elsewhere\\x", NAS)
+
+
+def test_localize_any_translates_a_mac_host_path_for_a_replica(monkeypatch):
+    """A bootstrap carries the host's native paths. A mac host's absolute
+    path must map on any replica, not only a Windows-form one (found by
+    smokes/run_smoke_mapping.sh, 2026-09-23)."""
+    from ring1 import pathmap
+    rows = [pathmap.PathMapping(win="Z:\\proj", mac="/Volumes/share/proj")]
+    monkeypatch.setattr(pathmap, "current_os_tag", lambda: "win")
+    assert pathmap.localize_any("/Volumes/share/proj/tex/a.png", rows) == "Z:\\proj\\tex\\a.png"
+    assert pathmap.localize_any("Z:\\proj\\tex\\a.png", rows) == "Z:\\proj\\tex\\a.png"
+    monkeypatch.setattr(pathmap, "current_os_tag", lambda: "mac")
+    assert pathmap.localize_any("Z:\\proj\\tex\\a.png", rows) == "/Volumes/share/proj/tex/a.png"
+    # nothing matches: unchanged, for the caller to judge by existence
+    assert pathmap.localize_any("/Users/someone/else.png", rows) == "/Users/someone/else.png"

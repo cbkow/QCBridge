@@ -37,4 +37,14 @@ def _dump():
     return 0.3
 
 
+if os.environ.get("QCB_SMOKE_LOCAL_EDIT"):
+    # 12 s in: edit the replica by hand (SYNC-AUDIT A9). The host must be told.
+    def _local_edit():
+        o = bpy.data.objects.get("Probe")
+        if o is not None:
+            o.location.z = 9.0
+            bpy.context.view_layer.update()
+        return None
+    bpy.app.timers.register(_local_edit, first_interval=12.0, persistent=True)
+
 bpy.app.timers.register(_dump, first_interval=1.0, persistent=True)

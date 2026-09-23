@@ -408,6 +408,8 @@ def _start_replica(prefs) -> None:
             "unmapped": replica_apply.stats["unmapped_paths"],
             "frozen": replica_apply.stats["frozen_caches"],
             "last_error": replica_apply.stats["last_error"][:120],
+            "local_edits": replica_apply.stats["local_edits"],
+            "last_local_edit": replica_apply.stats["last_local_edit"][:60],
             # Encoder state rides along so the HOST panel can say why a
             # viewer can't connect without anyone remoting to the replica.
             "pixel": pixel_path.status(),
@@ -601,6 +603,8 @@ def _replica_overlay_text() -> str:
         bits.append(f"⚠ {stats['frozen_caches']} frozen disk caches")
     if stats["last_error"]:
         bits.append(f"⚠ {stats['last_error'][:48]}")
+    if stats["local_edits"]:
+        bits.append(f"⚠ edited here: {stats['last_local_edit'][:32]} ({stats['local_edits']})")
     return " · ".join(bits)
 
 
@@ -671,6 +675,8 @@ def status_text() -> str:
             bits.append(f"⚠ replica: {peer['frozen']} disk caches frozen — use an external cache path")
         if peer.get("last_error"):
             bits.append(f"⚠ replica error: {peer['last_error'][:60]}")
+        if peer.get("local_edits"):
+            bits.append(f"⚠ replica edited locally: {peer.get('last_local_edit', '')[:40]} ({peer['local_edits']}) — Force Resync overrides")
         dropped = getattr(transport, "cold_dropped", 0)
         if dropped:
             bits.append(f"⚠ {dropped} frames dropped by the agent")

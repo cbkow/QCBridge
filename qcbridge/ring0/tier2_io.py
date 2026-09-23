@@ -50,6 +50,7 @@ _COLLECTIONS = (
     ("grease_pencils", bpy.types.GreasePencil),
     ("textures", bpy.types.Texture),
     ("particles", bpy.types.ParticleSettings),
+    ("cache_files", bpy.types.CacheFile),  # Alembic/USD: localized on arrival like images
     # NOTE no shape_keys entry: libraries.load has no shape_keys namespace
     # (probed 5.2) — Keys always ride their owner's blob and are paired by
     # the dedicated post-pass in apply_blob below.

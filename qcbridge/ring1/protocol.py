@@ -147,7 +147,8 @@ def check_hello(msg: dict, expected_token: str) -> tuple[bool, str]:
 
 # ── cold channel ─────────────────────────────────────────────────────────────
 # Message kinds: "t1" (property deltas), "t2" (datablock blob), "tomb"
-# (tombstone), "boot" (bootstrap blob), "sync" (flush markers).
+# (tombstone), "boot" (bootstrap blob). Fast-lane messages ("t1", "tomb")
+# carry lane="f" and `after` (ring1/merge.py).
 
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
 

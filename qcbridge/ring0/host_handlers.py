@@ -33,6 +33,7 @@ _FLUSH_TICK = 0.025   # was 0.05: up to a tick of latency on every delta
 _SWEEP_INTERVAL = 0.25  # was 0.5: eye toggles, renames, custom props ride this
 _AUTO_BOOT_DEBOUNCE = 1.0    # wait for the burst of Scene edits to end
 _AUTO_BOOT_MIN_INTERVAL = 5.0  # never more than one automatic bootstrap per
+_T2_PER_TICK = 2  # libraries.write is a main-thread stall; spread a storm over ticks (D3)
 _DEBUG = bool(os.environ.get("QCB_DEBUG"))
 
 # bpy ID type → shadow.TRACKED key (isinstance covers subclasses, e.g. the
@@ -49,8 +50,17 @@ _TYPE_KEYS = {
 }
 
 
+_lc_memo: tuple[float, dict] = (0.0, {})
+
+
 def _layer_collections():
-    """collection session_uid → LayerCollection, for the active view layer."""
+    """collection session_uid → LayerCollection, for the active view layer.
+    Memoised for 50 ms: build_snapshot asked once per collection, an O(n²)
+    main-thread walk on collection-heavy scenes (SYNC-AUDIT D6)."""
+    global _lc_memo
+    now = time.monotonic()
+    if now - _lc_memo[0] < 0.05:
+        return _lc_memo[1]
     result = {}
 
     def walk(lc):
@@ -59,6 +69,7 @@ def _layer_collections():
             walk(child)
 
     walk(bpy.context.view_layer.layer_collection)
+    _lc_memo = (now, result)
     return result
 
 # Geometry datablocks the depsgraph pings with a shading-only update when a
@@ -75,6 +86,7 @@ _SWEPT_COLLECTIONS = (
     "curves", "images", "node_groups", "collections", "actions", "shape_keys",
     "lattices", "armatures", "metaballs", "volumes", "hair_curves",
     "pointclouds", "lightprobes", "grease_pencils", "textures", "particles",
+    "cache_files",
 )
 
 
@@ -397,11 +409,16 @@ class HostSync:
         tombstones, dirty = self.dirty.drain()
         for uuid in tombstones:
             self._send_tombstone(uuid)
+        t2_budget = _T2_PER_TICK
         for uuid, tier in dirty:
             if uuid not in ready_set:
                 self.dirty.requeue(uuid, tier)  # still being edited
                 continue
             if tier == Tier.T2:
+                if t2_budget <= 0:
+                    self.dirty.requeue(uuid, tier)  # next tick: keep the UI breathing
+                    continue
+                t2_budget -= 1
                 self._flush_t2(uuid)
             else:
                 self._flush_t1(uuid)
@@ -675,7 +692,7 @@ def _is_syncable_id(db: bpy.types.ID) -> bool:
              bpy.types.Image, bpy.types.MetaBall, bpy.types.Volume,
              bpy.types.Curves, bpy.types.PointCloud, bpy.types.LightProbe,
              bpy.types.GreasePencil, bpy.types.Texture,
-             bpy.types.ParticleSettings)
+             bpy.types.ParticleSettings, bpy.types.CacheFile)
     )
 
 

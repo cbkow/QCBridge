@@ -741,7 +741,7 @@ class ReplicaTransportAgent:
         elif kind == T_EVENT:
             event = json.loads(body.decode("utf-8"))
             name = event.get("event")
-            if name in ("listening", "attached"):
+            if name == "attached":  # ("listening" was a helper-era event the agent never emits)
                 self._port = int(event.get("port") or 0)
                 self.fingerprint = event.get("fingerprint") or ""
                 self.agent_version = event.get("version", "")

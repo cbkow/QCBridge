@@ -77,11 +77,11 @@ def localize_paths(datablocks, local_dir: str, mappings) -> tuple[int, int, int]
             else:
                 unmapped += 1  # relative to a project dir this machine can't see
         else:
-            local = pathmap.from_canonical(filepath, mappings)
+            local = pathmap.localize_any(filepath, mappings)
             if local != filepath:
                 new = local
-            elif _is_foreign_form(filepath):
-                unmapped += 1
+            elif _is_foreign_form(filepath) or not os.path.exists(bpy.path.abspath(filepath)):
+                unmapped += 1  # no mapping matched and it is not here either
         if new and new != filepath:
             try:
                 db.filepath = new
@@ -152,10 +152,10 @@ def localize_object_paths(objects, local_dir: str, mappings) -> tuple[int, int, 
                 else:
                     unmapped += 1
             else:
-                local = pathmap.from_canonical(filepath, mappings)
+                local = pathmap.localize_any(filepath, mappings)
                 if local != filepath:
                     new = local
-                elif _is_foreign_form(filepath):
+                elif _is_foreign_form(filepath) or not os.path.isdir(filepath):
                     unmapped += 1
             try:
                 if attr == "filepath":
