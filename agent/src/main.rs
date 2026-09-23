@@ -117,6 +117,7 @@ fn attach_reply(agent: &Agent) -> Value {
         // see this key falls back to counting messages against an old agent.
         "credits": "bytes",
         "lanes": ["fast"],  // tier-1 has its own stream; absent = send it on cold
+        "codec": "zstd",    // cold payloads are compressed on the wire by the agent
         // The live settings, so the addon mirrors them instead of owning
         // its own copy. The addon already received `role` and `port` and
         // threw them away; now there is a reason to keep them.

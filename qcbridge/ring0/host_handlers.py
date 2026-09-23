@@ -352,7 +352,7 @@ class HostSync:
         """Queue the full mainfile for the wire (tier 3 — session bootstrap
         and force-resync). Chunks drain through flush_tick under
         backpressure; explicit, so it proceeds even while paused."""
-        data = bootstrap.serialize_mainfile()
+        data = bootstrap.serialize_mainfile(compress=self._blend_compress())
         self.last_bootstrap_bytes = len(data)
         meta = {
             "uuid": "__mainfile__",
@@ -563,7 +563,7 @@ class HostSync:
                 self._flush_t2(owner_uuid)
             return
         try:
-            data = tier2_io.serialize(db)
+            data = tier2_io.serialize(db, compress=self._blend_compress())
         except ReferenceError:
             return  # died between mark and flush; sweep will tombstone it
         if data is None:
@@ -600,6 +600,12 @@ class HostSync:
             print(f"qcb t2 send {db.name} ({len(data)} bytes)", flush=True)
         self._drain_t2_outbox(uuid)
 
+    def _blend_compress(self) -> bool:
+        """Compress .blend partials in Blender only when the transport does
+        not compress the wire itself (zmq): zstd on the main thread is the
+        replica's apply stall and the host's serialize stall."""
+        return not getattr(self.transport, "wire_compresses", False)
+
     def _blob_digest(self, db, data: bytes, snapshot: dict | None = None) -> bytes:
         pc = snapshot.get("~pcache") if snapshot is not None else (
             _pcache_signature(db) if isinstance(db, bpy.types.Object) else None)
@@ -618,7 +624,7 @@ class HostSync:
             if db is None or not _alive(db):
                 continue
             try:
-                data = tier2_io.serialize(db)
+                data = tier2_io.serialize(db, compress=self._blend_compress())
             except Exception:
                 continue
             if data is None:

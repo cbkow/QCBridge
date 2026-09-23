@@ -71,6 +71,43 @@ async fn ack_cold(link: &Link, n: u32) {
     link.frame(T_COLD_ACK, Bytes::copy_from_slice(&n.to_be_bytes())).await;
 }
 
+/// Cold-lane wire framing: u8 codec | u32 BE raw length | payload.
+/// codec 0 = raw, 1 = zstd (level 3: ~5× on .blend partials, fast).
+const CODEC_RAW: u8 = 0;
+const CODEC_ZSTD: u8 = 1;
+const ZSTD_LEVEL: i32 = 3;
+const ZSTD_MIN: usize = 4096; // below this, compressing costs more than it saves
+
+fn cold_wire_encode(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() + 5);
+    if raw.len() >= ZSTD_MIN {
+        if let Ok(z) = zstd::bulk::compress(raw, ZSTD_LEVEL) {
+            if z.len() < raw.len() {
+                out.push(CODEC_ZSTD);
+                out.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+                out.extend_from_slice(&z);
+                return out;
+            }
+        }
+    }
+    out.push(CODEC_RAW);
+    out.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+    out.extend_from_slice(raw);
+    out
+}
+
+fn cold_wire_decode(wire: &[u8]) -> Result<Vec<u8>> {
+    if wire.len() < 5 {
+        bail!("cold frame too short");
+    }
+    let raw_len = u32::from_be_bytes([wire[1], wire[2], wire[3], wire[4]]) as usize;
+    match wire[0] {
+        CODEC_RAW => Ok(wire[5..].to_vec()),
+        CODEC_ZSTD => zstd::bulk::decompress(&wire[5..], raw_len).context("zstd decompress"),
+        c => bail!("unknown cold codec {c}"),
+    }
+}
+
 async fn ack_fast(link: &Link, n: u32) {
     link.frame(T_FAST_ACK, Bytes::copy_from_slice(&n.to_be_bytes())).await;
 }
@@ -541,7 +578,11 @@ async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Resu
                 // addon and quinn, not a message count a 4 MiB chunk and a
                 // 200-byte delta would share (SYNC-AUDIT §3 B3/D4).
                 let len = body.len() as u32;
-                let sent = send_msg(&mut cold_send, &body.slice(1..)).await;
+                // Compress on this task, not in Blender: block_in_place keeps
+                // the other tasks on this worker moving (multi-thread rt).
+                let raw = body.slice(1..);
+                let wire = tokio::task::block_in_place(|| cold_wire_encode(&raw));
+                let sent = send_msg(&mut cold_send, &wire).await;
                 ack_cold(&c.link, len).await;
                 sent?;
             }
@@ -578,7 +619,8 @@ async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Resu
         let c = ctx.clone();
         tasks.spawn(async move {
             while let Some(payload) = recv_msg(&mut cold_recv).await? {
-                c.link.frame(T_COLD, lane_body(0, &payload)).await;
+                let raw = tokio::task::block_in_place(|| cold_wire_decode(&payload))?;
+                c.link.frame(T_COLD, lane_body(0, &raw)).await;
             }
             Ok(())
         });

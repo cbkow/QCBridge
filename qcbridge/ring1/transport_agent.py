@@ -382,6 +382,9 @@ class HostTransportAgent:
         self.cold_dropped = 0        # frames the agent had to discard (cold_dropped events)
         self._credits_bytes = False  # COLD_ACK unit; set from the attached event
         self._has_fast = False       # agent has the fast lane (attached event)
+        # The agent compresses cold payloads on the wire, so Blender may
+        # write partials uncompressed and the replica loads them 20× faster.
+        self.wire_compresses = False
         self._fast_outstanding = 0
         self.video_port = 0          # localhost TCP port serving Annex-B HEVC
         self.stats: dict = {}
@@ -538,6 +541,7 @@ class HostTransportAgent:
             self.agent_config = dict(event.get("config") or {})
             self._credits_bytes = event.get("credits") == "bytes"
             self._has_fast = "fast" in (event.get("lanes") or [])
+            self.wire_compresses = event.get("codec") == "zstd"
             self._attached.set()
         elif name == "config":   # every settings change, from us or the tray
             self.agent_config = dict(event.get("config") or self.agent_config)

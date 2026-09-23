@@ -321,3 +321,21 @@ def test_fast_lane_is_not_behind_a_cold_blob(pair):
     cold = []
     assert wait_for(lambda: cold.extend(replica.poll_cold(64)) or len(cold) >= len(chunks), timeout=15.0)
     assert [h["blob"]["i"] for h, _ in cold[: len(chunks)]] == list(range(len(chunks)))
+
+
+def test_cold_payloads_round_trip_byte_identical(pair):
+    """The agent compresses cold payloads on the wire (attached: codec=zstd);
+    what the replica polls must be exactly what the host sent — a highly
+    compressible blob and an incompressible one, plus a tiny one below the
+    compression threshold."""
+    import os
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    assert host.wire_compresses, "attached event lacked codec=zstd — stale agent binary?"
+    payloads = [b"MESH" * 1_500_000, os.urandom(1_500_000), b"x"]
+    for i, p in enumerate(payloads):
+        while not host.send_cold({"kind": "t2", "seq": i + 1, "uuid": f"p{i}"}, p):
+            time.sleep(0.002)
+    got = []
+    assert wait_for(lambda: got.extend(replica.poll_cold(16)) or len(got) >= 3, timeout=15.0)
+    assert [p for _, p in got[:3]] == payloads

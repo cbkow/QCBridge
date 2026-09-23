@@ -65,6 +65,12 @@ class HostTransport(Protocol):
     arrives). The host reads this to recommend a resync — decision-#8-clean
     because the replica only ever answers."""
 
+    wire_compresses: bool
+    """True when the transport compresses cold payloads itself (the agent
+    does, with zstd, on its own threads). The host then serializes partials
+    and bootstraps uncompressed, which keeps zstd off Blender's main thread
+    on both ends — the replica's libraries.load is what it saved."""
+
     def on_peer_state(self, cb: Callable[[bool], None]) -> None:
         """cb(True) on peer (re)appearing, cb(False) on peer-lost — fired
         from the IO thread; the callback must not touch bpy directly."""

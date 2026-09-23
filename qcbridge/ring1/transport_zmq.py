@@ -28,6 +28,7 @@ def _endpoint(address: str, port: int) -> str:
 
 
 class HostTransportZmq:
+    wire_compresses = False  # nothing between Blender and the socket: keep .blend compression on
     def __init__(self, cfg: TransportConfig) -> None:
         self._cfg = cfg
         self._ctx: zmq.Context | None = None

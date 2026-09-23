@@ -70,7 +70,14 @@ What the numbers say:
   partial uncompressed loads in 2 ms. The residual in `hol150` is
   decompression on Blender's main thread. The lever would be compressing on
   the agent's thread instead of in `libraries.write`/`load` (a wire change,
-  ~3× the local-link bytes); deferred to after the Windows pass.*
+  ~3× the local-link bytes).*
+- *Done the same evening (`agent-after-zstd/`): the agent zstd-compresses
+  cold payloads on its own threads and Blender writes/loads partials
+  uncompressed. `hol150` **114 ms** against a 109 ms `t1` — the head-of-line
+  cost is gone. The trade: the Heavy blob itself lands ~60 ms later on
+  loopback (360 vs ~300 ms), because 61 MB now crosses the local link twice
+  and is copied ≥4 times (D4) before the agent compresses it; on a real
+  link the wire bytes are the same. D4 is where that 60 ms lives.*
 - *After P2 (2026-09-23): with tier-1 on its own stream `hol150` reads
   240 ms against a 189 ms `t1` — the wire share is gone; the ~50 ms left is
   the replica's indivisible apply of the 640k-vertex blob on its main
@@ -161,7 +168,7 @@ bootstraps, unmapped paths, frozen caches and the last error.
 | D1 | **`~pose` hashes animated `matrix_basis`** in both the flush and the sweep digest: scrubbing a rigged shot escalates a full tier-2 Object blob per rig each time the pose is sampled changed, for zero information. | `host_handlers.py:578-590` | confirmed by code → **fixed 09-23**: the digest ignores `matrix_basis` on bones the action (or NLA) animates; the survey's `anim_rig_scrub` row sends **0** rig blobs across a 12-frame scrub (no pre-fix measurement of that row exists — the baseline is the code) |
 | D2 | **Edit-mode and sculpt strokes resend the whole Mesh, and the blob is the pre-edit datablock** — no `update_from_editmode()` anywhere. Correctness arrives on mode exit; the host stalls on every ≥150 ms pause. | `tier2_io.py:56-66` | confirmed → **fixed 09-23**: `serialize` flushes the edit-mesh first, and a blob byte-identical to the last one sent for that datablock (plus its point-cache signature) is skipped — `libraries.write` is deterministic for unchanged data (probed). A pause with no edit now sends nothing; a pause with one sends the current mesh. The map is primed on idle ticks after a bootstrap (two datablocks per tick), which is what turns an undo's 34 blobs into 6 |
 | D3 | Tier-2 `libraries.write` is synchronous on the host main thread with no per-tick byte budget; a multi-object structural edit is a serialize storm. | `host_handlers.py:289-296` | reported → **capped 09-23**: at most two serializations per flush tick, the rest requeued (and re-touched as ready — a plain requeue after `debounce.ready()` had consumed the entry left 33 blobs unsent, caught the same hour); still synchronous |
-| D4 | A 50 MiB blob is copied ≥4 times per direction (`pack_cold` join, `_read_exact` join, agent `vec!` per frame, `Reassembler` join); 4 MiB chunking is a zmq-era limit — lanes accept 256 MiB. | `transport_agent.py:78-80, 251-262`, `link.rs:179`, `protocol.py:217` | reported |
+| D4 | A 50 MiB blob is copied ≥4 times per direction (`pack_cold` join, `_read_exact` join, agent `vec!` per frame, `Reassembler` join); 4 MiB chunking is a zmq-era limit — lanes accept 256 MiB. | `transport_agent.py:78-80, 251-262`, `link.rs:179`, `protocol.py:217` | reported — **now the whole cost of a big blob on loopback** (partials are uncompressed on the local link since the agent compresses the wire): the next lever for the `heavy` row |
 | D5 | `stats` (rtt, loss, cwnd, mtu, mbps) is emitted at 1 Hz and read by nobody. `"listening"` event branch the agent never emits; `FLAG_HOLD`, cold kind `"sync"`, the fixed-rate pacer — declared, unused. | `transport_agent.py:525, 687`, `protocol.py:25, 144` | reported → **done 09-23**: stats on the panel and burn-in; `"listening"` branch and the `"sync"` kind removed. `FLAG_HOLD` stays as a reserved protocol bit; the pacer stays in lib.rs, documented as unused |
 | D6 | `build_snapshot` walks `_layer_collections()` once per collection — O(n²) on the main thread. | `host_handlers.py:767` | reported → **fixed 09-23**: memoised for 50 ms |
 | D7 | **Every shader-affecting material edit resends every Mesh that wears it, whole.** The depsgraph flags the mesh (shading), the handler discards `is_updated_geometry`, and Mesh is unconditional tier 2 — a 64 KB blob per slider tick on a four-vertex plane, a full mesh in production. | `classifier.py:54-55`, measured in `COVERAGE.md` | confirmed + measured → **fixed 09-23**: shading-only updates on geometry types are skipped (by type — an Action's keyframe edit also arrives as shade=True and must not be) |

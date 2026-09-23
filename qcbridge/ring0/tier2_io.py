@@ -64,7 +64,7 @@ def collection_of(db: bpy.types.ID) -> str | None:
     return None
 
 
-def serialize(db: bpy.types.ID) -> bytes | None:
+def serialize(db: bpy.types.ID, compress: bool = True) -> bytes | None:
     """Partial .blend bytes for one datablock (deps included), or None for
     types we don't resend (Scene: force-resync territory, M6)."""
     if collection_of(db) is None:
@@ -80,7 +80,7 @@ def serialize(db: bpy.types.ID) -> bytes | None:
             pass
     path = Path(tempfile.gettempdir()) / f"qcb-t2-{db.session_uid}.blend"
     try:
-        bpy.data.libraries.write(str(path), {db}, compress=True)
+        bpy.data.libraries.write(str(path), {db}, compress=compress)
         return path.read_bytes()
     finally:
         path.unlink(missing_ok=True)

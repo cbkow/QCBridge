@@ -18,7 +18,7 @@ from ..ring1 import pathmap
 from . import kiosk
 
 
-def serialize_mainfile() -> bytes:
+def serialize_mainfile(compress: bool = True) -> bytes:
     path = Path(tempfile.gettempdir()) / f"qcb-boot-{os.getpid()}.blend"
     try:
         # relative_remap=False is load-bearing: the default rewrites '//'
@@ -26,7 +26,7 @@ def serialize_mainfile() -> bytes:
         # the wire form must stay relative to the PROJECT dir, which the
         # replica resolves against its mapped-local project dir.
         bpy.ops.wm.save_as_mainfile(
-            filepath=str(path), copy=True, compress=True, relative_remap=False
+            filepath=str(path), copy=True, compress=compress, relative_remap=False
         )
         return path.read_bytes()
     finally:
