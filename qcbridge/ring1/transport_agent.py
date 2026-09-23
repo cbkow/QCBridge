@@ -84,13 +84,26 @@ def pack_cold(header: dict, payload: bytes) -> bytes:
     return struct.pack(">I", len(head)) + head + payload
 
 
-def unpack_cold(body: bytes) -> tuple[dict, bytes] | None:
+def cold_parts(header: dict, payload) -> list:
+    """The cold body as buffers the link writes in turn — no concatenation
+    of a 4 MiB chunk on the main thread (SYNC-AUDIT D4)."""
+    head = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    return [_PEER, struct.pack(">I", len(head)), head, payload]
+
+
+_VIEW_MIN = 65536  # payloads at least this big stay memoryviews of the receive buffer
+
+
+def unpack_cold(body) -> tuple[dict, bytes] | None:
     if len(body) < 4:
         return None
     (n,) = struct.unpack_from(">I", body)
     if len(body) < 4 + n:
         return None
-    return protocol.decode_cold([body[4:4 + n], body[4 + n:]])
+    payload = body[4 + n:]
+    if not isinstance(payload, (bytes, bytearray)) and len(payload) < _VIEW_MIN:
+        payload = bytes(payload)  # small: a real bytes object, decode()-able
+    return protocol.decode_cold([bytes(body[4:4 + n]), payload])
 
 
 class _FrameLink:
@@ -118,10 +131,16 @@ class _FrameLink:
         raise NotImplementedError
 
     @staticmethod
-    def _frame(kind: int, body: bytes) -> bytes:
-        return struct.pack(">IB", len(body) + 1, kind) + body
+    def _frame(kind: int, body) -> list:
+        """A frame as the buffers to write in turn: header, then the body's
+        parts. Nothing is concatenated — a big blob chunk goes to the socket
+        from the memoryview it was sliced as."""
+        parts = body if isinstance(body, list) else [body]
+        total = sum(len(p) for p in parts)
+        return [struct.pack(">IB", total + 1, kind), *parts]
 
-    def send(self, kind: int, body: bytes) -> None:
+    def send(self, kind: int, body) -> None:
+        """body: bytes, or a list of buffers (bytes / memoryview)."""
         with self._cv:
             self._frames.append(self._frame(kind, body))
             self._cv.notify()
@@ -213,7 +232,7 @@ class _AgentLink(_FrameLink):
         self._sock = socket.create_connection((host, port), timeout=5.0)
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock.settimeout(None)
-        self._sock.sendall(self._frame(T_CMD, json.dumps(
+        self._sendall_parts(self._frame(T_CMD, json.dumps(
             {"cmd": "attach", "secret": secret, "role": self._role}).encode("utf-8")))
         for target, name in ((self._read_loop, "qcb-agent-rx"), (self._write_loop, "qcb-agent-tx")):
             thread = threading.Thread(target=target, name=name, daemon=True)
@@ -246,24 +265,35 @@ class _AgentLink(_FrameLink):
                 closing = self._closing
             try:
                 for frame in batch:
-                    self._sock.sendall(frame)
+                    for part in frame:
+                        if len(part):
+                            self._sock.sendall(part)
             except OSError:
                 return
             if closing and not batch:
                 return
 
-    def _read_exact(self, n: int) -> bytes | None:
-        chunks, got = [], 0
+    def _sendall_parts(self, parts: list) -> None:
+        for part in parts:
+            if len(part):
+                self._sock.sendall(part)
+
+    def _read_exact(self, n: int):
+        """One preallocated buffer, filled in place; returns a memoryview.
+        Handlers slice it without copying, and a blob chunk reaches the
+        reassembler as a view of this buffer (SYNC-AUDIT D4)."""
+        buf = bytearray(n)
+        view = memoryview(buf)
+        got = 0
         while got < n:
             try:
-                chunk = self._sock.recv(n - got)
+                r = self._sock.recv_into(view[got:])
             except OSError:
                 return None
-            if not chunk:
+            if not r:
                 return None
-            chunks.append(chunk)
-            got += len(chunk)
-        return b"".join(chunks)
+            got += r
+        return view
 
 
 def _reap(proc: subprocess.Popen) -> None:
@@ -475,8 +505,9 @@ class HostTransportAgent:
             self._link.send_hot(key, value)
 
     def send_cold(self, header: dict, payload: bytes = b"") -> bool:
-        frame = _PEER + pack_cold(header, payload)
-        cost = len(frame) if self._credits_bytes else 1
+        parts = cold_parts(header, payload)
+        size = sum(len(p) for p in parts)
+        cost = size if self._credits_bytes else 1
         with self._lock:
             window = _COLD_WINDOW_BYTES if self._credits_bytes else _COLD_WINDOW
             # A frame larger than the window still goes when nothing is in
@@ -486,7 +517,7 @@ class HostTransportAgent:
             ):
                 return False
             self._cold_outstanding += cost
-        self._link.send(T_COLD, frame)
+        self._link.send(T_COLD, parts)
         return True
 
     def send_fast(self, header: dict, payload: bytes = b"") -> bool:
@@ -495,14 +526,15 @@ class HostTransportAgent:
         carries lane/after, so the replica merges either way)."""
         if not self._has_fast:
             return self.send_cold(header, payload)
-        frame = _PEER + pack_cold(header, payload)
+        parts = cold_parts(header, payload)
+        size = sum(len(p) for p in parts)
         with self._lock:
             if not self._link_up or (
-                self._fast_outstanding and self._fast_outstanding + len(frame) > _FAST_WINDOW_BYTES
+                self._fast_outstanding and self._fast_outstanding + size > _FAST_WINDOW_BYTES
             ):
                 return False
-            self._fast_outstanding += len(frame)
-        self._link.send(T_FAST, frame)
+            self._fast_outstanding += size
+        self._link.send(T_FAST, parts)
         return True
 
     @property
@@ -514,9 +546,9 @@ class HostTransportAgent:
 
     # ── helper frames (reader thread) ────────────────────────────────────────
 
-    def _on_frame(self, kind: int, body: bytes) -> None:
+    def _on_frame(self, kind: int, body) -> None:
         if kind == T_CONTROL:
-            reply = protocol.decode_control(body[1:])
+            reply = protocol.decode_control(bytes(body[1:]))
             if reply is not None:
                 self._handle_reply(reply)
         elif kind == T_COLD_ACK:
@@ -528,7 +560,7 @@ class HostTransportAgent:
             with self._lock:
                 self._fast_outstanding = max(0, self._fast_outstanding - count)
         elif kind == T_EVENT:
-            self._handle_event(json.loads(body.decode("utf-8")))
+            self._handle_event(json.loads(bytes(body).decode("utf-8")))
 
     def _handle_event(self, event: dict) -> None:
         name = event.get("event")
@@ -727,7 +759,7 @@ class ReplicaTransportAgent:
 
     def _on_frame(self, kind: int, body: bytes) -> None:
         if kind == T_CONTROL:
-            msg = protocol.decode_control(body[1:])
+            msg = protocol.decode_control(bytes(body[1:]))
             if msg is not None:
                 self._serve_control(msg)
         elif kind == T_HOT:
@@ -743,7 +775,7 @@ class ReplicaTransportAgent:
             if decoded is not None:
                 self._fast_q.append(decoded)
         elif kind == T_EVENT:
-            event = json.loads(body.decode("utf-8"))
+            event = json.loads(bytes(body).decode("utf-8"))
             name = event.get("event")
             if name == "attached":  # ("listening" was a helper-era event the agent never emits)
                 self._port = int(event.get("port") or 0)

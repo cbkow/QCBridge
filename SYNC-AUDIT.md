@@ -78,6 +78,12 @@ What the numbers say:
   loopback (360 vs ~300 ms), because 61 MB now crosses the local link twice
   and is copied ≥4 times (D4) before the agent compresses it; on a real
   link the wire bytes are the same. D4 is where that 60 ms lives.*
+- *D4 done (`agent-after-d4/`): chunks are memoryview slices sent as buffer
+  lists (no concatenation on the host main thread), the replica reads with
+  `recv_into` and assembles by offset into one buffer. `hol150` **99 ms**
+  against a 108 ms `t1`; `heavy` unchanged at 360 — so the copies were
+  not the 60 ms, the agent's single-threaded zstd on 61 MB is the next
+  suspect.*
 - *After P2 (2026-09-23): with tier-1 on its own stream `hol150` reads
   240 ms against a 189 ms `t1` — the wire share is gone; the ~50 ms left is
   the replica's indivisible apply of the 640k-vertex blob on its main

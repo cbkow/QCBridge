@@ -177,13 +177,15 @@ def chunk_blob(
     """Yield (header, payload) cold messages for one blob. `meta` rides on
     every chunk (chunks may be inspected before the blob completes)."""
     total = max(1, -(-len(data) // chunk_size))
+    view = memoryview(data)  # slices are views: no copy per chunk
     for i in range(total):
         header = {
             "kind": kind,
-            "blob": {"id": blob_id, "i": i, "n": total, "size": len(data)},
+            "blob": {"id": blob_id, "i": i, "n": total, "size": len(data),
+                     "o": i * chunk_size},  # offset: assemble in place
             **(meta or {}),
         }
-        yield header, data[i * chunk_size : (i + 1) * chunk_size]
+        yield header, view[i * chunk_size : (i + 1) * chunk_size]
 
 
 @dataclass
@@ -191,7 +193,8 @@ class _PartialBlob:
     total: int
     size: int
     header: dict
-    parts: dict = field(default_factory=dict)
+    buf: bytearray = field(default_factory=bytearray)  # the blob, assembled in place
+    got: set = field(default_factory=set)
 
 
 class Reassembler:
@@ -214,16 +217,19 @@ class Reassembler:
         part = self._partial.get(blob_id)
         if part is None:
             part = self._partial[blob_id] = _PartialBlob(
-                total=n, size=blob["size"], header=header
+                total=n, size=blob["size"], header=header, buf=bytearray(blob["size"])
             )
-        part.parts[i] = payload
-        if len(part.parts) < part.total:
+        offset = blob.get("o", i * len(payload))
+        end = offset + len(payload)
+        if end > part.size:
+            del self._partial[blob_id]
+            return None  # corrupt chunk — drop; caller's gap detection escalates
+        part.buf[offset:end] = payload  # the one copy, straight into place
+        part.got.add(i)
+        if len(part.got) < part.total:
             return None
         del self._partial[blob_id]
-        data = b"".join(part.parts[j] for j in range(part.total))
-        if len(data) != part.size:
-            return None  # corrupt reassembly — drop; caller's gap detection escalates
-        return part.header, data
+        return part.header, part.buf
 
     def drop(self, blob_id: str) -> None:
         self._partial.pop(blob_id, None)
