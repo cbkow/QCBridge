@@ -21,6 +21,8 @@ from ..ring1 import merge, protocol
 from . import bootstrap, kiosk, overlay, pixel_path, tier2_io
 from .identity import UUID_PROP
 
+_DEBUG = bool(os.environ.get("QCB_DEBUG"))
+
 _TICK = 0.015
 _BUDGET_S = 0.010
 _FRAME_MIN_INTERVAL = 0.1
@@ -84,6 +86,8 @@ _at_state: dict[str, dict[str, object]] = {}  # uuid → last "@" values applied
 _touched: dict[str, float] = {}   # uuid → monotonic time we last wrote it
 _quiet_until = 0.0                # no local-edit attribution before this (blob/boot/frame wake)
 _TOUCH_GRACE = 1.5
+_GEOMETRY_TYPES = (bpy.types.Mesh, bpy.types.Curve, bpy.types.Curves, bpy.types.PointCloud,
+                   bpy.types.Volume, bpy.types.MetaBall, bpy.types.GreasePencil, bpy.types.Lattice)
 _BLOB_GRACE = 3.0
 _FRAME_GRACE = 0.5
 _pending_t2_seq: int | None = None  # cold seq of the blob's last chunk
@@ -366,6 +370,7 @@ def _apply_t1(header: dict, payload: bytes) -> None:
 def _apply_tombstone(header: dict) -> None:
     global _last_hot
     _note_touched(header["uuid"])
+    _quiet(_FRAME_GRACE)  # a removal wakes the survivors
     db = _resolve(header["uuid"])
     if db is None:
         return
@@ -375,6 +380,38 @@ def _apply_tombstone(header: dict) -> None:
         stats["apply_errors"] += 1
     _uuid_map.pop(header["uuid"], None)
     _last_hot = None  # same camera-view risk as a t2 apply (see above)
+
+
+def _apply_link(header: dict) -> None:
+    """Link (or drop) datablocks from another .blend, by the replica's
+    mapped path. Linked IDs are never stamped, so membership and pointers
+    to them ride by name once they exist here."""
+    from ..ring1 import pathmap
+    _quiet(_BLOB_GRACE)  # libraries.load re-evaluates the scene: not a local edit
+    host_path = header.get("lib") or ""
+    local = pathmap.localize_any(host_path, _mappings)
+    if header.get("kind") == "unlink":
+        for lib in list(bpy.data.libraries):
+            if bpy.path.abspath(lib.filepath) in (local, host_path):
+                bpy.data.libraries.remove(lib)
+        return
+    if not os.path.exists(local):
+        stats["unmapped_paths"] += 1
+        stats["last_error"] = f"library not found here: {local}"
+        return
+    want_objects = set(header.get("objects") or [])
+    want_colls = set(header.get("collections") or [])
+    have = {o.name for o in bpy.data.objects if o.library and bpy.path.abspath(o.library.filepath) == local}
+    have_c = {c.name for c in bpy.data.collections if c.library and bpy.path.abspath(c.library.filepath) == local}
+    try:
+        with bpy.data.libraries.load(local, link=True) as (data_from, data_to):
+            data_to.objects = [n for n in want_objects - have if n in data_from.objects]
+            data_to.collections = [n for n in want_colls - have_c if n in data_from.collections]
+        stats["applied_t2"] += 1
+    except Exception as exc:
+        stats["apply_errors"] += 1
+        stats["last_error"] = f"link {os.path.basename(local)}: {exc!r}"
+    _rebuild_uuid_map()
 
 
 def _reapply_at_state(uuid: str) -> None:
@@ -540,6 +577,9 @@ def _dispatch(header: dict, payload: bytes, seq) -> None:
         _release(_merger.cold_done(seq))
     elif kind == "tomb":
         _apply_tombstone(header)
+        _release(_merger.cold_done(seq))
+    elif kind in ("link", "unlink"):
+        _apply_link(header)
         _release(_merger.cold_done(seq))
     elif kind in ("t2", "boot"):
             uuid = header.get("uuid", "")
@@ -844,6 +884,20 @@ def _on_depsgraph_replica(scene, depsgraph) -> None:
             continue
         if now - _touched.get(uuid, float("-inf")) < _TOUCH_GRACE:
             continue
+        if (
+            update.is_updated_shading
+            and not update.is_updated_geometry
+            and not update.is_updated_transform
+            and isinstance(db, (bpy.types.Object,) + _GEOMETRY_TYPES)
+        ):
+            # A shading-only update on an object or its geometry is a
+            # consequence of something else changing (a material, a light,
+            # a link); a local edit of the object shows as transform or
+            # geometry. A local material edit still shows on the Material.
+            continue
+        if _DEBUG:
+            print(f"qcb local-edit? {type(db).__name__}:{db.name} geom={update.is_updated_geometry}"
+                  f" shade={update.is_updated_shading} xform={update.is_updated_transform}", flush=True)
         stats["local_edits"] += 1
         stats["last_local_edit"] = f"{type(db).__name__}:{db.name}"
         return  # one per batch is enough to raise the flag

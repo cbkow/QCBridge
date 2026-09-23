@@ -65,7 +65,7 @@ the new keyed-rig scrub row is in (`anim_rig_scrub`). Results in
 |---|---|
 | new *unused* image / edits to an *unused* node group | Blender fires no depsgraph update for a datablock nothing uses, and a full save does not write it. It appears on the replica the moment it is used (the pointer rule ships it first). By design. |
 | pixel edits on an unpacked generated image | `libraries.write` carries no pixels for it; pack the image, or paint on a file-backed one. Documented limitation. |
-| linking an object from another `.blend` | linked IDs cannot be stamped; needs its own message ("link `X` from `<mapped path>`"). Deferred. |
+| linking an object from another `.blend` | **crosses since the evening of 2026-09-23**: the host sweeps `bpy.data.libraries` and sends a `link` message (host path, the linked object and collection names the scene uses); the replica maps the path, links those names, counts a missing file as unmapped, and reloads a Library it had to repoint. Membership and pointers to linked data then ride by name. The survey row crosses in ~350 ms. |
 | undo | run in a GUI Blender (`QCB_COV_UNDO=1`): no crash; the move and its undo cancel before the debounce flushes, so nothing crosses and both sides agree. The memfile undo floods the depsgraph and every Mesh update is unconditional tier 2: the survey's cost column measured **34 blobs** for one Ctrl-Z. Now the host hashes every blob it sends and primes those hashes on idle ticks after a bootstrap, so a blob identical to what the replica holds is skipped: **6 blobs, 29 skipped** for the same Ctrl-Z. The rest are datablocks the undo really changed. |
 
 ## Method

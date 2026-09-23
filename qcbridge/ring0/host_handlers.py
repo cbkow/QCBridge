@@ -144,6 +144,14 @@ class HostSync:
         # capable one has an entry.
         self._prime_queue: list[str] = []
         self.primed = 0
+        # Linked libraries (decision #15 scope guard lifted 2026-09-23): the
+        # linked IDs are never stamped, so they ride a "link" message naming
+        # the library file and the datablocks the scene uses from it; the
+        # replica links the same names from the mapped path. Later fast
+        # messages that name them wait behind the link's cold seq.
+        self._lib_state: dict[str, tuple] = {}
+        self._link_seq = 0
+        self.links_sent = 0
         self._auto_boot_at = 0.0     # monotonic; 0 = none pending
         self._last_auto_boot = float("-inf")
         self.auto_boots = 0
@@ -366,6 +374,13 @@ class HostSync:
             if _alive(db) and (db.users > 0 or db.use_fake_user)
         }
         self._blob_hash.clear()
+        self._lib_state = {
+            bpy.path.abspath(lib.filepath): (
+                tuple(sorted(o.name for o in bpy.data.objects if o.library == lib and o.users)),
+                tuple(sorted(c.name for c in bpy.data.collections if c.library == lib and c.users)),
+            )
+            for lib in bpy.data.libraries
+        }
         self._prime_queue = [
             uuid for uuid, db in self._uuid_to_db.items()
             if _alive(db) and (db.users > 0 or db.use_fake_user)
@@ -423,6 +438,7 @@ class HostSync:
         if now - self._last_sweep >= _SWEEP_INTERVAL:
             self._sweep_deletions()
             self._externalize_caches()
+            self._sweep_libraries()
             self._last_sweep = now
         if self.paused_fn() or not len(self.dirty):
             self._prime_hashes()
@@ -529,7 +545,40 @@ class HostSync:
             self.dirty.requeue(uuid, Tier.T1)
 
     def _after_for(self, uuid: str) -> int:
-        return max(self._uuid_cold_seq.get(uuid, 0), self._boot_last_seq)
+        return max(self._uuid_cold_seq.get(uuid, 0), self._boot_last_seq, self._link_seq)
+
+    def _sweep_libraries(self) -> None:
+        """New or changed library usage → "link"; a library gone → "unlink".
+        The bootstrap carries the libraries it had (a full save keeps the
+        references and the replica localizes them), so the state is primed
+        at each bootstrap and only changes since then are messages."""
+        current: dict[str, tuple] = {}
+        for lib in bpy.data.libraries:
+            objects = sorted(o.name for o in bpy.data.objects if o.library == lib and o.users)
+            colls = sorted(c.name for c in bpy.data.collections if c.library == lib and c.users)
+            if objects or colls:
+                current[bpy.path.abspath(lib.filepath)] = (tuple(objects), tuple(colls))
+        for path, (objects, colls) in current.items():
+            if self._lib_state.get(path) != (objects, colls):
+                if self._send_cold_msg({"kind": "link", "lib": path,
+                                        "objects": list(objects), "collections": list(colls)}):
+                    self._lib_state[path] = (objects, colls)
+                    self.links_sent += 1
+        for path in list(self._lib_state):
+            if path not in current:
+                if self._send_cold_msg({"kind": "unlink", "lib": path}):
+                    del self._lib_state[path]
+
+    def _send_cold_msg(self, header: dict) -> bool:
+        self.seq += 1
+        header["seq"] = self.seq
+        if self.transport.send_cold(header, b""):
+            self._link_seq = self.seq
+            if _DEBUG:
+                print(f"qcb {header['kind']} send {header.get('lib')}", flush=True)
+            return True
+        self.seq -= 1
+        return False
 
     def caught_up(self, peer_status: dict) -> bool:
         """Has the replica seen everything we sent, on both lanes? (Smokes

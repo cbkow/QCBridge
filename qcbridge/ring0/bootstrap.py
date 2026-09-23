@@ -67,8 +67,8 @@ def localize_paths(datablocks, local_dir: str, mappings) -> tuple[int, int, int]
     fixed = unmapped = errors = 0
     for db in datablocks:
         filepath = getattr(db, "filepath", None)
-        if not filepath or getattr(db, "packed_file", None):
-            continue
+        if not filepath or getattr(db, "packed_file", None) or filepath.startswith("<"):
+            continue  # empty, packed, or Blender's own "<builtin>" font
         new = None
         if filepath.startswith("//"):
             if local_dir:
@@ -87,6 +87,8 @@ def localize_paths(datablocks, local_dir: str, mappings) -> tuple[int, int, int]
                 db.filepath = new
                 if isinstance(db, bpy.types.Image):
                     db.reload()
+                elif isinstance(db, bpy.types.Library):
+                    db.reload()  # a repointed library is placeholders until reloaded
                 fixed += 1
                 if _DEBUG:
                     print(f"qcb path {db.name}: {filepath!r} -> {new!r}", flush=True)
