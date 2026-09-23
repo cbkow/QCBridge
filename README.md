@@ -57,7 +57,7 @@ coordinated release with QCView — is tracked in the QCBridgeAE repo's
 developed and tested on Blender 5.2 LTS, and 4.5 has not been exercised
 since. Both machines on the same network; it works over most VPNs.
 
-**Note:** 0.1.6 was tested with macOS as the host and Windows as the replica. The agent line has only been exercised on macOS so far. This is still very much a WIP experiment and was developed out of a need for a specific project.
+**Note:** 0.1.6 was tested with macOS as the host and Windows as the replica. The agent line (0.2.0) has been exercised on macOS and is being verified on Windows. This is still very much a WIP experiment and was developed out of a need for a specific project.
 
 ---
 

@@ -6,11 +6,12 @@ matching versions on **both machines**: the ends now tell each other their
 version at connect, and the panel warns if they don't match. Mismatched ends
 mostly work, but they degrade in confusing ways — update both.
 
-## Unreleased — the agent line (merged to `main` 2026-09-23)
+## 0.2.0 — unreleased (the agent line, merged to `main` 2026-09-23)
 
-Not a release yet: the version stays 0.1.6 until Windows is verified and the
-coordinated release with QCView happens. Everything below has run on macOS
-only, both roles on one machine, with the suites in `smokes/`.
+The number is set — extension and agent both say 0.2.0 — but it ships only
+with the coordinated release once Windows is verified. Everything below has
+run on macOS, both roles on one machine, with the suites in `smokes/`; the
+Windows pass is in progress.
 
 **The connection lives in an agent.** A small tray app (Rust) on each
 machine owns the QUIC session, so a Blender restart or a dropped link no

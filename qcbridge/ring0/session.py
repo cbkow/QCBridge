@@ -103,6 +103,12 @@ _ADDON_VERSION: str | None = None
 
 
 def _version_warning() -> str:
+    # The agent installs separately from the extension; a stale one next
+    # to a new addon would fail quietly on a lane it does not know.
+    transport = state.get("transport")
+    agent_v = getattr(transport, "agent_version", "") if transport else ""
+    if getattr(transport, "agent_mode", False) and agent_v and agent_v != _addon_version():
+        return f"⚠ agent {agent_v}, addon {_addon_version()} — update both"
     peer = state.get("peer_addon")
     if state.get("peer_epoch") is None or peer is None:
         return ""  # nothing paired yet
