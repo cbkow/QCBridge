@@ -299,6 +299,27 @@ ms/frame, 30 fps at the addon's 30 fps capture setting; CPU: helper 0.04
 cores, mux 0.01 — against 2.4 for the ffmpeg path an hour earlier. This
 was the "not a release blocker" item; it is now the Windows path.
 
+Two more things a viewer found once the native path was in front of it
+(`99621de`), both of which the Mac helper will meet on this path too:
+
+- **A joining viewer waited for ever.** The mux (ffmpeg, raw HEVC on a
+  pipe) sat in its default 5 MB probe on a fresh spawn; QCView gave up,
+  the mux died on the vanished socket, the pair restarted into the same
+  wait. Now the supervisor asks the helper for a keyframe the moment the
+  mux is up, so the parameter sets lead its input, and the mux runs with
+  a 64 KB probe and flushed packets. The restart backoff is 0.5 s: a
+  viewer leaving is the normal case for a one-viewer listener (entering
+  dual view re-connects the stream, for one).
+- **An idle desktop is a silent stream.** The helper, like
+  ScreenCaptureKit, only emitted changed frames; a demuxer probing a
+  stream that carries nothing never finishes. The helper now re-sends the
+  last frame at a floor of a few per second when nothing changed (an
+  unchanged P-frame is a few hundred bytes). The ffmpeg path never had
+  this because ddagrab repeats frames at the capture rate.
+
+With both, the stream sits on side A of QCView's dual view with a file on
+side B (QCView's frozen-D3D11-side gap fixed the same hour, in its notes).
+
 Glass-to-glass through the whole chain, the way the Mac measured it, is
 still owed (needs the host/replica pair with a burned-in clock).
 
