@@ -61,5 +61,11 @@ tao = "0.31"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# OpenProcess + WaitForSingleObject for the single-instance guard's
+# pid_alive. 0.61 is the copy tokio and tray-icon already bring in; adds no
+# packages.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [profile.release]
 debug = 1

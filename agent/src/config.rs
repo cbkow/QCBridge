@@ -213,9 +213,13 @@ pub fn live_view(cfg: &Config) -> serde_json::Value {
     })
 }
 
-/// Some(true)/Some(false) when the OS can say; None when it cannot (Windows
-/// without windows-sys — tracked for the port). Never claims "alive" on a
-/// guess: an unknown answer must not stop an agent from starting.
+/// Some(true)/Some(false) when the OS can say; None when it cannot. Never
+/// claims "alive" on a guess: an unknown answer must not stop an agent from
+/// starting. Unix: kill(pid, 0), EPERM counting as alive. Windows:
+/// OpenProcess(SYNCHRONIZE) and a zero-timeout wait — a process we may not
+/// open (another user, elevated) counts as alive the way EPERM does; any
+/// other failure means no such process. Same answer as the QCBridgeAE ring's
+/// liveness check, done the same day (2026-09-23).
 pub fn pid_alive(pid: u32) -> Option<bool> {
     if pid == std::process::id() {
         return Some(true);
@@ -228,7 +232,28 @@ pub fn pid_alive(pid: u32) -> Option<bool> {
         }
         return Some(std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM));
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+        // The standard access right; windows-sys files it under
+        // Storage::FileSystem, a whole feature for one constant.
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        if pid == 0 {
+            return Some(false);
+        }
+        unsafe {
+            let h = OpenProcess(SYNCHRONIZE, 0, pid);
+            if h.is_null() {
+                let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32;
+                return Some(err == ERROR_ACCESS_DENIED);
+            }
+            let w = WaitForSingleObject(h, 0);
+            CloseHandle(h);
+            Some(w == WAIT_TIMEOUT)
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         None
@@ -453,7 +478,7 @@ mod tests {
     #[test]
     fn our_own_pid_is_alive_and_a_nonsense_pid_is_not() {
         assert_eq!(pid_alive(std::process::id()), Some(true));
-        if cfg!(unix) {
+        if cfg!(any(unix, windows)) {
             assert_eq!(pid_alive(u32::MAX - 7), Some(false));
         }
     }
