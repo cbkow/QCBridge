@@ -40,8 +40,8 @@ soft body, particle systems and dynamic-paint canvas surfaces. It rides the
 depsgraph event. A change escalates the object to tier 2 via the `~pcache`
 structural pseudo-path (`ring1/shadow.py:118-124`, `host_handlers.py:315-323`).
 `bake_note` is set only when the *set of baked tags* changes
-(`host_handlers.py:130-133`) and cleared when a bootstrap is *queued*, before
-it has arrived (`:245`). `point_cache` is in `_DIGEST_SKIP` (`:464`), so the
+(`host_handlers.py:130-133`) and — since 2026-09-23 — cleared when the last
+bootstrap chunk actually leaves, not when it is queued. `point_cache` is in `_DIGEST_SKIP` (`:464`), so the
 modifier digest deliberately sees none of it — the signature is the only eye.
 
 Not detected anywhere: `use_external` and `filepath` (omitted from the
@@ -190,7 +190,7 @@ flight.
 
 The design that the evidence supports, in the order it should be built:
 
-**A. Tell the truth first.** On the replica, after any bootstrap or tier-2
+**A. Tell the truth first.** *(Done 2026-09-23: `replica_apply._count_frozen_caches` checks for `blendcache_<stem>/` beside the file; the count rides the overlay and the pong, and the host panel says "use an external cache path".)* On the replica, after any bootstrap or tier-2
 arrival, check each point cache: `is_baked` with `use_disk_cache` and no
 external path means "frozen — the frames are on the host's disk". Report it in
 the replica status and the host panel instead of a green flag. This is the

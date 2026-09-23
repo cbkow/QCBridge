@@ -101,9 +101,9 @@ on the pong.
 | A3 | **Image datablocks are not detected.** Not in `_is_syncable_id`; texture paint, reload, re-rendered bakes stay stale. | `host_handlers.py:446-449` | confirmed |
 | A4 | **`object.data` re-link, material slots, `instance_collection` are untracked** — swap the mesh under an object, empty diff, nothing sent. | `shadow.py:24-34`, `build_snapshot` | confirmed |
 | A5 | **View-layer state is lost on every tier-2 resend.** `@hide`/`@lc_exclude`/`@lc_hide` are not in the blob, and the shadow is refreshed before the blob goes so the host never resends them. A hidden object reappears after any structural edit. | `host_handlers.py:375-377` | confirmed |
-| A6 | **Cold frames dropped and credited.** When the agent's session is down or its queue full, the frame is discarded and `T_COLD_ACK`ed; on session start the stale queue is drained and acked. `send_cold` returns True, the dirty set clears, the replica counts a gap. | `link.rs:197-201`, `session.rs:458-466` | confirmed |
+| A6 | **Cold frames dropped and credited.** When the agent's session is down or its queue full, the frame is discarded and `T_COLD_ACK`ed; on session start the stale queue is drained and acked. `send_cold` returns True, the dirty set clears, the replica counts a gap. | `link.rs:197-201`, `session.rs:458-466` | confirmed → **mitigated 09-23**: the agent now emits `cold_dropped` (panel counts it) and every reconnect re-handshakes with a fresh epoch and re-bootstraps, so nothing sent into an outage is relied on |
 | A7 | **Disk point caches are frozen on the replica after every resync** — see `CACHES.md` §2. | `bootstrap.py:112-119` | confirmed (probed) |
-| A8 | **`unmapped_paths` and `last_error` are counted and never displayed**, contradicting three docstrings; `//` paths are silently skipped when the project dir is unknown and there is no `isdir` check on the mapped dir. | `replica_apply.py:300`, `bootstrap.py:73-96` | confirmed |
+| A8 | **`unmapped_paths` and `last_error` are counted and never displayed**, contradicting three docstrings; `//` paths are silently skipped when the project dir is unknown and there is no `isdir` check on the mapped dir. | `replica_apply.py:300`, `bootstrap.py:73-96` | confirmed → **fixed 09-23**: overlay + pong + host panel show unmapped/last_error; an unresolvable project dir counts its `//` paths as unmapped instead of skipping |
 | A9 | **The replica is not read-only.** No handler on the replica role; a local edit diverges forever because the host diffs against its *own* previous value. | `session.py:273`, `shadow.py:113-117` | reported |
 | A10 | Particle settings, rigid-body world/constraints, force fields; grease pencil, volumes, metaballs, point clouds, hair curves; NLA beyond a track count; extra view layers; scene frame range/fps/markers/world pointer — none detected. | `host_handlers.py:63-67, 446-449, 648`, `shadow.py:61-76` | reported |
 
@@ -111,8 +111,8 @@ on the pong.
 
 | # | finding | where | status |
 |---|---|---|---|
-| B1 | **A replica restart is never re-bootstrapped.** The handshake timer returns `None` on first success and is never re-armed; `on_peer_state` is implemented in the transport and registered by nobody. Host says connected, replica says listening, deltas hit unknown uuids. | `session.py:260`, `transport_agent.py:478` | confirmed |
-| B2 | **Gaps are counted, never acted on.** `SeqTracker.observe` increments; nothing escalates; Force Resync is host-only. An unattended replica with gaps stays wrong. | `replica_apply.py:344-348`, `session.py:489` | confirmed |
+| B1 | **A replica restart is never re-bootstrapped.** The handshake timer returns `None` on first success and is never re-armed; `on_peer_state` is implemented in the transport and registered by nobody. Host says connected, replica says listening, deltas hit unknown uuids. | `session.py:260`, `transport_agent.py:478` | confirmed → **fixed 09-23**: `on_peer_state` registered; down→up or a new replica epoch on the pong re-arms the handshake with a fresh host epoch and bootstraps (`smokes/run_smoke_reconnect.sh`) |
+| B2 | **Gaps are counted, never acted on.** `SeqTracker.observe` increments; nothing escalates; Force Resync is host-only. An unattended replica with gaps stays wrong. | `replica_apply.py:344-348`, `session.py:489` | confirmed → **fixed 09-23**: a gap or unknown uuid raises `want_resync` on the pong; `ring1/liveness.ResyncPolicy` sends one bootstrap per replica state, rate-limited |
 | B3 | **Tier-2 restarts from chunk 0 on any credit refusal** with a new `blob_id`. Over 64 chunks (256 MiB) it depends on credits returning mid-loop; otherwise it re-serializes every 50 ms. | `host_handlers.py:380-387` | confirmed |
 | B4 | Replica pongs share the agent's 256-slot link queue with inbound cold frames (`link.frame` for both), so a big transfer can trip the 3 s liveness window. | `main.rs:192-193`, `session.rs:489, 541` | confirmed |
 
@@ -169,7 +169,7 @@ interval, not the wire) and frames-over-the-wire for caches.
 
 Each step is independently shippable and testable with the bench or a smoke.
 
-**P0 — tell the truth and recover (a day or two).** A8 surface
+**P0 — tell the truth and recover (a day or two). Done 2026-09-23.** A8 surface
 `unmapped_paths`/`last_error` on the overlay and pong; B1 register
 `on_peer_state` and re-arm the handshake on a peer epoch change; B2 replica
 `want_resync` on gap, host honours it; A6 refuse instead of ack when the

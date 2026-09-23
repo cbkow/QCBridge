@@ -10,6 +10,7 @@ overlay — the replica may be behind, never silently wrong.
 from __future__ import annotations
 
 import collections
+import os
 import json
 import time
 
@@ -50,7 +51,18 @@ stats = {
     "host_ended": False,
     "applying": "",  # datablock name during an indivisible apply
     "last_error": "",
+    # Raised on a seq gap or an unknown uuid, cleared when a bootstrap
+    # applies; rides the pong so the host can ship one without a human.
+    "want_resync": False,
+    # Baked disk caches with no external path: their blendcache_<name>/ dir
+    # belongs to the host's file name, which this machine never had
+    # (CACHES.md §2) — frozen at rest with every flag green.
+    "frozen_caches": 0,
 }
+
+# Test hook: drop the first tier-1 message after start, to exercise the
+# gap → want_resync → bootstrap path without a lossy network.
+_TEST_DROP_FIRST_T1 = bool(os.environ.get("QCB_TEST_DROP_FIRST_T1"))
 
 _seq_tracker = protocol.SeqTracker()
 _uuid_map: dict[str, bpy.types.ID] = {}
@@ -261,6 +273,7 @@ def _apply_t1(header: dict, payload: bytes) -> None:
     db = _resolve(header["uuid"])
     if db is None:
         stats["unknown_uuid"] += 1
+        stats["want_resync"] = True  # a blob we never got
         return
     changes = json.loads(payload.decode("utf-8"))
     for path, value in changes:
@@ -285,6 +298,46 @@ def _apply_tombstone(header: dict) -> None:
     _last_hot = None  # same camera-view risk as a t2 apply (see above)
 
 
+def _point_caches():
+    for obj in bpy.data.objects:
+        for m in obj.modifiers:
+            pc = getattr(m, "point_cache", None)
+            if pc is not None:
+                yield pc
+            canvas = getattr(m, "canvas_settings", None)
+            if canvas is not None:
+                for surf in canvas.canvas_surfaces:
+                    if surf.point_cache is not None:
+                        yield surf.point_cache
+        for psys in obj.particle_systems:
+            yield psys.point_cache
+    for scene in bpy.data.scenes:
+        rbw = scene.rigidbody_world
+        if rbw is not None and rbw.point_cache is not None:
+            yield rbw.point_cache
+
+
+def _count_frozen_caches() -> int:
+    """Baked disk caches with no external path. `is_baked` is serialized
+    state, not a filesystem check: the frames are in a blendcache_ dir named
+    after the HOST's file, which does not exist here, and the flag stops
+    Blender from simulating either (probed 2026-09-23, CACHES.md §2)."""
+    n = 0
+    try:
+        # Blender keeps a non-external disk cache in //blendcache_<stem>/;
+        # check that directory, not the flag.
+        fp = bpy.data.filepath
+        stem = os.path.splitext(os.path.basename(fp))[0] if fp else ""
+        cache_dir = os.path.join(os.path.dirname(fp), f"blendcache_{stem}") if fp else ""
+        have_dir = bool(cache_dir) and os.path.isdir(cache_dir)
+        for pc in _point_caches():
+            if pc.use_disk_cache and not pc.use_external and pc.is_baked and not have_dir:
+                n += 1
+    except Exception:
+        pass  # mid-apply states are fine to skip
+    return n
+
+
 def _apply_pending_t2() -> None:
     global _pending_t2, _project_dir_local, _last_hot
     header, blob = _pending_t2
@@ -299,6 +352,7 @@ def _apply_pending_t2() -> None:
             stats["apply_errors"] += errors
             stats["unmapped_paths"] = unmapped
             stats["host_ended"] = False
+            stats["want_resync"] = False  # the full file is the answer
             from . import session  # deferred: session imports this module
             session.on_project_loaded()
         else:
@@ -308,6 +362,7 @@ def _apply_pending_t2() -> None:
             stats["applied_t2"] += 1
             stats["apply_errors"] += errors
         _rebuild_uuid_map()
+        stats["frozen_caches"] = _count_frozen_caches()
     except Exception as exc:
         stats["apply_errors"] += 1
         stats["last_error"] = f"{header.get('kind')} {header.get('name')}: {exc!r}"
@@ -342,11 +397,16 @@ def _process_cold(deadline: float) -> None:
             _inbox.extend(items)
         header, payload = _inbox.popleft()
         seq = header.get("seq")
+        kind = header.get("kind")
+        global _TEST_DROP_FIRST_T1
+        if _TEST_DROP_FIRST_T1 and kind == "t1":
+            _TEST_DROP_FIRST_T1 = False
+            continue  # simulate a lost frame: the next seq reveals the gap
         if seq is not None:
-            _seq_tracker.observe(seq)
+            if not _seq_tracker.observe(seq):
+                stats["want_resync"] = True
             stats["seq"] = _seq_tracker.last_seen or 0
             stats["gaps"] = _seq_tracker.gaps
-        kind = header.get("kind")
         if kind == "t1":
             _apply_t1(header, payload)
         elif kind == "tomb":
@@ -522,6 +582,7 @@ def _handle_new_session() -> None:
     _blob_by_uuid.clear()
     stats["seq"] = 0
     stats["gaps"] = 0
+    stats["want_resync"] = False
 
 
 def _handle_goodbye() -> None:
@@ -624,6 +685,7 @@ def start(transport, mappings=()) -> None:
     stats.update(
         seq=0, gaps=0, applied_t1=0, applied_t2=0, apply_errors=0,
         unknown_uuid=0, bootstraps=0, unmapped_paths=0, applying="", last_error="",
+        want_resync=False, frozen_caches=0,
     )
     _rebuild_uuid_map()
     # persistent: the apply loop must survive the bootstrap's open_mainfile

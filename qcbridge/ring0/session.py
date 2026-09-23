@@ -12,7 +12,7 @@ import uuid as _uuid
 
 import bpy
 
-from ..ring1 import pathmap, protocol, toolbox
+from ..ring1 import liveness, pathmap, protocol, toolbox
 from ..ring1.transport import TransportConfig
 from . import host_handlers, host_hot, kiosk, overlay, pixel_path, replica_apply
 
@@ -222,15 +222,12 @@ def _start_host(prefs) -> None:
         transport.wait_attached(3.0)  # agent_config — token, peer — arrives with `attached`
 
     token = _effective_token(prefs, transport)
-    hello = protocol.make_hello(
-        token, state["epoch"], bpy.app.version_string,
-        addon_version=_addon_version(),
-    )
 
     # Fire-and-poll — this timer runs on Blender's main thread, and a dead
     # peer must never freeze the UI (it did: a blocking 3 s request per
     # retry bogged Blender down whenever the replica was unreachable).
-    pending = {"req": None, "sent_at": 0.0}
+    # Re-armable: a reconnect or a restarted replica pairs afresh (below).
+    pending = {"req": None, "sent_at": 0.0, "armed": False}
 
     def _handshake():
         import time as _time
@@ -239,6 +236,10 @@ def _start_host(prefs) -> None:
             return None  # session stopped/replaced
         now = _time.monotonic()
         if pending["req"] is None:
+            hello = protocol.make_hello(
+                token, state["epoch"], bpy.app.version_string,
+                addon_version=_addon_version(),
+            )
             pending["req"] = transport.request_nowait(hello)
             pending["sent_at"] = now
             return 0.25
@@ -249,14 +250,18 @@ def _start_host(prefs) -> None:
                 state["peer_stream"] = reply.get("stream") or {}
                 state["peer_addon"] = reply.get("addon", "")
                 state["note"] = "connected"
+                state["resync_policy"].reset()
                 # Fresh handshake = fresh epoch pairing → full bootstrap
-                # (decision #16; same-epoch transport blips reconnect
-                # without re-handshaking and just keep flowing).
+                # (decision #16). Transport blips re-handshake too, with a
+                # fresh host epoch, because frames sent into the outage are
+                # gone (SYNC-AUDIT A6) and the replica may be a new process.
                 state["sync"].send_bootstrap()
                 # Re-assert host-owned replica state a fresh session lost.
                 transport.request_nowait(
                     {"kind": "shot", "on": state["shot_mode"]}
                 )
+                pending["req"] = None
+                pending["armed"] = False
                 return None
             state["note"] = f"denied: {reply.get('reason', '')}"
             pending["req"] = None
@@ -268,7 +273,56 @@ def _start_host(prefs) -> None:
             return _HANDSHAKE_RETRY
         return 0.25
 
-    bpy.app.timers.register(_handshake, first_interval=0.1, persistent=True)
+    def _arm_handshake(note: str, new_epoch: bool) -> None:
+        if pending["armed"]:
+            return
+        if new_epoch:
+            import uuid as _uuid
+            state["epoch"] = _uuid.uuid4().hex  # the replica resets its seq tracker on a new epoch
+        pending["armed"] = True
+        pending["req"] = None
+        state["note"] = note
+        bpy.app.timers.register(_handshake, first_interval=0.1, persistent=True)
+
+    # Peer transitions arrive on the IO thread: flag them, act on the tick.
+    flags = {"lost": False, "reconnect": False}
+
+    def _on_peer(alive: bool) -> None:
+        if not alive:
+            flags["lost"] = True
+        elif flags["lost"]:
+            flags["reconnect"] = True
+
+    transport.on_peer_state(_on_peer)
+    state["resync_policy"] = liveness.ResyncPolicy()
+
+    def _watch():
+        """Main-thread watcher: reconnects, replica restarts, resync requests."""
+        import time as _time
+
+        if state["transport"] is not transport:
+            return None
+        if flags["lost"] and not flags["reconnect"] and not pending["armed"]:
+            state["note"] = "replica lost — waiting"
+        if flags["reconnect"]:
+            flags["reconnect"] = False
+            flags["lost"] = False
+            _arm_handshake("reconnected — re-syncing", new_epoch=True)
+            return 0.25
+        status = getattr(transport, "peer_status", {}) or {}
+        if not pending["armed"] and liveness.replica_restarted(status, state["peer_epoch"]):
+            _arm_handshake("replica restarted — re-syncing", new_epoch=True)
+            return 0.25
+        sync = state.get("sync")
+        if sync is not None and not pending["armed"] and state["resync_policy"].should_resync(
+            status, _time.monotonic()
+        ):
+            sync.send_bootstrap()
+            state["auto_resyncs"] = state.get("auto_resyncs", 0) + 1
+        return 0.25
+
+    _arm_handshake(address_error or "connecting", new_epoch=False)
+    bpy.app.timers.register(_watch, first_interval=0.5, persistent=True)
     host_hot.start(transport)
     state["sync"] = host_handlers.start(
         transport,
@@ -340,6 +394,14 @@ def _start_replica(prefs) -> None:
             "gaps": replica_apply.stats["gaps"],
             "errors": replica_apply.stats["apply_errors"],
             "unknown": replica_apply.stats["unknown_uuid"],
+            # Everything else the replica knows and the host could not see
+            # (SYNC-AUDIT §4.2): who we are, what we want, what went wrong.
+            "epoch": epoch,
+            "want_resync": replica_apply.stats["want_resync"],
+            "bootstraps": replica_apply.stats["bootstraps"],
+            "unmapped": replica_apply.stats["unmapped_paths"],
+            "frozen": replica_apply.stats["frozen_caches"],
+            "last_error": replica_apply.stats["last_error"][:120],
             # Encoder state rides along so the HOST panel can say why a
             # viewer can't connect without anyone remoting to the replica.
             "pixel": pixel_path.status(),
@@ -522,6 +584,14 @@ def _replica_overlay_text() -> str:
         bits.append(f"⚠ {stats['apply_errors']} apply errors")
     if stats["unknown_uuid"]:
         bits.append(f"⚠ {stats['unknown_uuid']} unknown")
+    if stats["want_resync"]:
+        bits.append("⟳ resync requested")
+    if stats["unmapped_paths"]:
+        bits.append(f"⚠ {stats['unmapped_paths']} unmapped paths")
+    if stats["frozen_caches"]:
+        bits.append(f"⚠ {stats['frozen_caches']} frozen disk caches")
+    if stats["last_error"]:
+        bits.append(f"⚠ {stats['last_error'][:48]}")
     return " · ".join(bits)
 
 
@@ -576,6 +646,19 @@ def status_text() -> str:
                 f" (gaps {peer.get('gaps', 0)}, unknown {peer.get('unknown', 0)},"
                 f" errors {peer.get('errors', 0)}, unsent {sync.t2_unsupported})"
             )
+        if peer.get("want_resync"):
+            bits.append("⟳ replica asked for a resync — sending")
+        if state.get("auto_resyncs"):
+            bits.append(f"auto-resyncs {state['auto_resyncs']}")
+        if peer.get("unmapped"):
+            bits.append(f"⚠ replica: {peer['unmapped']} unmapped paths — check path mappings")
+        if peer.get("frozen"):
+            bits.append(f"⚠ replica: {peer['frozen']} disk caches frozen — use an external cache path")
+        if peer.get("last_error"):
+            bits.append(f"⚠ replica error: {peer['last_error'][:60]}")
+        dropped = getattr(transport, "cold_dropped", 0)
+        if dropped:
+            bits.append(f"⚠ {dropped} frames dropped by the agent")
         if getattr(sync, "bake_note", ""):
             bits.append(f"⚠ {sync.bake_note} — Force Resync ships it")
     if state["role"] == "REPLICA":

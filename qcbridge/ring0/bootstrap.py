@@ -74,6 +74,8 @@ def localize_paths(datablocks, local_dir: str, mappings) -> tuple[int, int, int]
             if local_dir:
                 rel = filepath[2:].replace("\\", "/")
                 new = os.path.normpath(os.path.join(local_dir, *rel.split("/")))
+            else:
+                unmapped += 1  # relative to a project dir this machine can't see
         else:
             local = pathmap.from_canonical(filepath, mappings)
             if local != filepath:
@@ -119,6 +121,12 @@ def apply_mainfile(
     path.unlink(missing_ok=True)
 
     local_dir = pathmap.from_canonical(project_dir, mappings) if project_dir else ""
+    if local_dir and not os.path.isdir(local_dir):
+        # Unmapped or wrong: absolutizing '//' against it would fabricate
+        # paths and count them as fixed. Leave them relative, count them.
+        if _DEBUG:
+            print(f"qcb project dir not found here: {local_dir!r}", flush=True)
+        local_dir = ""
     errors = 0
     unmapped = 0
     for coll_name in _PATH_COLLECTIONS:

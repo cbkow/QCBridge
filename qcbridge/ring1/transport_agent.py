@@ -524,6 +524,12 @@ class HostTransportAgent:
             self.video_port = int(event.get("port") or 0)
         elif name == "stats":
             self.stats = event
+        elif name == "cold_dropped":
+            # The agent had to discard a cold frame (session down or its
+            # queue full) and credited it back so we would not stall. The
+            # datablock is NOT on the replica; the reconnect re-handshake
+            # ships a bootstrap, and this counter says it happened.
+            self.cold_dropped += int(event.get("n") or 1)
         elif name == "error":
             self.link_note = event.get("msg") or ""
 

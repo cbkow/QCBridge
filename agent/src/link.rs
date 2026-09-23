@@ -197,6 +197,9 @@ fn reader_loop(mut r: impl Read, inb: &Inbound, link: &Link, on_cmd: &(dyn Fn(&V
             T_COLD => {
                 let sent = inb.connected.load(Relaxed) && inb.cold_tx.try_send(body).is_ok();
                 if !sent {
+                    // Credit it back so the addon never stalls on a dead
+                    // session — and say so: the frame is gone, not delivered.
+                    link.event_try(serde_json::json!({"event": "cold_dropped", "n": 1}));
                     link.frame_blocking(T_COLD_ACK, Bytes::copy_from_slice(&1u32.to_be_bytes()));
                 }
             }

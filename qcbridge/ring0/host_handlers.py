@@ -245,8 +245,8 @@ class HostSync:
         blob_id = f"boot.{self.sent_boot}.{self.seq + 1}"
         self._boot_outbox.extend(protocol.chunk_blob("boot", blob_id, data, meta=meta))
         self.sent_boot += 1
-        self.bake_note = ""  # the full file carries every baked cache
-        self.t2_unsupported = 0  # ditto anything we couldn't resend
+        # bake_note / t2_unsupported clear when the last chunk actually
+        # leaves (flush), not here: a queued bootstrap is not a shipped one.
         self._suppress_marks = False  # deltas are real from here on
         if _DEBUG:
             print(f"qcb boot queued ({len(data)} bytes)", flush=True)
@@ -272,6 +272,9 @@ class HostSync:
             header["seq"] = self.seq
             if self.transport.send_cold(header, payload):
                 self._boot_outbox.pop(0)
+                if not self._boot_outbox:
+                    self.bake_note = ""  # the full file carries every baked cache
+                    self.t2_unsupported = 0  # ditto anything we couldn't resend
             else:
                 self.seq -= 1
                 return _FLUSH_TICK  # backpressure: try again next tick

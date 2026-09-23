@@ -123,11 +123,14 @@ def step_bake():
 def step_resync():
     results["bake_note_seen"] = bool(sync.bake_note)  # sweep had ≥2 s
     session.force_resync()
-    results["bake_note_cleared"] = not sync.bake_note
+    # Queued is not shipped: the note clears when the last chunk leaves
+    # (SYNC-AUDIT §3, 2026-09-23). Judged in the next step, after settle.
+    results["bake_note_cleared_at_queue"] = not sync.bake_note
     scene.frame_set(20)
 
 
 def step_influence():
+    results["bake_note_cleared"] = not sync.bake_note  # bootstrap drained by now
     cam.constraints[0].influence = 0.3
 
 
