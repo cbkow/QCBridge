@@ -35,3 +35,11 @@ def test_passphrase_appended_once(monkeypatch):
         "ffmpeg.exe", "hevc_10_420_50", url, "secret123456"
     )
     assert cmd2[-1].count("passphrase=") == 1  # already present: not doubled
+
+
+def test_fatal_output_lines_arm_the_reaper():
+    # macOS avfoundation can keep ffmpeg alive after the SRT viewer leaves;
+    # these stderr lines are what the supervisor kills on.
+    assert pixel_path.is_fatal_output_line("[out#0/mpegts @ 0x1] Error muxing a packet")
+    assert pixel_path.is_fatal_output_line("[out#0/mpegts @ 0x1] Error closing file: Input/output error")
+    assert not pixel_path.is_fatal_output_line("[hevc @ 0x1] Error constructing the frame RPS.")

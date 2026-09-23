@@ -10,15 +10,18 @@ overlay — the replica may be behind, never silently wrong.
 from __future__ import annotations
 
 import collections
+import os
 import json
 import time
 
 import bpy
 from mathutils import Matrix
 
-from ..ring1 import protocol
-from . import bootstrap, kiosk, pixel_path, tier2_io
+from ..ring1 import merge, protocol
+from . import bootstrap, kiosk, overlay, pixel_path, tier2_io
 from .identity import UUID_PROP
+
+_DEBUG = bool(os.environ.get("QCB_DEBUG"))
 
 _TICK = 0.015
 _BUDGET_S = 0.010
@@ -27,7 +30,9 @@ _FRAME_MIN_INTERVAL = 0.1
 _SCANNED_COLLECTIONS = (
     "objects", "lights", "cameras", "materials", "worlds", "scenes", "meshes",
     "curves", "node_groups", "images", "collections", "actions", "shape_keys",
-    "lattices", "armatures",
+    "lattices", "armatures", "metaballs", "volumes", "hair_curves",
+    "pointclouds", "lightprobes", "grease_pencils", "textures", "particles",
+    "cache_files",
 )
 
 _transport = None
@@ -50,13 +55,42 @@ stats = {
     "host_ended": False,
     "applying": "",  # datablock name during an indivisible apply
     "last_error": "",
+    # Raised on a seq gap or an unknown uuid, cleared when a bootstrap
+    # applies; rides the pong so the host can ship one without a human.
+    "want_resync": False,
+    "seq_fast": 0,     # fast lane (tier-1 deltas, tombstones)
+    "parked": 0,       # fast messages waiting for their blob to apply
+    # Edits made ON the replica: nothing forbids them and the host will
+    # never overwrite one unless it changes that same property (SYNC-AUDIT
+    # A9). Heuristic count — an update on a stamped datablock we did not
+    # touch recently, outside a frame change and outside a blob's wake.
+    "local_edits": 0,
+    "last_local_edit": "",
+    # Baked disk caches with no external path: their blendcache_<name>/ dir
+    # belongs to the host's file name, which this machine never had
+    # (CACHES.md §2) — frozen at rest with every flag green.
+    "frozen_caches": 0,
 }
 
-_seq_tracker = protocol.SeqTracker()
+# Test hook: drop the first tier-1 message after start, to exercise the
+# gap → want_resync → bootstrap path without a lossy network.
+_TEST_DROP_FIRST_T1 = bool(os.environ.get("QCB_TEST_DROP_FIRST_T1"))
+
+_merger = merge.LaneMerger()
 _uuid_map: dict[str, bpy.types.ID] = {}
 _reassembler = protocol.Reassembler()
-_inbox: collections.deque = collections.deque()  # polled-but-unprocessed msgs
+_inbox: collections.deque = collections.deque()  # polled-but-unprocessed cold msgs
+_inbox_fast: collections.deque = collections.deque()  # fast lane: never waits on a blob apply
 _blob_by_uuid: dict[str, str] = {}   # uuid → latest in-flight blob id
+_at_state: dict[str, dict[str, object]] = {}  # uuid → last "@" values applied
+_touched: dict[str, float] = {}   # uuid → monotonic time we last wrote it
+_quiet_until = 0.0                # no local-edit attribution before this (blob/boot/frame wake)
+_TOUCH_GRACE = 1.5
+_GEOMETRY_TYPES = (bpy.types.Mesh, bpy.types.Curve, bpy.types.Curves, bpy.types.PointCloud,
+                   bpy.types.Volume, bpy.types.MetaBall, bpy.types.GreasePencil, bpy.types.Lattice)
+_BLOB_GRACE = 3.0
+_FRAME_GRACE = 0.5
+_pending_t2_seq: int | None = None  # cold seq of the blob's last chunk
 _pending_t2: tuple[dict, bytes] | None = None  # applied on the NEXT tick so
                                                # the "⟳ applying" label gets a redraw first
 _mappings: list = []
@@ -219,12 +253,57 @@ def _layer_collection_for(coll):
 
 
 def _write_rna(db, path: str, value) -> None:
-    # "@" paths: view-layer state applied by setter, not RNA (shadow.py)
+    # "@" paths: view-layer state and pointers applied by setter, not RNA
+    # (shadow.py). Pointers ride as names: the replica's copy has the same
+    # names, and tier-1 renames keep them in step.
     if path == "@hide":  # the object eye toggle
         db.hide_set(bool(value))
         return
     if path == "@scene_camera":
         db.camera = bpy.data.objects.get(value) if value else None
+        return
+    if path == "@scene_world":
+        db.world = bpy.data.worlds.get(value) if value else None
+        return
+    if path == "@instance_collection":
+        db.instance_collection = bpy.data.collections.get(value) if value else None
+        return
+    if path == "@ll_receiver":
+        db.light_linking.receiver_collection = bpy.data.collections.get(value) if value else None
+        return
+    if path == "@ll_blocker":
+        db.light_linking.blocker_collection = bpy.data.collections.get(value) if value else None
+        return
+    if path == "@dof_focus_object":
+        db.dof.focus_object = bpy.data.objects.get(value) if value else None
+        return
+    if path == "@rbw":  # the rigid-body world exists (settings ride tier 1)
+        if value and db.rigidbody_world is None:
+            with bpy.context.temp_override(scene=db):
+                bpy.ops.rigidbody.world_add()
+        elif not value and db.rigidbody_world is not None:
+            with bpy.context.temp_override(scene=db):
+                bpy.ops.rigidbody.world_remove()
+        return
+    if path == "@master_members":
+        # Direct membership of the scene's master collection: objects and
+        # child collections, by name. Scene-embedded, so no tier 2 carries it.
+        want_objs, want_colls = set(value[0]), set(value[1])
+        master = db.collection
+        for o in list(master.objects):
+            if o.name not in want_objs:
+                master.objects.unlink(o)
+        for name in want_objs:
+            o = bpy.data.objects.get(name)
+            if o is not None and o.name not in master.objects:
+                master.objects.link(o)
+        for c in list(master.children):
+            if c.name not in want_colls:
+                master.children.unlink(c)
+        for name in want_colls:
+            c = bpy.data.collections.get(name)
+            if c is not None and c.name not in master.children:
+                master.children.link(c)
         return
     if path in ("@lc_exclude", "@lc_hide"):
         lc = _layer_collection_for(db)
@@ -257,16 +336,35 @@ def _write_rna(db, path: str, value) -> None:
     setattr(parent, attr, value)
 
 
+def _note_touched(uuid: str) -> None:
+    _touched[uuid] = time.monotonic()
+
+
+def _quiet(seconds: float) -> None:
+    global _quiet_until
+    _quiet_until = max(_quiet_until, time.monotonic() + seconds)
+
+
 def _apply_t1(header: dict, payload: bytes) -> None:
     db = _resolve(header["uuid"])
+    _note_touched(header["uuid"])
+    # A delta on one datablock wakes its dependents (a camera's data → its
+    # object); the detector judges only while the host has been quiet.
+    _quiet(_FRAME_GRACE)
     if db is None:
         stats["unknown_uuid"] += 1
+        stats["want_resync"] = True  # a blob we never got
         return
     changes = json.loads(payload.decode("utf-8"))
     for path, value in changes:
         try:
             _write_rna(db, path, value)
             stats["applied_t1"] += 1
+            if path.startswith("@"):
+                # View-layer / pointer state a later blob will not carry and
+                # the host will not resend (its shadow already has it):
+                # keep it to re-apply after apply_blob (SYNC-AUDIT A5).
+                _at_state.setdefault(header["uuid"], {})[path] = value
         except Exception as exc:
             stats["apply_errors"] += 1
             stats["last_error"] = f"{header['uuid']}.{path}: {exc!r}"
@@ -274,6 +372,8 @@ def _apply_t1(header: dict, payload: bytes) -> None:
 
 def _apply_tombstone(header: dict) -> None:
     global _last_hot
+    _note_touched(header["uuid"])
+    _quiet(_FRAME_GRACE)  # a removal wakes the survivors
     db = _resolve(header["uuid"])
     if db is None:
         return
@@ -285,11 +385,103 @@ def _apply_tombstone(header: dict) -> None:
     _last_hot = None  # same camera-view risk as a t2 apply (see above)
 
 
+def _apply_link(header: dict) -> None:
+    """Link (or drop) datablocks from another .blend, by the replica's
+    mapped path. Linked IDs are never stamped, so membership and pointers
+    to them ride by name once they exist here."""
+    from ..ring1 import pathmap
+    _quiet(_BLOB_GRACE)  # libraries.load re-evaluates the scene: not a local edit
+    host_path = header.get("lib") or ""
+    local = pathmap.localize_any(host_path, _mappings)
+    if header.get("kind") == "unlink":
+        for lib in list(bpy.data.libraries):
+            if bpy.path.abspath(lib.filepath) in (local, host_path):
+                bpy.data.libraries.remove(lib)
+        return
+    if not os.path.exists(local):
+        stats["unmapped_paths"] += 1
+        stats["last_error"] = f"library not found here: {local}"
+        return
+    want_objects = set(header.get("objects") or [])
+    want_colls = set(header.get("collections") or [])
+    have = {o.name for o in bpy.data.objects if o.library and bpy.path.abspath(o.library.filepath) == local}
+    have_c = {c.name for c in bpy.data.collections if c.library and bpy.path.abspath(c.library.filepath) == local}
+    try:
+        with bpy.data.libraries.load(local, link=True) as (data_from, data_to):
+            data_to.objects = [n for n in want_objects - have if n in data_from.objects]
+            data_to.collections = [n for n in want_colls - have_c if n in data_from.collections]
+        stats["applied_t2"] += 1
+    except Exception as exc:
+        stats["apply_errors"] += 1
+        stats["last_error"] = f"link {os.path.basename(local)}: {exc!r}"
+    _rebuild_uuid_map()
+
+
+def _reapply_at_state(uuid: str) -> None:
+    """After a blob replaced a datablock, put back the "@" state the host
+    sent earlier: the blob does not carry it, and the host's shadow already
+    holds it so it will never be resent."""
+    saved = _at_state.get(uuid)
+    if not saved:
+        return
+    db = _resolve(uuid)
+    if db is None:
+        return
+    for path, value in saved.items():
+        try:
+            _write_rna(db, path, value)
+        except Exception as exc:
+            stats["apply_errors"] += 1
+            stats["last_error"] = f"{uuid}.{path} (re-apply): {exc!r}"
+
+
+def _point_caches():
+    for obj in bpy.data.objects:
+        for m in obj.modifiers:
+            pc = getattr(m, "point_cache", None)
+            if pc is not None:
+                yield pc
+            canvas = getattr(m, "canvas_settings", None)
+            if canvas is not None:
+                for surf in canvas.canvas_surfaces:
+                    if surf.point_cache is not None:
+                        yield surf.point_cache
+        for psys in obj.particle_systems:
+            yield psys.point_cache
+    for scene in bpy.data.scenes:
+        rbw = scene.rigidbody_world
+        if rbw is not None and rbw.point_cache is not None:
+            yield rbw.point_cache
+
+
+def _count_frozen_caches() -> int:
+    """Baked disk caches with no external path. `is_baked` is serialized
+    state, not a filesystem check: the frames are in a blendcache_ dir named
+    after the HOST's file, which does not exist here, and the flag stops
+    Blender from simulating either (probed 2026-09-23, CACHES.md §2)."""
+    n = 0
+    try:
+        # Blender keeps a non-external disk cache in //blendcache_<stem>/;
+        # check that directory, not the flag.
+        fp = bpy.data.filepath
+        stem = os.path.splitext(os.path.basename(fp))[0] if fp else ""
+        cache_dir = os.path.join(os.path.dirname(fp), f"blendcache_{stem}") if fp else ""
+        have_dir = bool(cache_dir) and os.path.isdir(cache_dir)
+        for pc in _point_caches():
+            if pc.use_disk_cache and not pc.use_external and pc.is_baked and not have_dir:
+                n += 1
+    except Exception:
+        pass  # mid-apply states are fine to skip
+    return n
+
+
 def _apply_pending_t2() -> None:
     global _pending_t2, _project_dir_local, _last_hot
     header, blob = _pending_t2
     _pending_t2 = None
     blob_tag = header["blob"]["id"].replace(".", "-")
+    _note_touched(header.get("uuid", ""))
+    _quiet(_BLOB_GRACE)  # a blob (and its dependencies) wakes the depsgraph broadly
     try:
         if header.get("kind") == "boot":
             errors, unmapped, _project_dir_local = bootstrap.apply_mainfile(
@@ -299,6 +491,7 @@ def _apply_pending_t2() -> None:
             stats["apply_errors"] += errors
             stats["unmapped_paths"] = unmapped
             stats["host_ended"] = False
+            stats["want_resync"] = False  # the full file is the answer
             from . import session  # deferred: session imports this module
             session.on_project_loaded()
         else:
@@ -308,11 +501,17 @@ def _apply_pending_t2() -> None:
             stats["applied_t2"] += 1
             stats["apply_errors"] += errors
         _rebuild_uuid_map()
+        if header.get("kind") == "boot":
+            _at_state.clear()  # the file carries view-layer state itself
+        else:
+            _reapply_at_state(header.get("uuid", ""))
+        stats["frozen_caches"] = _count_frozen_caches()
     except Exception as exc:
         stats["apply_errors"] += 1
         stats["last_error"] = f"{header.get('kind')} {header.get('name')}: {exc!r}"
     finally:
         stats["applying"] = ""
+        _release(_merger.cold_done(_pending_t2_seq))
         # A t2/boot apply can replace the very camera the viewport is
         # looking through — batch_remove knocks the view out of CAMERA
         # perspective. A static host view means every hot packet is
@@ -328,30 +527,64 @@ def _apply_pending_t2() -> None:
 
 
 def _process_cold(deadline: float) -> None:
-    # One message at a time through _inbox so a mid-batch stop (a completed
-    # tier-2 blob deferring its apply) never drops already-polled messages.
+    # One message at a time through the inboxes so a mid-batch stop (a
+    # completed tier-2 blob deferring its apply) never drops already-polled
+    # messages. Fast messages are applied even while a blob apply is
+    # pending: the merge rule parks any that must follow it (LaneMerger),
+    # so the rest are independent of it by construction.
     global _pending_t2
-    while time.monotonic() < deadline and _pending_t2 is None:
-        if not _inbox:
-            transport = _transport
-            if transport is None:
-                return
-            items = transport.poll_cold(8)
-            if not items:
-                return
-            _inbox.extend(items)
-        header, payload = _inbox.popleft()
+    transport = _transport
+    if transport is None:
+        return
+    while time.monotonic() < deadline:
+        if not _inbox_fast and hasattr(transport, "poll_fast"):
+            _inbox_fast.extend(transport.poll_fast(64))
+        if _inbox_fast:
+            header, payload = _inbox_fast.popleft()
+        elif _pending_t2 is None:
+            if not _inbox:
+                _inbox.extend(transport.poll_cold(8))
+                if not _inbox:
+                    return
+            header, payload = _inbox.popleft()
+        else:
+            return  # cold waits for the pending apply; fast is drained
         seq = header.get("seq")
-        if seq is not None:
-            _seq_tracker.observe(seq)
-            stats["seq"] = _seq_tracker.last_seen or 0
-            stats["gaps"] = _seq_tracker.gaps
         kind = header.get("kind")
+        global _TEST_DROP_FIRST_T1
+        if _TEST_DROP_FIRST_T1 and kind == "t1":
+            _TEST_DROP_FIRST_T1 = False
+            continue  # simulate a lost frame: the next seq reveals the gap
+        if not _merger.observe(header):
+            stats["want_resync"] = True
+        stats["seq"] = _merger.cold.last_seen or 0
+        stats["seq_fast"] = _merger.fast.last_seen or 0
+        stats["gaps"] = _merger.gaps
+        if not _merger.admit(header, payload):
+            stats["parked"] = _merger.parked
+            continue  # fast message waiting for the blob it must follow
+        _dispatch(header, payload, seq)
+
+
+def _dispatch(header: dict, payload: bytes, seq) -> None:
+    global _pending_t2, _pending_t2_seq
+    kind = header.get("kind")
+    if _merger.lane_of(header) == merge.LANE_FAST:
         if kind == "t1":
             _apply_t1(header, payload)
         elif kind == "tomb":
             _apply_tombstone(header)
-        elif kind in ("t2", "boot"):
+        return
+    if kind == "t1":
+        _apply_t1(header, payload)
+        _release(_merger.cold_done(seq))
+    elif kind == "tomb":
+        _apply_tombstone(header)
+        _release(_merger.cold_done(seq))
+    elif kind in ("link", "unlink"):
+        _apply_link(header)
+        _release(_merger.cold_done(seq))
+    elif kind in ("t2", "boot"):
             uuid = header.get("uuid", "")
             blob_id = header["blob"]["id"]
             stale = _blob_by_uuid.get(uuid)
@@ -364,9 +597,19 @@ def _process_cold(deadline: float) -> None:
                 # Defer the indivisible apply one tick: label first.
                 stats["applying"] = done[0].get("name", "?")
                 _pending_t2 = done
+                _pending_t2_seq = seq  # cold_done only once it has applied
                 area = _target_view()
                 if area:
                     area.tag_redraw()
+            else:
+                _release(_merger.cold_done(seq))  # a middle chunk: nothing waits on it
+
+
+def _release(items: list) -> None:
+    """Parked fast messages whose blob has now applied."""
+    for header, payload in items:
+        _dispatch(header, payload, header.get("seq"))
+    stats["parked"] = _merger.parked
 
 
 def _target_view():
@@ -396,6 +639,7 @@ def _camera_view_bound(rv3d, cam) -> bool:
 
 
 def _apply_hot(packed: bytes, reassert: bool = False) -> None:
+    _quiet(_FRAME_GRACE)
     global _last_frame_apply
     state = protocol.unpack_hot(packed)
     if state is None:
@@ -507,21 +751,36 @@ def notify_host_goodbye() -> None:
     _host_goodbye = True
 
 
-def notify_new_session() -> None:
-    """Fresh handshake: the new host session restarts its seq numbering, so
-    the old tracker would count a false gap. IO thread — flag only."""
-    global _new_session
+_new_session_seqs = (0, 0)
+
+
+def notify_new_session(seq_cold: int = 0, seq_fast: int = 0) -> None:
+    """Fresh handshake: the host's lane counters are wherever it left them,
+    so the trackers prime to what the hello reports — otherwise the first
+    message on a lane is a fresh start and a lost first message is no gap.
+    IO thread — flag only."""
+    global _new_session, _new_session_seqs
+    _new_session_seqs = (int(seq_cold or 0), int(seq_fast or 0))
     _new_session = True
 
 
 def _handle_new_session() -> None:
-    global _new_session, _seq_tracker, _reassembler
+    global _new_session, _reassembler
     _new_session = False
-    _seq_tracker = protocol.SeqTracker()
+    _merger.reset()
+    # Keep zeros: 0 means "the next message is seq 1", not "unknown" — a
+    # lane the host never used before a restart must still show its gaps.
+    _merger.cold.last_seen = _new_session_seqs[0]
+    _merger.fast.last_seen = _new_session_seqs[1]
+    _merger.cold_applied = _new_session_seqs[0]
     _reassembler = protocol.Reassembler()
     _blob_by_uuid.clear()
+    _at_state.clear()
     stats["seq"] = 0
+    stats["seq_fast"] = 0
+    stats["parked"] = 0
     stats["gaps"] = 0
+    stats["want_resync"] = False
 
 
 def _handle_goodbye() -> None:
@@ -568,6 +827,16 @@ def _tick_inner(transport):
         _handle_new_session()
     start = time.monotonic()
     packed = transport.poll_hot()
+    if packed is not None:
+        stamped = protocol.unpack_hot(packed)
+        if stamped is not None and stamped.t_host:
+            # Parity probe: the strip must show the newest stamp even on a
+            # static view, so it redraws on every stamped packet.
+            overlay.set_probe(stamped.t_host, stamped.probe_seq)
+            probe_area = _target_view()
+            if probe_area is not None:
+                probe_area.tag_redraw()
+        packed = protocol.hot_core(packed)
     if packed is not None and packed != _last_hot:
         _apply_hot(packed)
         _last_hot = packed
@@ -599,23 +868,69 @@ def _tick_inner(transport):
     return _TICK
 
 
+@bpy.app.handlers.persistent
+def _on_depsgraph_replica(scene, depsgraph) -> None:
+    """Count edits this replica made itself. Attribution is by exclusion:
+    a stamped datablock we did not write in the last 1.5 s, updated outside
+    the 3 s after a blob/bootstrap and the 0.5 s after a frame change."""
+    if _transport is None:
+        return
+    now = time.monotonic()
+    if now < _quiet_until:
+        return
+    for update in depsgraph.updates:
+        db = update.id.original
+        if isinstance(db, (bpy.types.Scene, bpy.types.WindowManager, bpy.types.Screen)):
+            continue
+        uuid = db.get(UUID_PROP) if hasattr(db, "get") else None
+        if not uuid:
+            continue
+        if now - _touched.get(uuid, float("-inf")) < _TOUCH_GRACE:
+            continue
+        if (
+            update.is_updated_shading
+            and not update.is_updated_geometry
+            and not update.is_updated_transform
+            and isinstance(db, (bpy.types.Object,) + _GEOMETRY_TYPES)
+        ):
+            # A shading-only update on an object or its geometry is a
+            # consequence of something else changing (a material, a light,
+            # a link); a local edit of the object shows as transform or
+            # geometry. A local material edit still shows on the Material.
+            continue
+        if _DEBUG:
+            print(f"qcb local-edit? {type(db).__name__}:{db.name} geom={update.is_updated_geometry}"
+                  f" shade={update.is_updated_shading} xform={update.is_updated_transform}", flush=True)
+        stats["local_edits"] += 1
+        stats["last_local_edit"] = f"{type(db).__name__}:{db.name}"
+        return  # one per batch is enough to raise the flag
+
+
 def start(transport, mappings=()) -> None:
-    global _transport, _last_hot, _last_hot_applied, _seq_tracker, \
+    global _transport, _last_hot, _last_hot_applied, \
         _reassembler, _mappings, _pending_t2
     _transport = transport
     _last_hot = None
     _last_hot_applied = 0.0
-    _seq_tracker = protocol.SeqTracker()
+    _merger.reset()
     _reassembler = protocol.Reassembler()
     _inbox.clear()
+    _inbox_fast.clear()
     _blob_by_uuid.clear()
+    _at_state.clear()
     _pending_t2 = None
     _mappings = list(mappings)
     stats.update(
         seq=0, gaps=0, applied_t1=0, applied_t2=0, apply_errors=0,
         unknown_uuid=0, bootstraps=0, unmapped_paths=0, applying="", last_error="",
+        want_resync=False, frozen_caches=0, seq_fast=0, parked=0,
     )
     _rebuild_uuid_map()
+    _touched.clear()
+    stats.update(local_edits=0, last_local_edit="")
+    _quiet(_BLOB_GRACE)
+    if _on_depsgraph_replica not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_replica)
     # persistent: the apply loop must survive the bootstrap's open_mainfile
     # (non-persistent timers are dropped on file load)
     bpy.app.timers.register(_tick, first_interval=_TICK, persistent=True)
@@ -624,3 +939,5 @@ def start(transport, mappings=()) -> None:
 def stop() -> None:
     global _transport
     _transport = None
+    if _on_depsgraph_replica in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_replica)

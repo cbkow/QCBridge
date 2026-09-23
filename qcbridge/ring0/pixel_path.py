@@ -19,7 +19,16 @@ import threading
 import time
 from pathlib import Path
 
+try:
+    from ..ring1 import probe
+except ImportError:  # file-imported by tests with qcbridge/ on sys.path
+    from ring1 import probe
+
 _RESTART_BACKOFF = 2.0
+
+# build_command(srt_url=PIPE_OUTPUT): Annex-B HEVC with AUDs on stdout, for
+# an external owner of the capture child, when there is one.
+PIPE_OUTPUT = "pipe:"
 
 # Encoder rungs judged on a production scene (windows-v0-matrix/notes.md).
 _RUNG_BITRATE = {
@@ -27,6 +36,14 @@ _RUNG_BITRATE = {
     "hevc_10_420_50": "50M",
     "hevc_10_444_50": "50M",
 }
+
+def capture_fps() -> int:
+    return probe.capture_fps()
+
+
+def rung_mbps(rung: str) -> int:
+    return int(_RUNG_BITRATE.get(rung, "100M").rstrip("M"))
+
 
 _proc: subprocess.Popen | None = None
 _thread: threading.Thread | None = None
@@ -41,9 +58,10 @@ def build_command(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> list
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}passphrase={passphrase}&pbkeylen=16"
 
+    fps = probe.capture_fps()  # 30 unless the parity spike overrides it
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "warning"]
     if sys.platform == "win32":
-        cmd += ["-filter_complex", "ddagrab=output_idx=0:framerate=30:draw_mouse=0"]
+        cmd += ["-filter_complex", f"ddagrab=output_idx=0:framerate={fps}:draw_mouse=0"]
         if rung == "hevc_10_444_50":
             # True 4:4:4 needs the CPU path — NVENC silently downgrades 4:4:4
             # requests on GPU frames (verify receiver-side, always).
@@ -55,19 +73,60 @@ def build_command(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> list
         # for nothing we need; ull + bf 0 keep the encoder frame-in/frame-out.
         cmd += [
             "-preset", "p4", "-tune", "ull", "-delay", "0", "-bf", "0",
-            "-b:v", bitrate, "-g", "30",
+            "-b:v", bitrate, "-g", str(fps),
         ]
     elif sys.platform == "darwin":
         cmd += [
-            "-f", "avfoundation", "-capture_cursor", "0", "-framerate", "30",
+            "-f", "avfoundation", "-capture_cursor", "0", "-framerate", str(fps),
             "-i", "Capture screen 0",
             "-c:v", "hevc_videotoolbox", "-profile:v", "main10",
-            "-pix_fmt", "p010le", "-b:v", bitrate, "-g", "30", "-realtime", "1",
+            "-pix_fmt", "p010le", "-b:v", bitrate, "-g", str(fps), "-realtime", "1",
         ]
     else:
         raise RuntimeError("no capture path for this platform")
-    cmd += ["-f", "mpegts", url]
+    if srt_url == PIPE_OUTPUT:
+        # Raw HEVC carries no timestamps, so ffmpeg defaults to constant-rate
+        # output and pads with duplicate frames; at a 120 Hz capture the
+        # encoder then falls behind and latency grows without bound (seen
+        # live: 90 s behind after 90 s). Pass frames through as captured.
+        cmd += ["-fps_mode", "passthrough",
+                "-bsf:v", "hevc_metadata=aud=insert", "-f", "hevc", "-"]
+    else:
+        cmd += ["-f", "mpegts", url]
     return cmd
+
+
+# An SRT listener serves ONE viewer; when it leaves, the mux fails and
+# ffmpeg should exit so we respawn for the next one. On macOS the
+# avfoundation input thread can keep ffmpeg alive (ignoring SIGTERM) after
+# that error — found live 2026-09-17 — so a fatal output line arms a kill.
+_FATAL_OUTPUT = ("Error muxing a packet", "Error writing trailer", "Error closing file")
+_FATAL_GRACE_S = 2.0
+
+
+def is_fatal_output_line(line: str) -> bool:
+    return any(marker in line for marker in _FATAL_OUTPUT)
+
+
+def _pump_log(proc: subprocess.Popen, log) -> None:
+    """Copy ffmpeg's stderr to the log; kill a process that reported a fatal
+    output error but hasn't exited within the grace period."""
+    fatal_at = None
+    for raw in iter(proc.stderr.readline, b""):
+        log.write(raw)
+        log.flush()
+        if fatal_at is None and is_fatal_output_line(raw.decode(errors="replace")):
+            fatal_at = time.monotonic()
+            threading.Thread(
+                target=_kill_if_stuck, args=(proc,), name="qcb-pixel-reap", daemon=True
+            ).start()
+
+
+def _kill_if_stuck(proc: subprocess.Popen) -> None:
+    try:
+        proc.wait(timeout=_FATAL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 def _supervise(cmd: list[str], log_path: Path) -> None:
@@ -77,12 +136,19 @@ def _supervise(cmd: list[str], log_path: Path) -> None:
             log.write(f"\n--- spawn {time.ctime()} ---\n".encode())
             log.flush()
             try:
-                _proc = subprocess.Popen(cmd, stdout=log, stderr=log)
+                _proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                )
             except OSError as exc:
                 _status = f"ffmpeg spawn failed: {exc}"
                 return
             _status = "streaming"
+            pump = threading.Thread(
+                target=_pump_log, args=(_proc, log), name="qcb-pixel-log", daemon=True
+            )
+            pump.start()
             _proc.wait()
+            pump.join(timeout=2.0)
         if _stop.is_set():
             break
         _status = f"ffmpeg exited ({_proc.returncode}) — restarting"
@@ -104,8 +170,23 @@ def start(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> None:
     _thread.start()
 
 
+_external = None  # (stop_fn, state_fn): something else owns the child
+_EXTERNAL_STATUS = {"running": "streaming", "restarting": "ffmpeg exited — restarting",
+                    "spawn_failed": "ffmpeg spawn failed", "off": "off", "": "off"}
+
+
+def set_external(stop_fn=None, state_fn=None) -> None:
+    """When another process owns the capture child, stop()/status()
+    — called from goodbye handling, the panel and pong status — defer to it."""
+    global _external
+    _external = (stop_fn, state_fn) if stop_fn and state_fn else None
+
+
 def stop() -> None:
     global _thread, _proc
+    if _external is not None:
+        _external[0]()
+        return
     _stop.set()
     if _proc is not None and _proc.poll() is None:
         _proc.terminate()
@@ -120,4 +201,7 @@ def stop() -> None:
 
 
 def status() -> str:
+    if _external is not None:
+        state = _external[1]()
+        return _EXTERNAL_STATUS.get(state, state)
     return _status

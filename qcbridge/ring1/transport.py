@@ -26,6 +26,13 @@ class TransportConfig:
     port_cold: int
     heartbeat_interval: float = 1.0
     heartbeat_misses: int = 3
+    # Agent transport only (transport_agent.py); one UDP port = port_control.
+    token: str = ""         # QUIC-level auth, on top of the hello token check
+    helper_path: str = ""   # qcb-helper binary; empty = auto-discover
+    fingerprint: str = ""   # host: pinned replica cert SHA-256; empty = trust on first use
+    cert_dir: str = ""      # replica: where its certificate lives
+    video_listen: str = ""  # host: "127.0.0.1:PORT" serving the stream to the viewer
+    cap_mbps: float = 0.0   # replica: wire-rate cap; 0 = helper default
 
 
 class HostTransport(Protocol):
@@ -43,6 +50,13 @@ class HostTransport(Protocol):
         — the caller keeps the datablock dirty and retries on a later flush."""
         ...
 
+    def send_fast(self, header: dict, payload: bytes = b"") -> bool:
+        """Tier-1 deltas and tombstones: an ordered lane of its own where the
+        transport has one, so a delta never waits behind a blob. The header
+        carries lane="f" and `after` (the cold seq it must follow); the
+        replica's LaneMerger orders the two lanes. Same contract as send_cold."""
+        ...
+
     @property
     def peer_alive(self) -> bool: ...
 
@@ -50,6 +64,12 @@ class HostTransport(Protocol):
     """Latest status dict the replica attached to a pong (empty until one
     arrives). The host reads this to recommend a resync — decision-#8-clean
     because the replica only ever answers."""
+
+    wire_compresses: bool
+    """True when the transport compresses cold payloads itself (the agent
+    does, with zstd, on its own threads). The host then serializes partials
+    and bootstraps uncompressed, which keeps zstd off Blender's main thread
+    on both ends — the replica's libraries.load is what it saved."""
 
     def on_peer_state(self, cb: Callable[[bool], None]) -> None:
         """cb(True) on peer (re)appearing, cb(False) on peer-lost — fired
@@ -77,6 +97,11 @@ class ReplicaTransport(Protocol):
 
     def poll_cold(self, max_items: int) -> list[tuple[dict, bytes]]:
         """Up to max_items complete cold messages, oldest first."""
+        ...
+
+    def poll_fast(self, max_items: int) -> list[tuple[dict, bytes]]:
+        """Up to max_items fast-lane messages, oldest first ([] when the
+        transport has no such lane — they arrive via poll_cold instead)."""
         ...
 
     @property

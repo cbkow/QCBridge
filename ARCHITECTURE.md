@@ -1,5 +1,11 @@
 # QCBridge architecture
 
+> **2026-09-23:** the agent line (`spike/quinn`) is merged here. This document
+> still describes the addon as it stood on the frozen zmq release; the lanes,
+> credits, recovery, detection and cache handling changed that day and are
+> described in `SYNC-AUDIT.md` (§2 for the transport as it is now),
+> `COVERAGE.md` and `CACHES.md`. Where they disagree, those three are current.
+
 How the addon is put together, and — more usefully — *why* the awkward parts
 are awkward. Much of this code is shaped by Blender behaviour that took a
 while to pin down; those findings are recorded here and in the comments they

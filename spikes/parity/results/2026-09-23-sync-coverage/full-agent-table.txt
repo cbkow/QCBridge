@@ -1,0 +1,121 @@
+action                       group       status           ms  note
+obj_add                      object      crossed         402  
+obj_delete                   object      crossed         305  
+obj_rename                   object      crossed         448  
+obj_duplicate                object      crossed         325  
+obj_data_relink              object      NOT crossed          expected 5  replica 4
+obj_delta_transform          object      NOT crossed          expected [0.0, 0.0, 1.5]  replica [0.0, 0.0, 0.0]
+obj_display_type             object      crossed       34663  
+obj_show_in_front            object      crossed       32032  
+obj_hide_eye                 visibility  crossed         577  
+obj_hide_viewport            visibility  crossed         737  
+obj_hide_render              visibility  crossed         641  
+obj_ray_visibility           visibility  NOT crossed          expected false  replica true
+obj_holdout                  visibility  NOT crossed          expected [true, true]  replica [false, false]
+obj_color                    object      crossed         324  
+obj_empty_display            object      crossed       50181  
+obj_instance_collection      object      crossed       47614  
+obj_material_slot_assign     material    crossed         230  
+obj_vertex_parent            object      crossed         380  
+obj_light_linking            object      NOT crossed          expected "CovColl"  replica null
+obj_custom_prop_nested       object      crossed         473  
+mesh_vertex_move             mesh        crossed         380  
+mesh_vertex_group            mesh        crossed         284  
+mesh_uv_layer                mesh        crossed         434  
+mesh_color_attribute         mesh        crossed         357  
+mesh_shade_smooth            mesh        crossed         249  
+mesh_material_index          mesh        crossed         390  
+mesh_custom_prop             mesh        crossed        3683  
+mod_add_subsurf              modifier    crossed        1042  
+mod_setting_change           modifier    crossed         283  
+mod_reorder                  modifier    crossed         428  
+mod_remove                   modifier    crossed         321  
+mod_toggle_viewport          modifier    crossed         229  
+mod_toggle_render            modifier    crossed         382  
+mod_hook_object              modifier    crossed         277  
+mod_displace_texture         modifier    crossed         404  
+mod_texture_setting          modifier    NOT crossed          expected 1.9  replica 0.7
+mat_new_assign               material    crossed         210  
+mat_socket_default           material    crossed         382  
+mat_link_new                 material    crossed         280  
+mat_node_property            material    crossed         433  
+mat_node_mute                material    crossed       11206  
+mat_colorramp_stop           material    crossed        8574  
+mat_image_assign             material    crossed        5940  
+mat_node_add                 material    crossed        3311  
+mat_settings                 material    crossed         680  
+mat_viewport_color           material    crossed         308  
+mat_custom_prop              material    crossed       13383  
+nodegroup_value_edit         material    NOT crossed          expected 0.8  replica null
+nodegroup_node_property      material    NOT crossed          expected "SINE"  replica null
+image_new_generated          image       NOT crossed          expected [4, 4]  replica null
+image_pixels_edit            image       NOT crossed          expected [1.0, 0.0]  replica [0.502, 0.502]
+image_colorspace             image       crossed         236  
+light_energy                 light       crossed         390  
+light_color                  light       crossed         289  
+light_radius                 light       crossed         202  
+light_type_area              light       NOT crossed          expected ["AREA", "DISK", 3.0]  replica ["AREA", "SQUARE", 0.25]
+light_shadow_toggle          light       NOT crossed          expected false  replica true
+light_spread                 light       NOT crossed          expected 1.0  replica 3.1416
+light_add_sun                light       crossed         333  
+cam_lens                     camera      crossed         237  
+cam_dof_focus_object         camera      NOT crossed          expected [true, "CovEmpty"]  replica [true, null]
+cam_sensor                   camera      NOT crossed          expected ["VERTICAL", 30.0]  replica ["AUTO", 24.0]
+cam_ortho                    camera      NOT crossed          expected ["ORTHO", 12.0]  replica ["PERSP", 6.0]
+cam_background_image         camera      NOT crossed          expected [1, "CovImg"]  replica [0, null]
+scene_camera_switch          camera      crossed         269  
+marker_camera_bind           camera      NOT crossed          expected [5, "Camera"]  replica null
+world_node_socket            world       crossed         349  
+world_swap                   world       NOT crossed          expected "CovWorldB"  replica "World"
+world_color_no_nodes         world       NOT crossed          expected [true, [0.2, 0.3, 0.4]]  replica [true, [0.0509, 0.0509, 0.0509]]
+scene_frame_range            scene       NOT crossed          expected [5, 60]  replica [1, 48]
+scene_fps                    scene       NOT crossed          expected 25  replica 24
+scene_resolution             scene       crossed         371  
+scene_view_transform         scene       crossed         281  
+scene_engine                 scene       crossed         429  
+scene_cycles_samples         scene       NOT crossed          expected 77  replica 4096
+scene_film_transparent       scene       NOT crossed          expected true  replica false
+scene_motion_blur            scene       NOT crossed          expected true  replica false
+scene_units                  scene       NOT crossed          expected ["IMPERIAL", 0.5]  replica ["METRIC", 1.0]
+scene_gravity                scene       NOT crossed          expected [0.0, 0.0, -3.0]  replica [0.0, 0.0, -9.81]
+scene_border                 scene       NOT crossed          expected [true, 0.25]  replica [false, 0.0]
+scene_custom_prop            scene       NOT crossed          expected 11  replica null
+viewlayer_add                scene       NOT crossed          expected ["ViewLayer", "CovVL"]  replica ["ViewLayer"]
+viewlayer_pass               scene       NOT crossed          expected true  replica false
+compositor_node_add          scene       NOT crossed          expected true  replica null
+coll_new_and_link            collection  NOT crossed          expected [true, false]  replica [true, true]
+coll_exclude                 collection  crossed         296  
+coll_hide_viewport_layer     collection  crossed         703  
+coll_hide_render_data        collection  crossed         356  
+coll_instance_offset         collection  NOT crossed          expected [1.0, 2.0, 3.0]  replica [0.0, 0.0, 0.0]
+coll_custom_prop             collection  crossed        2941  
+coll_move_between            collection  crossed         321  
+anim_keyframe_insert         animation   crossed         214  
+anim_keyframe_move           animation   crossed         354  
+anim_interpolation           animation   crossed         261  
+anim_action_swap             animation   crossed         403  
+anim_nla_strip               animation   crossed         292  
+anim_nla_mute                animation   NOT crossed          expected true  replica false
+anim_driver_add              animation   crossed         333  
+anim_driver_edit             animation   crossed         233  
+phys_rigid_body              physics     crossed         372  
+phys_rigid_body_world        physics     NOT crossed          expected 22  replica null
+phys_force_field             physics     NOT crossed          expected ["WIND", 7.0]  replica null
+phys_particles_add           physics     crossed         353  
+phys_particles_setting       physics     crossed        3023  
+phys_cloth_setting           physics     crossed         396  
+phys_fluid_domain            physics     crossed         268  
+curve_bevel                  othertypes  crossed         415  
+curve_point_move             othertypes  crossed         311  
+text_body                    othertypes  crossed         470  
+metaball_add                 othertypes  crossed         361  
+grease_pencil_add            othertypes  crossed        1201  
+volume_add                   othertypes  crossed         418  
+hair_curves_add              othertypes  crossed         306  
+pointcloud_add               othertypes  crossed         467  
+lightprobe_add               othertypes  crossed         351  
+empty_image                  othertypes  crossed         272  
+library_link                 files       NOT crossed          expected true  replica null
+undo_after_move              files       host-error           RuntimeError: skipped: set QCB_COV_UNDO=1
+{"crossed": 79, "NOT crossed": 38, "host-error": 1}
+replica stats: {"seq": 118, "gaps": 0, "applied_t1": 27, "apply_errors": 0, "unknown_uuid": 0, "applied_t2": 92, "bootstraps": 1, "unmapped_paths": 0, "host_ended": false, "last_error": ""}

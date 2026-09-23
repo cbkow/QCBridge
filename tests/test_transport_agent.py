@@ -1,0 +1,341 @@
+"""Live localhost integration of the agent transport pair.
+
+Same contract as test_transport_zmq.py, over one QUIC connection between two
+qcbridge-agent processes this module spawns (QCB_AGENT=spawn). Each agent
+gets its own directory, so config, certificate and agent.json are isolated
+and a replica's certificate is stable across restarts within a test.
+
+This file IS the transport contract: the four cases below the zmq suite does
+not cover — keyed hot, credit-window backpressure, trust-on-first-use
+pinning, and a token rejected at the QUIC layer — are the reason it exists.
+Skipped whole-module when the agent isn't built (cargo build in agent/).
+"""
+
+import os
+import pathlib
+import socket
+import sys
+import time
+
+os.environ["QCB_AGENT"] = "spawn"  # never attach to a running agent from tests
+
+import pytest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "qcbridge"))
+
+from ring1 import protocol  # noqa: E402
+from ring1.transport import TransportConfig  # noqa: E402
+from ring1.transport_agent import (  # noqa: E402
+    HostTransportAgent, ReplicaTransportAgent, find_agent, pack_cold, unpack_cold,
+)
+
+if find_agent() is None:
+    pytest.skip("qcbridge-agent binary not built", allow_module_level=True)
+
+HEARTBEAT = 0.1
+
+
+def wait_for(predicate, timeout=5.0, interval=0.02):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def free_udp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def make_pair(tmp_path, token_host="tok", token_replica="tok", fingerprint=""):
+    port = free_udp_port()
+    replica = ReplicaTransportAgent(TransportConfig(
+        address="127.0.0.1", port_control=port, port_hot=0, port_cold=0,
+        heartbeat_interval=HEARTBEAT, token=token_replica, cert_dir=str(tmp_path / "cert"),
+    ))
+    replica.start()
+    host = HostTransportAgent(TransportConfig(
+        address="127.0.0.1", port_control=port, port_hot=0, port_cold=0,
+        heartbeat_interval=HEARTBEAT, token=token_host, fingerprint=fingerprint,
+    ))
+    host.start()
+    return host, replica
+
+
+@pytest.fixture()
+def pair(tmp_path):
+    host, replica = make_pair(tmp_path)
+    yield host, replica
+    host.stop()
+    replica.stop()
+
+
+def test_cold_pack_round_trip():
+    header, payload = unpack_cold(pack_cold({"kind": "t1", "seq": 4}, b"\x00\x01blob"))
+    assert header == {"kind": "t1", "seq": 4} and payload == b"\x00\x01blob"
+    assert unpack_cold(b"\x00") is None
+
+
+def test_handshake_token_accept_and_deny(pair):
+    host, replica = pair
+
+    def handler(msg):
+        ok, reason = protocol.check_hello(msg, "secret")
+        return {"kind": "hello_reply", "ok": ok, "reason": reason, "epoch": "r-1"}
+
+    replica.set_request_handler(handler)
+    assert wait_for(lambda: host.peer_alive)
+    reply = host.request(protocol.make_hello("secret", "h-1", "5.2.0"), timeout=2.0)
+    assert reply and reply["ok"] and reply["epoch"] == "r-1"
+    reply = host.request(protocol.make_hello("wrong", "h-1", "5.2.0"), timeout=2.0)
+    assert reply and not reply["ok"] and "token" in reply["reason"]
+
+
+def test_handler_exception_does_not_kill_io(pair):
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    replica.set_request_handler(lambda msg: 1 / 0)
+    reply = host.request({"kind": "boom"}, timeout=2.0)
+    assert reply and reply["kind"] == "error"
+    replica.set_request_handler(lambda msg: {"kind": "ok"})
+    reply = host.request({"kind": "fine"}, timeout=2.0)
+    assert reply and reply["kind"] == "ok"
+
+
+def test_hot_latest_wins_and_keys_are_independent(pair):
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    for frame in range(1, 51):
+        state = protocol.HotState(
+            frame=frame, view_matrix=tuple(float(i) for i in range(16)),
+            lens=50.0, clip_start=0.1, clip_end=100.0,
+        )
+        host.send_hot(state.pack())
+        host.send_hot_keyed(b"light.energy", str(frame).encode())
+        time.sleep(0.001)
+    assert wait_for(
+        lambda: (s := replica.poll_hot()) is not None and protocol.unpack_hot(s).frame == 50
+    ), "latest camera state should be the last one sent"
+    assert wait_for(lambda: replica.poll_hot_keyed().get(b"light.energy") == b"50")
+
+
+def test_cold_ordered_delivery_and_chunked_blob(pair, monkeypatch):
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    # On loopback the agent drains faster than Python can fill 32 MiB, so
+    # the pushback would never show; shrink the window for the assertion.
+    from ring1 import transport_agent
+    monkeypatch.setattr(transport_agent, "_COLD_WINDOW_BYTES", 1 << 20)
+    seq = 0
+    sent = []
+    for _ in range(3):
+        seq += 1
+        sent.append(({"kind": "t1", "seq": seq}, b"delta"))
+    blob = b"MESH" * 2_000_000  # 8 MB: far more than the (shrunk) window
+    for header, payload in protocol.chunk_blob(
+        "t2", "blob-9", blob, meta={"uuid": "u9"}, chunk_size=64_000
+    ):
+        seq += 1
+        header["seq"] = seq
+        sent.append((header, payload))
+
+    refused = 0
+    for header, payload in sent:
+        while not host.send_cold(header, payload):
+            refused += 1          # window full: the caller retries, as the dirty set does
+            time.sleep(0.002)
+    assert refused > 0, "credit window should have pushed back on an 8 MB burst"
+
+    received = []
+    assert wait_for(
+        lambda: len(received) >= seq or (received.extend(replica.poll_cold(64)) and False),
+        timeout=20.0,
+    ), f"expected {seq} cold messages, got {len(received)}"
+
+    tracker = protocol.SeqTracker()
+    reassembler = protocol.Reassembler()
+    blobs = []
+    for header, payload in received:
+        assert tracker.observe(header["seq"])
+        done = reassembler.feed(header, payload)
+        if done and done[0]["kind"] == "t2":
+            blobs.append(done)
+    assert tracker.gaps == 0
+    assert len(blobs) == 1 and blobs[0][1] == blob and blobs[0][0]["uuid"] == "u9"
+
+
+def test_request_nowait_poll_and_cancel(pair):
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    replica.set_request_handler(lambda msg: {"kind": "ok", "echo": msg.get("kind")})
+    fetched = []
+    req = host.request_nowait({"kind": "probe"})
+
+    def fetch():
+        reply = host.poll_reply(req)
+        if reply is not None:
+            fetched.append(reply)
+        return bool(fetched)
+
+    assert wait_for(fetch)
+    assert fetched[0]["echo"] == "probe"
+    assert host.poll_reply(req) is None
+
+    cancelled = host.request_nowait({"kind": "probe2"})
+    host.cancel_request(cancelled)
+    time.sleep(0.3)
+    assert host.poll_reply(cancelled) is None
+
+
+def test_pong_carries_replica_status(pair):
+    host, replica = pair
+    replica.set_status_provider(lambda: {"seq": 9, "gaps": 3, "unknown": 1})
+    assert wait_for(lambda: host.peer_status.get("gaps") == 3)
+    assert host.peer_status == {"seq": 9, "gaps": 3, "unknown": 1}
+
+
+def test_liveness_both_sides_and_peer_lost(pair):
+    host, replica = pair
+    states = []
+    host.on_peer_state(states.append)
+    assert wait_for(lambda: host.peer_alive and replica.peer_alive)
+    assert states[:1] == [True]
+    replica.stop()
+    assert wait_for(lambda: not host.peer_alive, timeout=6.0)
+    assert states[-1] is False
+
+
+def test_trust_on_first_use_then_pin(tmp_path):
+    host, replica = make_pair(tmp_path)
+    try:
+        assert wait_for(lambda: host.peer_alive)
+        assert len(replica.fingerprint) == 64
+        assert host.peer_fingerprint == replica.fingerprint  # learned, not configured
+    finally:
+        host.stop()
+        replica.stop()
+    # Pinned to the right cert: connects. Pinned to another: never comes up.
+    host, replica = make_pair(tmp_path, fingerprint=replica.fingerprint)
+    try:
+        assert wait_for(lambda: host.peer_alive)
+    finally:
+        host.stop()
+        replica.stop()
+    host, replica = make_pair(tmp_path, fingerprint="00" * 32)
+    try:
+        assert not wait_for(lambda: host.peer_alive, timeout=1.5)
+        assert wait_for(lambda: "certificate changed" in host.link_note)
+    finally:
+        host.stop()
+        replica.stop()
+
+
+def test_wrong_quic_token_never_connects(tmp_path):
+    host, replica = make_pair(tmp_path, token_host="nope")
+    try:
+        assert not wait_for(lambda: host.peer_alive, timeout=1.5)
+    finally:
+        host.stop()
+        replica.stop()
+
+
+def wait_reply(transport, req_id, timeout=5.0):
+    """The agent's correlated reply, or None. (poll_cmd_reply pops, so a
+    walrus inside a wait_for lambda would consume it into the lambda's own
+    scope — which is exactly the bug this helper replaced.)"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        reply = transport.poll_cmd_reply(req_id)
+        if reply is not None:
+            return reply
+        time.sleep(0.02)
+    return None
+
+
+def test_set_config_round_trip_and_needs_restart(pair):
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    # A live field lands, persists, and comes back in the correlated reply.
+    reply = wait_reply(host, host.set_config(idle_secs=7))
+    assert reply and reply["changed"] == ["idle_secs"], reply
+    assert host.agent_config["idle_secs"] == 7
+    # A restart-only field is named back, not silently ignored.
+    reply = wait_reply(host, host.set_config(listen="0.0.0.0:1"))
+    assert reply and reply["needs_restart"] == ["listen"] and reply["changed"] == [], reply
+    assert host.agent_config["listen"] != "0.0.0.0:1"
+    # A bad value is rejected, not coerced.
+    reply = wait_reply(host, host.set_config(discovery="loud"))
+    assert reply and reply["rejected"] == ["discovery"], reply
+
+
+def test_discover_by_direct_probe_finds_the_replica(pair):
+    """The VPN path: a unicast probe to an address returns the replica's
+    beacon — name, listen port, certificate fingerprint, paired state — with
+    the asking host excluded from its own answer."""
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    reply = wait_reply(host, host.discover("127.0.0.1"), timeout=6.0)
+    assert reply, "no peers reply within 6 s"
+    assert reply["sources"] == ["probe"]
+    peers = reply["peers"]
+    assert len(peers) == 1, peers
+    p = peers[0]
+    assert p["role"] == "replica"
+    assert p["fp"] == replica.fingerprint, "the probe reports the certificate we would pin"
+    assert p["port"] == replica.bound_ports()[0]
+    assert p["paired"] is True
+    assert host.peers == peers
+
+
+def test_agent_advertises_byte_credits(pair):
+    """COLD_ACK carries bytes since 2026-09-23; the attached event says so
+    and the host transport switches its window to bytes on that field."""
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    assert host._credits_bytes, "attached event lacked credits=bytes — stale agent binary?"
+    assert replica._credits_bytes if hasattr(replica, "_credits_bytes") else True
+
+
+def test_fast_lane_is_not_behind_a_cold_blob(pair):
+    """A tier-1 delta sent right after a large blob must reach the replica
+    before the blob finishes — that is what the second stream is for."""
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    assert host._has_fast, "attached event lacked lanes=[fast] — stale agent binary?"
+    blob = b"MESH" * 8_000_000  # 32 MB on the cold lane
+    chunks = list(protocol.chunk_blob("t2", "blob-big", blob, meta={"uuid": "big"}))
+    seq = 0
+    for header, payload in chunks:
+        seq += 1
+        header["seq"] = seq
+        while not host.send_cold(header, payload):
+            time.sleep(0.002)
+    assert host.send_fast({"kind": "t1", "lane": "f", "seq": 1, "uuid": "x", "after": 0}, b"delta")
+    fast = []
+    assert wait_for(lambda: fast.extend(replica.poll_fast(8)) or bool(fast), timeout=5.0)
+    assert fast[0][0]["uuid"] == "x"
+    # the cold lane must still deliver the whole blob, in order
+    cold = []
+    assert wait_for(lambda: cold.extend(replica.poll_cold(64)) or len(cold) >= len(chunks), timeout=15.0)
+    assert [h["blob"]["i"] for h, _ in cold[: len(chunks)]] == list(range(len(chunks)))
+
+
+def test_cold_payloads_round_trip_byte_identical(pair):
+    """The agent compresses cold payloads on the wire (attached: codec=zstd);
+    what the replica polls must be exactly what the host sent — a highly
+    compressible blob and an incompressible one, plus a tiny one below the
+    compression threshold."""
+    import os
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    assert host.wire_compresses, "attached event lacked codec=zstd — stale agent binary?"
+    payloads = [b"MESH" * 1_500_000, os.urandom(1_500_000), b"x"]
+    for i, p in enumerate(payloads):
+        while not host.send_cold({"kind": "t2", "seq": i + 1, "uuid": f"p{i}"}, p):
+            time.sleep(0.002)
+    got = []
+    assert wait_for(lambda: got.extend(replica.poll_cold(16)) or len(got) >= 3, timeout=15.0)
+    assert [p for _, p in got[:3]] == payloads

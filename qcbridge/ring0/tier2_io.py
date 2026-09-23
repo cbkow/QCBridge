@@ -40,6 +40,17 @@ _COLLECTIONS = (
     ("actions", bpy.types.Action),
     ("lattices", bpy.types.Lattice),
     ("armatures", bpy.types.Armature),
+    # Added 2026-09-23 (COVERAGE.md inventory): types that used to cross only
+    # as a new object's data and never again.
+    ("metaballs", bpy.types.MetaBall),
+    ("volumes", bpy.types.Volume),
+    ("hair_curves", bpy.types.Curves),
+    ("pointclouds", bpy.types.PointCloud),
+    ("lightprobes", bpy.types.LightProbe),
+    ("grease_pencils", bpy.types.GreasePencil),
+    ("textures", bpy.types.Texture),
+    ("particles", bpy.types.ParticleSettings),
+    ("cache_files", bpy.types.CacheFile),  # Alembic/USD: localized on arrival like images
     # NOTE no shape_keys entry: libraries.load has no shape_keys namespace
     # (probed 5.2) — Keys always ride their owner's blob and are paired by
     # the dedicated post-pass in apply_blob below.
@@ -53,14 +64,23 @@ def collection_of(db: bpy.types.ID) -> str | None:
     return None
 
 
-def serialize(db: bpy.types.ID) -> bytes | None:
+def serialize(db: bpy.types.ID, compress: bool = True) -> bytes | None:
     """Partial .blend bytes for one datablock (deps included), or None for
     types we don't resend (Scene: force-resync territory, M6)."""
     if collection_of(db) is None:
         return None
+    # An object in edit mode keeps its edits in the edit-mesh until it
+    # leaves the mode; libraries.write would ship the pre-edit datablock
+    # (SYNC-AUDIT D2). Flush the edit-mesh into the datablock first.
+    edit_obj = getattr(bpy.context, "edit_object", None)
+    if edit_obj is not None and edit_obj.data == db:
+        try:
+            edit_obj.update_from_editmode()
+        except RuntimeError:
+            pass
     path = Path(tempfile.gettempdir()) / f"qcb-t2-{db.session_uid}.blend"
     try:
-        bpy.data.libraries.write(str(path), {db}, compress=True)
+        bpy.data.libraries.write(str(path), {db}, compress=compress)
         return path.read_bytes()
     finally:
         path.unlink(missing_ok=True)
@@ -193,6 +213,13 @@ def apply_blob(
         bpy.data.libraries, local_project_dir, mappings
     )
     errors += lib_errors
+    # Cache and bake directories on the arrived objects' modifiers; the
+    # point-cache reassignment also rescans the external frames.
+    _f, _u, obj_errors = bootstrap.localize_object_paths(
+        [db for db, _, _ in pairs if isinstance(db, bpy.types.Object)],
+        local_project_dir, mappings,
+    )
+    errors += obj_errors
     # New objects aren't linked into any scene collection by append-into-data;
     # link the ones that ended up orphaned.
     for new_db, old_db, _ in pairs:

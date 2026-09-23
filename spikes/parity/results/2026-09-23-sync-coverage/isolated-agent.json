@@ -1,0 +1,182 @@
+{
+ "rows": [
+  {
+   "key": "obj_display_type",
+   "group": "object",
+   "desc": "display as wire",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "\"WIRE\"",
+   "last_seen": "\"TEXTURED\"",
+   "error": null
+  },
+  {
+   "key": "obj_show_in_front",
+   "group": "object",
+   "desc": "show in front",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "true",
+   "last_seen": "false",
+   "error": null
+  },
+  {
+   "key": "obj_empty_display",
+   "group": "object",
+   "desc": "empty display type/size",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "[\"CUBE\", 2.5]",
+   "last_seen": "[\"PLAIN_AXES\", 1.0]",
+   "error": null
+  },
+  {
+   "key": "obj_instance_collection",
+   "group": "object",
+   "desc": "empty instancing a collection",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "[\"COLLECTION\", \"CovInstSrc\"]",
+   "last_seen": "[\"NONE\", null]",
+   "error": null
+  },
+  {
+   "key": "mesh_custom_prop",
+   "group": "mesh",
+   "desc": "custom prop on the mesh datablock",
+   "status": "piggybacked",
+   "latency_ms": 4357,
+   "expected": "7",
+   "last_seen": "7",
+   "error": null
+  },
+  {
+   "key": "mod_add_subsurf",
+   "group": "modifier",
+   "desc": "add subsurf, levels 2",
+   "status": "crossed",
+   "latency_ms": 292,
+   "expected": "2",
+   "last_seen": "2",
+   "error": null
+  },
+  {
+   "key": "mat_node_property",
+   "group": "material",
+   "desc": "Math node operation ADD \u2192 MULTIPLY",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "\"MULTIPLY\"",
+   "last_seen": "\"ADD\"",
+   "error": null
+  },
+  {
+   "key": "mat_node_mute",
+   "group": "material",
+   "desc": "mute a node",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "true",
+   "last_seen": "false",
+   "error": null
+  },
+  {
+   "key": "mat_colorramp_stop",
+   "group": "material",
+   "desc": "move a ColorRamp stop",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "0.35",
+   "last_seen": "0.0",
+   "error": null
+  },
+  {
+   "key": "mat_image_assign",
+   "group": "material",
+   "desc": "assign an image to an Image Texture node",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "\"CovImg\"",
+   "last_seen": "null",
+   "error": null
+  },
+  {
+   "key": "mat_node_add",
+   "group": "material",
+   "desc": "add a node",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "true",
+   "last_seen": "false",
+   "error": null
+  },
+  {
+   "key": "mat_custom_prop",
+   "group": "material",
+   "desc": "custom prop on a material",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "3",
+   "last_seen": "null",
+   "error": null
+  },
+  {
+   "key": "coll_custom_prop",
+   "group": "collection",
+   "desc": "custom prop on a collection",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "5",
+   "last_seen": "null",
+   "error": null
+  },
+  {
+   "key": "phys_force_field",
+   "group": "physics",
+   "desc": "force field on an empty",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "[\"WIND\", 7.0]",
+   "last_seen": "null",
+   "error": null
+  },
+  {
+   "key": "phys_particles_setting",
+   "group": "physics",
+   "desc": "particle settings change (count)",
+   "status": "host-error",
+   "latency_ms": null,
+   "expected": "null",
+   "last_seen": "null",
+   "error": "IndexError: bpy_prop_collection[index]: index 0 out of range, size 0"
+  },
+  {
+   "key": "grease_pencil_add",
+   "group": "othertypes",
+   "desc": "grease pencil object with a layer",
+   "status": "crossed",
+   "latency_ms": 400,
+   "expected": "[\"GREASEPENCIL\", [\"Color\", \"Lines\", \"CovLayer\"]]",
+   "last_seen": "[\"GREASEPENCIL\", [\"Color\", \"Lines\", \"CovLayer\"]]",
+   "error": null
+  }
+ ],
+ "counts": {
+  "NOT crossed": 12,
+  "piggybacked": 1,
+  "crossed": 2,
+  "host-error": 1
+ },
+ "replica_stats": {
+  "seq": 11,
+  "gaps": 0,
+  "applied_t1": 0,
+  "apply_errors": 0,
+  "unknown_uuid": 0,
+  "applied_t2": 10,
+  "bootstraps": 1,
+  "unmapped_paths": 0,
+  "host_ended": false,
+  "last_error": ""
+ }
+}

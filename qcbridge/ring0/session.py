@@ -7,14 +7,42 @@ it works purely on strings captured at session start.
 
 from __future__ import annotations
 
+import os
 import uuid as _uuid
 
 import bpy
 
-from ..ring1 import pathmap, protocol, toolbox
+from ..ring1 import liveness, pathmap, protocol, toolbox
 from ..ring1.transport import TransportConfig
-from ..ring1.transport_zmq import HostTransportZmq, ReplicaTransportZmq
 from . import host_handlers, host_hot, kiosk, overlay, pixel_path, replica_apply
+
+
+
+def _use_agent(prefs) -> bool:
+    """Transport switch: QCB_TRANSPORT=agent, or a `transport` pref. Both
+    ends must agree. Default stays zmq, which is frozen but supported."""
+    kind = os.environ.get("QCB_TRANSPORT") or getattr(prefs, "transport", "zmq")
+    return str(kind).lower() == "agent"
+
+
+def _make_transport(prefs, cfg: TransportConfig, role: str):
+    # Imported lazily: the agent path must not need pyzmq, nor zmq the agent.
+    if _use_agent(prefs):
+        from ..ring1 import transport_agent
+
+        cls = (transport_agent.HostTransportAgent if role == "HOST"
+               else transport_agent.ReplicaTransportAgent)
+    else:
+        from ..ring1 import transport_zmq
+
+        cls = (transport_zmq.HostTransportZmq if role == "HOST"
+               else transport_zmq.ReplicaTransportZmq)
+    return cls(cfg)
+
+
+def _agent_cert_dir() -> str:
+    """Stable across sessions, or the host's pinned fingerprint would break."""
+    return os.path.join(bpy.utils.user_resource("CONFIG"), "qcbridge-cert")
 
 _HANDSHAKE_TIMEOUT = 3.0
 _HANDSHAKE_RETRY = 2.0
@@ -135,6 +163,10 @@ def stop() -> None:
         role=None, transport=None, peer_epoch=None, note="", sync=None,
         prefs=None, ffmpeg_note="", peer_stream={}, shot_mode=False,
         peer_addon=None,
+        # Cleared here or a session stopped mid-resolve leaves it True and
+        # every later _start_pixel_path returns at the guard: sync works,
+        # the stream never starts again.
+        pixel_resolving=False,
     )
 
 
@@ -150,29 +182,52 @@ def _check_address(address: str) -> str:
         return f"replica address does not resolve: {address!r} — check preferences"
 
 
+def _effective_token(prefs, transport) -> str:
+    """The token in force. In agent mode the agent owns it and reports it at
+    attach; the addon's pref is the fallback, and the value for zmq."""
+    cfg = getattr(transport, "agent_config", None) or {}
+    return cfg.get("token") or prefs.token
+
+
+def _effective_peer_host(prefs, transport) -> str:
+    """The replica's address: the addon's, when given (an explicit override),
+    else the agent's configured peer. Feeds the SRT viewer URL, which is
+    the addon's business even though the connection is the agent's."""
+    if prefs.replica_address:
+        return prefs.replica_address
+    cfg = getattr(transport, "agent_config", None) or {}
+    return (cfg.get("peer") or "").rsplit(":", 1)[0]
+
+
 def _start_host(prefs) -> None:
-    address_error = _check_address(prefs.replica_address or "127.0.0.1")
+    agent = _use_agent(prefs)
+    # Agent mode: a blank address means the agent's own peer stands, so there
+    # is nothing to pre-check; the old "127.0.0.1" fallback would have
+    # overridden that peer with the loopback.
+    address_error = "" if (agent and not prefs.replica_address) else _check_address(prefs.replica_address or "127.0.0.1")
     cfg = TransportConfig(
-        address=prefs.replica_address or "127.0.0.1",
+        address=prefs.replica_address if agent else (prefs.replica_address or "127.0.0.1"),
         port_control=prefs.port_control,
         port_hot=prefs.port_hot,
         port_cold=prefs.port_cold,
+        token=prefs.token,
+        helper_path=getattr(prefs, "helper_path", ""),
+        fingerprint=getattr(prefs, "replica_fingerprint", ""),
     )
-    transport = HostTransportZmq(cfg)
+    transport = _make_transport(prefs, cfg, "HOST")
     transport.start()
     state["transport"] = transport
     state["note"] = address_error or "connecting"
+    if agent and hasattr(transport, "wait_attached"):
+        transport.wait_attached(3.0)  # agent_config — token, peer — arrives with `attached`
 
-    token = prefs.token
-    hello = protocol.make_hello(
-        token, state["epoch"], bpy.app.version_string,
-        addon_version=_addon_version(),
-    )
+    token = _effective_token(prefs, transport)
 
     # Fire-and-poll — this timer runs on Blender's main thread, and a dead
     # peer must never freeze the UI (it did: a blocking 3 s request per
     # retry bogged Blender down whenever the replica was unreachable).
-    pending = {"req": None, "sent_at": 0.0}
+    # Re-armable: a reconnect or a restarted replica pairs afresh (below).
+    pending = {"req": None, "sent_at": 0.0, "armed": False}
 
     def _handshake():
         import time as _time
@@ -181,6 +236,13 @@ def _start_host(prefs) -> None:
             return None  # session stopped/replaced
         now = _time.monotonic()
         if pending["req"] is None:
+            sync = state.get("sync")
+            hello = protocol.make_hello(
+                token, state["epoch"], bpy.app.version_string,
+                addon_version=_addon_version(),
+                seq=sync.seq if sync else 0,
+                seq_fast=getattr(sync, "seq_fast", 0) if sync else 0,
+            )
             pending["req"] = transport.request_nowait(hello)
             pending["sent_at"] = now
             return 0.25
@@ -191,14 +253,18 @@ def _start_host(prefs) -> None:
                 state["peer_stream"] = reply.get("stream") or {}
                 state["peer_addon"] = reply.get("addon", "")
                 state["note"] = "connected"
+                state["resync_policy"].reset()
                 # Fresh handshake = fresh epoch pairing → full bootstrap
-                # (decision #16; same-epoch transport blips reconnect
-                # without re-handshaking and just keep flowing).
+                # (decision #16). Transport blips re-handshake too, with a
+                # fresh host epoch, because frames sent into the outage are
+                # gone (SYNC-AUDIT A6) and the replica may be a new process.
                 state["sync"].send_bootstrap()
                 # Re-assert host-owned replica state a fresh session lost.
                 transport.request_nowait(
                     {"kind": "shot", "on": state["shot_mode"]}
                 )
+                pending["req"] = None
+                pending["armed"] = False
                 return None
             state["note"] = f"denied: {reply.get('reason', '')}"
             pending["req"] = None
@@ -210,12 +276,62 @@ def _start_host(prefs) -> None:
             return _HANDSHAKE_RETRY
         return 0.25
 
-    bpy.app.timers.register(_handshake, first_interval=0.1, persistent=True)
+    def _arm_handshake(note: str, new_epoch: bool) -> None:
+        if pending["armed"]:
+            return
+        if new_epoch:
+            import uuid as _uuid
+            state["epoch"] = _uuid.uuid4().hex  # the replica resets its seq tracker on a new epoch
+        pending["armed"] = True
+        pending["req"] = None
+        state["note"] = note
+        bpy.app.timers.register(_handshake, first_interval=0.1, persistent=True)
+
+    # Peer transitions arrive on the IO thread: flag them, act on the tick.
+    flags = {"lost": False, "reconnect": False}
+
+    def _on_peer(alive: bool) -> None:
+        if not alive:
+            flags["lost"] = True
+        elif flags["lost"]:
+            flags["reconnect"] = True
+
+    transport.on_peer_state(_on_peer)
+    state["resync_policy"] = liveness.ResyncPolicy()
+
+    def _watch():
+        """Main-thread watcher: reconnects, replica restarts, resync requests."""
+        import time as _time
+
+        if state["transport"] is not transport:
+            return None
+        if flags["lost"] and not flags["reconnect"] and not pending["armed"]:
+            state["note"] = "replica lost — waiting"
+        if flags["reconnect"]:
+            flags["reconnect"] = False
+            flags["lost"] = False
+            _arm_handshake("reconnected — re-syncing", new_epoch=True)
+            return 0.25
+        status = getattr(transport, "peer_status", {}) or {}
+        if not pending["armed"] and liveness.replica_restarted(status, state["peer_epoch"]):
+            _arm_handshake("replica restarted — re-syncing", new_epoch=True)
+            return 0.25
+        sync = state.get("sync")
+        if sync is not None and not pending["armed"] and state["resync_policy"].should_resync(
+            status, _time.monotonic()
+        ):
+            sync.send_bootstrap()
+            state["auto_resyncs"] = state.get("auto_resyncs", 0) + 1
+        return 0.25
+
+    _arm_handshake(address_error or "connecting", new_epoch=False)
+    bpy.app.timers.register(_watch, first_interval=0.5, persistent=True)
     host_hot.start(transport)
     state["sync"] = host_handlers.start(
         transport,
         paused_fn=lambda: state["paused"],
         mappings=_prefs_mappings(prefs),
+        cache_root=getattr(prefs, "cache_root", "") or "",
     )
 
 
@@ -225,9 +341,15 @@ def _start_replica(prefs) -> None:
         port_control=prefs.port_control,
         port_hot=prefs.port_hot,
         port_cold=prefs.port_cold,
+        token=prefs.token,
+        helper_path=getattr(prefs, "helper_path", ""),
+        cert_dir=_agent_cert_dir() if _use_agent(prefs) else "",
     )
-    transport = ReplicaTransportZmq(cfg)
-    token = prefs.token
+    transport = _make_transport(prefs, cfg, "REPLICA")
+    # The capture child is ours in both transports now: video leaves over SRT
+    # and never touches the connection.
+    pixel_path.set_external()
+    token = _effective_token(prefs, transport)
     epoch = state["epoch"]
 
     # Captured now (main thread) so the IO-thread handler touches no bpy.
@@ -246,7 +368,7 @@ def _start_replica(prefs) -> None:
             ok, reason = protocol.check_hello(msg, token)
             if ok:
                 if state["peer_epoch"] != msg.get("epoch"):
-                    replica_apply.notify_new_session()
+                    replica_apply.notify_new_session(msg.get("seq", 0), msg.get("seq_fast", 0))
                 state["peer_epoch"] = msg.get("epoch")
                 state["peer_addon"] = msg.get("addon", "")
                 state["note"] = "host connected"
@@ -276,6 +398,18 @@ def _start_replica(prefs) -> None:
             "gaps": replica_apply.stats["gaps"],
             "errors": replica_apply.stats["apply_errors"],
             "unknown": replica_apply.stats["unknown_uuid"],
+            # Everything else the replica knows and the host could not see
+            # (SYNC-AUDIT §4.2): who we are, what we want, what went wrong.
+            "epoch": epoch,
+            "want_resync": replica_apply.stats["want_resync"],
+            "seq_fast": replica_apply.stats["seq_fast"],
+            "parked": replica_apply.stats["parked"],
+            "bootstraps": replica_apply.stats["bootstraps"],
+            "unmapped": replica_apply.stats["unmapped_paths"],
+            "frozen": replica_apply.stats["frozen_caches"],
+            "last_error": replica_apply.stats["last_error"][:120],
+            "local_edits": replica_apply.stats["local_edits"],
+            "last_local_edit": replica_apply.stats["last_local_edit"][:60],
             # Encoder state rides along so the HOST panel can say why a
             # viewer can't connect without anyone remoting to the replica.
             "pixel": pixel_path.status(),
@@ -317,9 +451,11 @@ def _start_pixel_path(prefs) -> None:
     state["pixel_resolving"] = True
     # bpy reads happen HERE, main thread; the worker gets plain strings.
     args = (
-        prefs.ffmpeg_path, prefs.encoder_rung, _replica_srt_url(prefs),
-        protocol.srt_passphrase(prefs.token),
+        prefs.ffmpeg_path, prefs.encoder_rung,
+        _replica_srt_url(prefs),
+        protocol.srt_passphrase(_effective_token(prefs, state.get("transport"))),
     )
+    transport = state.get("transport")
 
     def _resolve_and_start():
         try:
@@ -369,12 +505,16 @@ def viewer_url() -> str:
     prefs = state.get("prefs")
     if not stream.get("enabled") or prefs is None:
         return ""
+    transport = state.get("transport")
+    host_addr = _effective_peer_host(prefs, transport)
+    if not host_addr:
+        return ""
     latency_us = int(stream.get("latency_ms", 120)) * 1000
     url = (
-        f"srt://{prefs.replica_address}:{stream.get('port', 9998)}"
+        f"srt://{host_addr}:{stream.get('port', 9998)}"
         f"?mode=caller&latency={latency_us}"
     )
-    passphrase = protocol.srt_passphrase(prefs.token)
+    passphrase = protocol.srt_passphrase(_effective_token(prefs, transport))
     if passphrase:
         url += f"&passphrase={passphrase}&pbkeylen=16"
     return url
@@ -444,6 +584,9 @@ def _replica_overlay_text() -> str:
     now = _time.time()
     clock = _time.strftime("%H:%M:%S", _time.localtime(now)) + f".{int(now * 10) % 10}"
     bits = [f"● live · seq {stats['seq']} · {clock}"]
+    st = getattr(transport, "stats", None) or {}
+    if st.get("rtt_ms") is not None:
+        bits.append(f"rtt {st['rtt_ms']:.0f} ms")
     if _version_warning():
         bits.append("⚠ version mismatch")
     if stats["gaps"]:
@@ -452,6 +595,16 @@ def _replica_overlay_text() -> str:
         bits.append(f"⚠ {stats['apply_errors']} apply errors")
     if stats["unknown_uuid"]:
         bits.append(f"⚠ {stats['unknown_uuid']} unknown")
+    if stats["want_resync"]:
+        bits.append("⟳ resync requested")
+    if stats["unmapped_paths"]:
+        bits.append(f"⚠ {stats['unmapped_paths']} unmapped paths")
+    if stats["frozen_caches"]:
+        bits.append(f"⚠ {stats['frozen_caches']} frozen disk caches")
+    if stats["last_error"]:
+        bits.append(f"⚠ {stats['last_error'][:48]}")
+    if stats["local_edits"]:
+        bits.append(f"⚠ edited here: {stats['last_local_edit'][:32]} ({stats['local_edits']})")
     return " · ".join(bits)
 
 
@@ -468,6 +621,30 @@ def status_text() -> str:
         )
     if state["paused"]:
         bits.append("paused")
+    # Agent link state: where the connection actually lives.
+    if getattr(transport, "agent_mode", False):
+        bits.append(f"agent {getattr(transport, 'agent_version', '') or '?'}")
+        ac = getattr(transport, "agent_config", None) or {}
+        if ac.get("name"):
+            bits.append(f"as {ac['name']}")
+        if state["role"] == "HOST" and ac.get("peer"):
+            bits.append(f"→ {ac['peer']}")
+        if state["role"] == "REPLICA" and ac.get("discovery"):
+            bits.append({"off": "not reachable", "direct": "reachable by address",
+                         "discoverable": "discoverable on the LAN"}.get(ac["discovery"], ac["discovery"]))
+    note = getattr(transport, "link_note", "")
+    if note:
+        bits.append(f"link: {note}")
+    st = getattr(transport, "stats", None) or {}
+    if st.get("rtt_ms") is not None:
+        bits.append(
+            f"rtt {st['rtt_ms']:.0f} ms · lost {st.get('quic_lost', 0)}"
+            f" · ↑{st.get('tx_mbps', 0):.1f} ↓{st.get('rx_mbps', 0):.1f} Mb/s"
+        )
+    fp = getattr(transport, "peer_fingerprint", "")
+    if fp and state["role"] == "HOST":
+        pinned = getattr(transport, "peer_pinned", True)
+        bits.append(f"replica cert {fp[:8]}…{'' if pinned else ' (new — pinned on first use)'}")
     sync = state.get("sync")
     if sync is not None and len(sync.dirty):
         t1, t2, tomb = sync.dirty.counts()
@@ -488,8 +665,27 @@ def status_text() -> str:
                 f" (gaps {peer.get('gaps', 0)}, unknown {peer.get('unknown', 0)},"
                 f" errors {peer.get('errors', 0)}, unsent {sync.t2_unsupported})"
             )
+        if peer.get("want_resync"):
+            bits.append("⟳ replica asked for a resync — sending")
+        if state.get("auto_resyncs"):
+            bits.append(f"auto-resyncs {state['auto_resyncs']}")
+        if getattr(sync, "t2_skipped", 0):
+            bits.append(f"unchanged blobs skipped {sync.t2_skipped}")
+        if peer.get("unmapped"):
+            bits.append(f"⚠ replica: {peer['unmapped']} unmapped paths — check path mappings")
+        if peer.get("frozen"):
+            bits.append(f"⚠ replica: {peer['frozen']} disk caches frozen — use an external cache path")
+        if peer.get("last_error"):
+            bits.append(f"⚠ replica error: {peer['last_error'][:60]}")
+        if peer.get("local_edits"):
+            bits.append(f"⚠ replica edited locally: {peer.get('last_local_edit', '')[:40]} ({peer['local_edits']}) — Force Resync overrides")
+        dropped = getattr(transport, "cold_dropped", 0)
+        if dropped:
+            bits.append(f"⚠ {dropped} frames dropped by the agent")
         if getattr(sync, "bake_note", ""):
             bits.append(f"⚠ {sync.bake_note} — Force Resync ships it")
+        if getattr(sync, "cache_note", ""):
+            bits.append(sync.cache_note)
     if state["role"] == "REPLICA":
         bits.append(_replica_overlay_text())
         bits.append(state.get("ffmpeg_note", ""))

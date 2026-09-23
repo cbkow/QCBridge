@@ -1,0 +1,73 @@
+"""Probe smoke host: default scene, stamped hot packets, constant orbit.
+
+Env: QCB_SMOKE_REPLICA (127.0.0.1), QCB_SMOKE_TOKEN (smoketok),
+QCB_SMOKE_SRT_LATENCY (60), QCB_SMOKE_ENGINE (e.g. CYCLES, BLENDER_EEVEE)."""
+import json, os, sys, time  # noqa: E401
+from types import SimpleNamespace
+import bpy
+
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+OUT = sys.argv[sys.argv.index("--") + 1]  # work dir: pysite/ (unzipped pyzmq wheel) + json dumps
+sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.join(OUT, "pysite"))
+from qcbridge.ring0 import session  # noqa: E402
+
+E = os.environ.get
+prefs = SimpleNamespace(
+    role="HOST", replica_address=E("QCB_SMOKE_REPLICA", "127.0.0.1"), bind_address="0.0.0.0",
+    port_control=19990, port_hot=19991, port_cold=19992, token=E("QCB_SMOKE_TOKEN", "smoketok"),
+    enable_stream=True, srt_port=19998, srt_url="",
+    srt_latency_ms=int(E("QCB_SMOKE_SRT_LATENCY", "60")),
+    encoder_rung="hevc_10_420_50", ffmpeg_path="", replica_kiosk=False,
+    path_mappings=[],
+)
+# Render engine rides the bootstrap to the replica (whose viewport is Rendered).
+if E("QCB_SMOKE_ENGINE"):
+    bpy.context.scene.render.engine = E("QCB_SMOKE_ENGINE")
+    if E("QCB_SMOKE_ENGINE") == "CYCLES":
+        bpy.context.scene.cycles.device = "GPU"  # replica picks the backend
+# Bootstrap bench: QCB_SMOKE_HEAVY=N adds N million random-offset vertices
+# (incompressible-ish mesh data) so the bootstrap blob is large.
+if E("QCB_SMOKE_HEAVY"):
+    import random
+
+    import bmesh
+    n = int(float(E("QCB_SMOKE_HEAVY")) * 1_000_000)
+    mesh = bpy.data.meshes.new("Heavy")
+    mesh.vertices.add(n)
+    rnd = random.Random(7)
+    mesh.vertices.foreach_set("co", [rnd.uniform(-5, 5) for _ in range(n * 3)])
+    mesh.update()
+    obj = bpy.data.objects.new("Heavy", mesh)
+    obj.hide_viewport = True  # bench the wire, not the viewport
+    bpy.context.scene.collection.objects.link(obj)
+_T_START = time.time()
+session.start(prefs)
+
+_boot = {"s": None}
+
+
+def _dump():
+    transport = session.state.get("transport")
+    status = getattr(transport, "peer_status", None) or {}
+    # Transfer time on the host clock alone: every cold message the host has
+    # sent (bootstrap chunks included) is counted by the replica and reported
+    # back on its pong. Done = the replica's seq caught up with ours. Pongs
+    # are 1 s apart, so this is good to about a second.
+    sync = session.state.get("sync")
+    sent = getattr(sync, "seq", 0)
+    if (_boot["s"] is None and sent > 0 and status.get("seq") == sent
+            and getattr(sync, "last_bootstrap_bytes", 0)):
+        _boot["s"] = round(time.time() - _T_START, 2)
+    d = {"t": time.time(), "t_start": _T_START, "note": session.state.get("note"),
+         "peer": status, "boot_s": _boot["s"],
+         "boot_bytes": getattr(session.state.get("sync"), "last_bootstrap_bytes", None),
+         "link_note": getattr(transport, "link_note", ""),
+         "peer_fingerprint": getattr(transport, "peer_fingerprint", ""),
+         "transport_stats": getattr(transport, "stats", None),
+         "sync_seq": getattr(session.state.get("sync"), "seq", None)}
+    with open(os.path.join(OUT, "host.json"), "w") as f:
+        json.dump(d, f, default=str)
+    return float(E("QCB_SMOKE_DUMP", "1.0"))
+
+bpy.app.timers.register(_dump, first_interval=1.0, persistent=True)

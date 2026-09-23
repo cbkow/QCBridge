@@ -8,3 +8,10 @@ __pycache__/
 .venv/
 dist/
 .pytest_cache/
+
+# built bench binaries (spikes/parity/mux-tax)
+spikes/parity/mux-tax/qcb-stamp
+spikes/parity/mux-tax/muxsend.o
+
+# Rust build dir (was committed by accident on main, 2026-09-22)
+agent/target/

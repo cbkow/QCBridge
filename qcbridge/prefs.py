@@ -174,6 +174,7 @@ _SETTINGS_FIELDS = (
     "role", "replica_address", "bind_address", "port_control", "port_hot",
     "port_cold", "token", "enable_stream", "srt_port", "srt_url",
     "srt_latency_ms", "encoder_rung", "ffmpeg_path", "replica_kiosk",
+    "cache_root",
 )
 
 
@@ -332,6 +333,56 @@ class QCB_OT_open_qcview(Operator):
         return {"FINISHED"}
 
 
+def _agent_transport():
+    """The running agent-mode transport, or None."""
+    t = session.state.get("transport")
+    return t if (t is not None and getattr(t, "agent_mode", False)) else None
+
+
+class QCB_OT_discover(Operator):
+    bl_idname = "qcbridge.discover"
+    bl_label = "Find Replicas"
+    bl_description = (
+        "Ask the agent for replicas: probe the address above if one is set "
+        "(works over a VPN), otherwise sweep the LAN and the phonebook"
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return session.running() and _agent_transport() is not None and session.state["role"] == "HOST"
+
+    def execute(self, context):
+        prefs = get_prefs(context)
+        t = _agent_transport()
+        t.discover(prefs.replica_address.strip() or None)
+        self.report({"INFO"}, "asking the agent…")
+        return {"FINISHED"}
+
+
+class QCB_OT_pick_peer(Operator):
+    bl_idname = "qcbridge.pick_peer"
+    bl_label = "Use This Replica"
+    bl_description = "Point the agent at this replica and pin its certificate"
+    bl_options = {"INTERNAL"}
+
+    index: bpy.props.IntProperty()
+
+    def execute(self, context):
+        t = _agent_transport()
+        if t is None or not (0 <= self.index < len(t.peers)):
+            return {"CANCELLED"}
+        p = t.peers[self.index]
+        if p.get("role") != "replica" or not p.get("port"):
+            self.report({"WARNING"}, "that is not a replica you can pair to")
+            return {"CANCELLED"}
+        t.set_config(peer=f"{p['ip']}:{p['port']}", fingerprint=p.get("fp", ""))
+        # The SRT viewer URL is assembled here from replica_address, so keep
+        # it in step with the peer the agent will dial.
+        get_prefs(context).replica_address = p["ip"]
+        self.report({"INFO"}, f"agent now dials {p.get('n') or p['ip']}")
+        return {"FINISHED"}
+
+
 class QCB_OT_copy_stream_url(Operator):
     bl_idname = "qcbridge.copy_stream_url"
     bl_label = "Copy Stream URL"
@@ -439,21 +490,63 @@ class QCBridgePreferences(AddonPreferences):
     path_mappings: CollectionProperty(type=QCB_PathMapping)
     active_mapping_index: IntProperty(default=0)
 
+    # Simulation caches (CACHES.md §4 B): a disk cache lives in
+    # //blendcache_<file>/, which the replica's temp copy can never share.
+    # With a root on the mapped volume the host externalizes every unbaked
+    # point cache there BEFORE it is baked, and a bake on the host is a
+    # bake on the replica after a settings-only resend. Opt-in: it moves
+    # where the user's caches live.
+    cache_root: StringProperty(
+        name="Shared cache root",
+        description="Directory on the shared volume (path-mapped) where point "
+                    "caches are written so the replica reads the same frames. "
+                    "Set it before baking: an existing bake must be re-baked "
+                    "to move. Empty = off",
+        subtype="DIR_PATH",
+        default="",
+    )
+
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "role")
 
         box = layout.box()
-        box.label(text="Connection")
-        if self.role == "HOST":
-            box.prop(self, "replica_address")
+        agent_mode = session._use_agent(self)
+        if agent_mode:
+            # The agent owns the connection. What it reports is shown while a
+            # session is attached; the fields below are overrides and the
+            # zmq fallback, not the source of truth.
+            box.label(text="Connection — managed by the QCBridge Agent", icon="LINKED")
+            t = _agent_transport()
+            ac = getattr(t, "agent_config", None) or {}
+            if ac:
+                col = box.column(align=True)
+                col.label(text=f"Agent: {ac.get('name', '?')}  ·  role {ac.get('role', '?')}")
+                if self.role == "HOST":
+                    col.label(text=f"Dials: {ac.get('peer') or '(none set)'}")
+                    fp = ac.get("fingerprint") or ""
+                    col.label(text=f"Pinned replica cert: {fp[:16] + '…' if fp else '(learn on first use)'}")
+                else:
+                    col.label(text=f"Listens: {ac.get('listen', '?')}  ·  {ac.get('discovery', '?')}")
+            else:
+                box.label(text="Start a session to see the agent's settings", icon="INFO")
+            if self.role == "HOST":
+                box.prop(self, "replica_address", text="Address override (blank = agent's peer)")
+            else:
+                box.prop(self, "bind_address")
+            box.prop(self, "port_control", text="Port (when overriding)")
+            box.prop(self, "token", text="Token (fallback)")
         else:
-            box.prop(self, "bind_address")
-        row = box.row(align=True)
-        row.prop(self, "port_control")
-        row.prop(self, "port_hot")
-        row.prop(self, "port_cold")
-        box.prop(self, "token")
+            box.label(text="Connection")
+            if self.role == "HOST":
+                box.prop(self, "replica_address")
+            else:
+                box.prop(self, "bind_address")
+            row = box.row(align=True)
+            row.prop(self, "port_control")
+            row.prop(self, "port_hot")
+            row.prop(self, "port_cold")
+            box.prop(self, "token")
 
         if self.role == "REPLICA":
             box = layout.box()
@@ -471,6 +564,11 @@ class QCBridgePreferences(AddonPreferences):
         row = layout.row(align=True)
         row.operator("qcbridge.settings_save", icon="EXPORT")
         row.operator("qcbridge.settings_load", icon="IMPORT")
+
+        box = layout.box()
+        box.label(text="Simulation caches")
+        box.prop(self, "cache_root")
+        box.label(text="Set before baking; baked caches stay put until re-baked.", icon="INFO")
 
         box = layout.box()
         box.label(text="Path Mappings (Windows root ↔ macOS root)")
@@ -520,6 +618,24 @@ class QCB_PT_main(Panel):
                 op.delta = 6.0
                 op = row.operator("qcbridge.replica_zoom", text="", icon="LOOP_BACK")
                 op.reset = True
+                t = _agent_transport()
+                if t is not None:
+                    box = layout.box()
+                    row = box.row(align=True)
+                    row.prop(prefs, "replica_address", text="", placeholder="address to probe, or blank to sweep")
+                    row.operator("qcbridge.discover", text="", icon="VIEWZOOM")
+                    peers = list(getattr(t, "peers", []))
+                    if peers:
+                        srcs = ", ".join(getattr(t, "peers_sources", []))
+                        box.label(text=f"Found via {srcs}:" if srcs else "Found:")
+                        for i, p in enumerate(peers):
+                            state = "in a session" if p.get("paired") else "free"
+                            op = box.operator(
+                                "qcbridge.pick_peer",
+                                text=f"{p.get('n') or p.get('ip')}  ·  {p.get('ip')}:{p.get('port')}  ·  {state}",
+                                icon="LINKED" if p.get("paired") else "UNLINKED",
+                            )
+                            op.index = i
         else:
             layout.operator("qcbridge.session_start", icon="PLAY")
         if prefs.role == "REPLICA":
@@ -547,6 +663,8 @@ _classes = (
     QCB_OT_replica_zoom,
     QCB_OT_open_qcview,
     QCB_OT_copy_stream_url,
+    QCB_OT_discover,
+    QCB_OT_pick_peer,
     QCBridgePreferences,
     QCB_PT_main,
 )

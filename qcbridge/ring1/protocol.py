@@ -24,6 +24,9 @@ _HOT_MAGIC = b"QCB2"
 FLAG_PERSP = 1 << 0
 FLAG_HOLD = 1 << 1  # reserved: follow/hold ships stage 3
 FLAG_CAMERA = 1 << 2  # host viewport is looking through the camera
+# Parity-spike probe (ring1/probe.py): optional trailing host wall clock +
+# seq. Absent unless QCB_PROBE=1, so production packets are unchanged.
+_HOT_PROBE = struct.Struct("<dI")
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,8 @@ class HotState:
     camera: bool = False       # view_perspective == 'CAMERA'
     cam_zoom: float = 0.0      # rv3d.view_camera_zoom
     cam_offset: tuple = (0.0, 0.0)
+    t_host: float = 0.0        # probe only: host time.time() at sampling
+    probe_seq: int = 0         # probe only
 
     def pack(self) -> bytes:
         flags = (
@@ -51,14 +56,23 @@ class HotState:
             _HOT_MAGIC, flags, self.frame,
             self.lens, self.clip_start, self.clip_end, *self.view_matrix,
             self.cam_zoom, self.cam_offset[0], self.cam_offset[1],
-        )
+        ) + (_HOT_PROBE.pack(self.t_host, self.probe_seq) if self.t_host else b"")
+
+
+def hot_core(data: bytes) -> bytes:
+    """The view/frame part of a hot packet — what dedup compares. Probe
+    stamps change every tick and must not defeat the static-view dedup."""
+    return data[: _HOT.size]
 
 
 def unpack_hot(data: bytes) -> HotState | None:
-    if len(data) != _HOT.size:
+    t_host, probe_seq = 0.0, 0
+    if len(data) == _HOT.size + _HOT_PROBE.size:
+        t_host, probe_seq = _HOT_PROBE.unpack(data[_HOT.size:])
+    elif len(data) != _HOT.size:
         return None
     (magic, flags, frame, lens, clip_start, clip_end,
-     *rest) = _HOT.unpack(data)
+     *rest) = _HOT.unpack(data[: _HOT.size])
     if magic != _HOT_MAGIC:
         return None
     matrix, cam = rest[:16], rest[16:]
@@ -68,6 +82,7 @@ def unpack_hot(data: bytes) -> HotState | None:
         is_persp=bool(flags & FLAG_PERSP), hold=bool(flags & FLAG_HOLD),
         camera=bool(flags & FLAG_CAMERA),
         cam_zoom=cam[0], cam_offset=(cam[1], cam[2]),
+        t_host=t_host, probe_seq=probe_seq,
     )
 
 
@@ -99,12 +114,17 @@ def srt_passphrase(token: str) -> str:
 
 
 def make_hello(
-    token: str, epoch: str, blender_version: str, addon_version: str = ""
+    token: str, epoch: str, blender_version: str, addon_version: str = "",
+    seq: int = 0, seq_fast: int = 0,
 ) -> dict:
     return {
         "kind": "hello",
         "token": token,
         "epoch": epoch,
+        # Where the host's lane counters stand, so the replica primes its
+        # trackers: a lost first message after a re-handshake is still a gap.
+        "seq": seq,
+        "seq_fast": seq_fast,
         "protocol": PROTOCOL_VERSION,
         "blender": blender_version,
         # Informational, never gates the handshake: mismatched ends mostly
@@ -127,7 +147,8 @@ def check_hello(msg: dict, expected_token: str) -> tuple[bool, str]:
 
 # ── cold channel ─────────────────────────────────────────────────────────────
 # Message kinds: "t1" (property deltas), "t2" (datablock blob), "tomb"
-# (tombstone), "boot" (bootstrap blob), "sync" (flush markers).
+# (tombstone), "boot" (bootstrap blob). Fast-lane messages ("t1", "tomb")
+# carry lane="f" and `after` (ring1/merge.py).
 
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
 
@@ -156,13 +177,15 @@ def chunk_blob(
     """Yield (header, payload) cold messages for one blob. `meta` rides on
     every chunk (chunks may be inspected before the blob completes)."""
     total = max(1, -(-len(data) // chunk_size))
+    view = memoryview(data)  # slices are views: no copy per chunk
     for i in range(total):
         header = {
             "kind": kind,
-            "blob": {"id": blob_id, "i": i, "n": total, "size": len(data)},
+            "blob": {"id": blob_id, "i": i, "n": total, "size": len(data),
+                     "o": i * chunk_size},  # offset: assemble in place
             **(meta or {}),
         }
-        yield header, data[i * chunk_size : (i + 1) * chunk_size]
+        yield header, view[i * chunk_size : (i + 1) * chunk_size]
 
 
 @dataclass
@@ -170,7 +193,8 @@ class _PartialBlob:
     total: int
     size: int
     header: dict
-    parts: dict = field(default_factory=dict)
+    buf: bytearray = field(default_factory=bytearray)  # the blob, assembled in place
+    got: set = field(default_factory=set)
 
 
 class Reassembler:
@@ -193,16 +217,19 @@ class Reassembler:
         part = self._partial.get(blob_id)
         if part is None:
             part = self._partial[blob_id] = _PartialBlob(
-                total=n, size=blob["size"], header=header
+                total=n, size=blob["size"], header=header, buf=bytearray(blob["size"])
             )
-        part.parts[i] = payload
-        if len(part.parts) < part.total:
+        offset = blob.get("o", i * len(payload))
+        end = offset + len(payload)
+        if end > part.size:
+            del self._partial[blob_id]
+            return None  # corrupt chunk — drop; caller's gap detection escalates
+        part.buf[offset:end] = payload  # the one copy, straight into place
+        part.got.add(i)
+        if len(part.got) < part.total:
             return None
         del self._partial[blob_id]
-        data = b"".join(part.parts[j] for j in range(part.total))
-        if len(data) != part.size:
-            return None  # corrupt reassembly — drop; caller's gap detection escalates
-        return part.header, data
+        return part.header, part.buf
 
     def drop(self, blob_id: str) -> None:
         self._partial.pop(blob_id, None)

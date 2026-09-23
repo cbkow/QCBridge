@@ -23,14 +23,17 @@ import idprop
 import mathutils
 
 from ..ring1 import protocol
-from ..ring1.classifier import Debouncer, classify_update
+from ..ring1.classifier import DEBOUNCE_S, Debouncer, classify_update
 from ..ring1.dirtyset import DirtySet, Tier
 from ..ring1.registry import IdentityRegistry
 from ..ring1.shadow import TRACKED, ShadowStore
 from . import bootstrap, identity, tier2_io
 
-_FLUSH_TICK = 0.05
-_SWEEP_INTERVAL = 0.5
+_FLUSH_TICK = 0.025   # was 0.05: up to a tick of latency on every delta
+_SWEEP_INTERVAL = 0.25  # was 0.5: eye toggles, renames, custom props ride this
+_AUTO_BOOT_DEBOUNCE = 1.0    # wait for the burst of Scene edits to end
+_AUTO_BOOT_MIN_INTERVAL = 5.0  # never more than one automatic bootstrap per
+_T2_PER_TICK = 2  # libraries.write is a main-thread stall; spread a storm over ticks (D3)
 _DEBUG = bool(os.environ.get("QCB_DEBUG"))
 
 # bpy ID type → shadow.TRACKED key (isinstance covers subclasses, e.g. the
@@ -47,8 +50,17 @@ _TYPE_KEYS = {
 }
 
 
+_lc_memo: tuple[float, dict] = (0.0, {})
+
+
 def _layer_collections():
-    """collection session_uid → LayerCollection, for the active view layer."""
+    """collection session_uid → LayerCollection, for the active view layer.
+    Memoised for 50 ms: build_snapshot asked once per collection, an O(n²)
+    main-thread walk on collection-heavy scenes (SYNC-AUDIT D6)."""
+    global _lc_memo
+    now = time.monotonic()
+    if now - _lc_memo[0] < 0.05:
+        return _lc_memo[1]
     result = {}
 
     def walk(lc):
@@ -57,41 +69,92 @@ def _layer_collections():
             walk(child)
 
     walk(bpy.context.view_layer.layer_collection)
+    _lc_memo = (now, result)
     return result
+
+# Geometry datablocks the depsgraph pings with a shading-only update when a
+# material or image they wear changes. An Action's keyframe edit also arrives
+# as shade=True (measured 5.2), so the skip is by type, not by flag alone.
+_SHADING_PINGED = (
+    bpy.types.Mesh, bpy.types.Curve, bpy.types.Curves, bpy.types.PointCloud,
+    bpy.types.Volume, bpy.types.MetaBall, bpy.types.GreasePencil, bpy.types.Lattice,
+)
 
 # Collections swept for deletions (only types we stamp/track).
 _SWEPT_COLLECTIONS = (
     "objects", "lights", "cameras", "materials", "worlds", "scenes", "meshes",
     "curves", "images", "node_groups", "collections", "actions", "shape_keys",
-    "lattices", "armatures",
+    "lattices", "armatures", "metaballs", "volumes", "hair_curves",
+    "pointclouds", "lightprobes", "grease_pencils", "textures", "particles",
+    "cache_files",
 )
 
 
 class HostSync:
-    def __init__(self, transport, paused_fn, mappings=()) -> None:
+    def __init__(self, transport, paused_fn, mappings=(), cache_root: str = "") -> None:
         self.transport = transport
         self.paused_fn = paused_fn
         self.mappings = list(mappings)
+        # Shared cache root (CACHES.md §4 B): unbaked point caches become
+        # external files under it, so the replica reads the same frames.
+        self.cache_root = os.path.abspath(bpy.path.abspath(cache_root)) if cache_root else ""
+        self.cache_note = ""
+        self.externalized = 0
         self._boot_outbox: list[tuple[dict, bytes]] = []
+        # Tier-2 blobs mid-flight under backpressure, per uuid: the next
+        # tick resumes from the chunk that was refused instead of
+        # re-serializing and restarting from chunk 0 (SYNC-AUDIT B3). A
+        # newer escalation of the same uuid replaces the entry.
+        self._t2_outbox: dict[str, list[tuple[dict, bytes]]] = {}
         self.sent_boot = 0
         self.registry = IdentityRegistry()
         self.shadow = ShadowStore()
         self.debounce = Debouncer()
         self.dirty = DirtySet()
-        self.seq = 0
+        self.seq = 0            # cold lane: bootstraps and blobs
+        self.seq_fast = 0       # fast lane: tier-1 deltas and tombstones
+        # Ordering across the two lanes: every fast message names the cold
+        # seq it must follow — the last chunk of the newest blob for its
+        # datablock, or the last bootstrap chunk, whichever is later.
+        self._uuid_cold_seq: dict[str, int] = {}
+        self._boot_last_seq = 0
         self.sent_t1 = 0
         self.sent_t2 = 0
         self.t2_unsupported = 0
-        self.bake_note = ""  # a sim bake appeared/vanished — panel nags for
-                             # Force Resync until one ships. A tier-2 resend
-                             # DOES carry the cache frames (re-probed 5.2,
-                             # 2026-09-18, correcting the older "only the
-                             # full save carries cache data"); what it loses
-                             # is is_baked, so the replica's copy is unbaked
-                             # and re-simulates on the next edit. Only tier 3
-                             # carries the bake intact.
+        self.bake_note = ""  # a sim bake appeared/vanished: only tier 3
+                             # carries cache data (probed 5.2) — panel nags
+                             # for Force Resync until one ships
         self.sync_errors = 0
         self.last_sync_error = ""
+        # uuids the replica holds: everything with users at the last
+        # bootstrap (a full save writes no orphans) plus every blob since.
+        # A pointer to anything else ships that datablock first.
+        self._shipped: set[str] = set()
+        # blake2b of the last blob sent per uuid. libraries.write is
+        # deterministic for unchanged data (probed 2026-09-23), so an
+        # identical blob — an edit-mode pause with no edit, an undo that
+        # touched everything and changed nothing — need not go again. Cleared
+        # at every bootstrap: the file may carry state no blob did.
+        self._blob_hash: dict[str, bytes] = {}
+        self.t2_skipped = 0
+        # After a bootstrap the map is empty, so an undo that touches
+        # everything and changes nothing would still resend everything
+        # (measured: 34 blobs for one Ctrl-Z). Idle ticks prime it: two
+        # datablocks per tick, serialized and hashed, until every tier-2
+        # capable one has an entry.
+        self._prime_queue: list[str] = []
+        self.primed = 0
+        # Linked libraries (decision #15 scope guard lifted 2026-09-23): the
+        # linked IDs are never stamped, so they ride a "link" message naming
+        # the library file and the datablocks the scene uses from it; the
+        # replica links the same names from the mapped path. Later fast
+        # messages that name them wait behind the link's cold seq.
+        self._lib_state: dict[str, tuple] = {}
+        self._link_seq = 0
+        self.links_sent = 0
+        self._auto_boot_at = 0.0     # monotonic; 0 = none pending
+        self._last_auto_boot = float("-inf")
+        self.auto_boots = 0
         # Nothing marks until the first bootstrap is serialized: every edit
         # and every depsgraph batch before that moment — the file-open
         # flood, pre-session edits, our own uuid stamping — is inside the
@@ -105,6 +168,7 @@ class HostSync:
         self._in_handler = False
         self._drop_next_batch = False
         self._initial_scan()
+        self._externalize_caches()  # before the bootstrap: the file carries the paths
 
     def _sweep_visibility(self) -> None:
         """Visibility changes don't reliably produce depsgraph events: the
@@ -117,8 +181,10 @@ class HostSync:
         Point-cache state rides the same sweep for the same reason: a bake
         finishing (job thread) or Delete Bake gives no dependable event for
         the owning object; the flush diff sees "~pcache" change and
-        escalates to tier 2, which carries the cache frames but not the
-        baked flag — hence bake_note and the nag for a Force Resync."""
+        escalates to tier 2. That partial blend carries a memory cache's
+        frames but not the baked flag, and an unbaked cache is re-simulated
+        on a frame jump (probed 2026-09-23, CACHES.md) — so what crosses is
+        inert. Hence bake_note and the nag for a Force Resync."""
         now = time.monotonic()
         for obj in bpy.data.objects:
             uuid = self.registry.uuid_for(obj.session_uid)
@@ -128,18 +194,18 @@ class HostSync:
             old = self._vis_state.get(uuid)
             if old != vector:
                 if old is not None and len(old) >= 4:
-                    # A bake appearing/disappearing needs tier 3: the tier-2
-                    # partial blend does NOT contain cache data (probed —
-                    # only the full save does). Settings still resend via
-                    # the "~pcache" escalation; the bake itself waits on a
-                    # manual Force Resync (resync stays manual, decision #8).
+                    # A bake appearing/disappearing needs tier 3: the frames
+                    # in the tier-2 partial arrive unbaked and are not read
+                    # on a frame jump (CACHES.md §2). Settings still resend
+                    # via the "~pcache" escalation; the bake itself waits on
+                    # a manual Force Resync (resync stays manual, decision #8).
                     old_on = {row[0] for row in old[3] if row[1]}
                     new_on = {row[0] for row in vector[3] if row[1]}
                     if old_on != new_on:
                         self.bake_note = f"sim bake changed ({obj.name})"
                 self._vis_state[uuid] = vector
                 self.dirty.mark(uuid, Tier.T1)
-                self.debounce.touch(uuid, now)
+                self._touch_ready(uuid, now)
         layer_collections = _layer_collections()
         for coll in bpy.data.collections:
             uuid = self.registry.uuid_for(coll.session_uid)
@@ -151,11 +217,39 @@ class HostSync:
                 lc.hide_viewport if lc else None,
                 coll.hide_viewport,
                 coll.hide_render,
+                _idprops_digest(coll),
             )
             if self._vis_state.get(uuid) != vector:
                 self._vis_state[uuid] = vector
                 self.dirty.mark(uuid, Tier.T1)
-                self.debounce.touch(uuid, now)
+                self._touch_ready(uuid, now)
+        for coll_name in _SWEPT_T1_TYPES:
+            for db in getattr(bpy.data, coll_name):
+                uuid = self.registry.uuid_for(db.session_uid)
+                if uuid is None:
+                    continue
+                vector = _datablock_sweep_vector(db)
+                if self._vis_state.get(uuid) != vector:
+                    self._vis_state[uuid] = vector
+                    self.dirty.mark(uuid, Tier.T1)
+                    self._touch_ready(uuid, now)
+        # Mesh custom props: tier-2-only type, the blob carries them.
+        for me in bpy.data.meshes:
+            uuid = self.registry.uuid_for(me.session_uid)
+            if uuid is None:
+                continue
+            digest = _idprops_digest(me)
+            if self._vis_state.get(uuid) != digest:
+                if uuid in self._vis_state:  # first sample primes only
+                    self.dirty.mark(uuid, Tier.T2)
+                    self._touch_ready(uuid, now)
+                self._vis_state[uuid] = digest
+
+    def _touch_ready(self, uuid: str, now: float) -> None:
+        """A sweep-detected change is already coalesced by the sweep cadence;
+        it flushes on this very tick instead of waiting a debounce window
+        (the sweep runs before the drain — SYNC-AUDIT C2)."""
+        self.debounce.touch(uuid, now - DEBOUNCE_S)
 
     def reset_for_new_file(self) -> None:
         """The host opened a different file (or a new one) mid-session: all
@@ -190,6 +284,11 @@ class HostSync:
                 uuid = identity.ensure_uuid(db, self.registry)
                 self._uuid_to_db[uuid] = db
                 self.dirty.assume_known(uuid)
+                if db.users == 0 and not db.use_fake_user:
+                    # A full save writes no orphans: the replica does NOT
+                    # have this one. Leave its shadow unprimed so the first
+                    # reference or edit ships it whole (first contact).
+                    continue
                 if _type_key(db) is not None:
                     snapshot = build_snapshot(db)
                     self.shadow.diff_and_update(uuid, snapshot)
@@ -216,9 +315,32 @@ class HostSync:
                 type_key = _type_key(db)
                 if type_key is None and not _is_syncable_id(db):
                     continue
+                if (
+                    isinstance(db, _SHADING_PINGED)
+                    and update.is_updated_shading
+                    and not update.is_updated_geometry
+                    and not update.is_updated_transform
+                ):
+                    # A material/image edit pings every Mesh wearing it with
+                    # a shading-only update. The mesh did not change; the
+                    # material reports on its own ID. Resending the whole
+                    # mesh per slider tick was SYNC-AUDIT D7.
+                    continue
                 uuid = identity.ensure_uuid(db, self.registry)
                 self._uuid_to_db[uuid] = db
                 tier = classify_update(type_key, update.is_updated_geometry)
+                if (
+                    tier == Tier.T1
+                    and update.is_updated_geometry
+                    and not update.is_updated_transform
+                    and isinstance(db, bpy.types.Object)
+                    and _has_bake_nodes(db)
+                ):
+                    # A simulation-zone / Bake-node bake (or its delete) is
+                    # exactly one geometry update on the object and nothing
+                    # the snapshot can diff (CACHES.md §2): resend the object
+                    # — the packed bake rides the blob and is used.
+                    tier = Tier.T2
                 if _DEBUG:
                     print(
                         f"qcb classify {type(db).__name__}:{db.name} -> T{int(tier)}"
@@ -238,7 +360,8 @@ class HostSync:
         """Queue the full mainfile for the wire (tier 3 — session bootstrap
         and force-resync). Chunks drain through flush_tick under
         backpressure; explicit, so it proceeds even while paused."""
-        data = bootstrap.serialize_mainfile()
+        data = bootstrap.serialize_mainfile(compress=self._blend_compress())
+        self.last_bootstrap_bytes = len(data)
         meta = {
             "uuid": "__mainfile__",
             "name": bpy.path.basename(bpy.data.filepath) or "untitled",
@@ -246,9 +369,27 @@ class HostSync:
         }
         blob_id = f"boot.{self.sent_boot}.{self.seq + 1}"
         self._boot_outbox.extend(protocol.chunk_blob("boot", blob_id, data, meta=meta))
+        self._shipped = {
+            uuid for uuid, db in self._uuid_to_db.items()
+            if _alive(db) and (db.users > 0 or db.use_fake_user)
+        }
+        self._blob_hash.clear()
+        self._lib_state = {
+            bpy.path.abspath(lib.filepath): (
+                tuple(sorted(o.name for o in bpy.data.objects if o.library == lib and o.users)),
+                tuple(sorted(c.name for c in bpy.data.collections if c.library == lib and c.users)),
+            )
+            for lib in bpy.data.libraries
+        }
+        self._prime_queue = [
+            uuid for uuid, db in self._uuid_to_db.items()
+            if _alive(db) and (db.users > 0 or db.use_fake_user)
+            and not isinstance(db, (bpy.types.Scene, bpy.types.Key))
+            and tier2_io.collection_of(db) is not None
+        ]
         self.sent_boot += 1
-        self.bake_note = ""  # the full file carries every baked cache
-        self.t2_unsupported = 0  # ditto anything we couldn't resend
+        # bake_note / t2_unsupported clear when the last chunk actually
+        # leaves (flush), not here: a queued bootstrap is not a shipped one.
         self._suppress_marks = False  # deltas are real from here on
         if _DEBUG:
             print(f"qcb boot queued ({len(data)} bytes)", flush=True)
@@ -274,25 +415,53 @@ class HostSync:
             header["seq"] = self.seq
             if self.transport.send_cold(header, payload):
                 self._boot_outbox.pop(0)
+                if not self._boot_outbox:
+                    self._boot_last_seq = header["seq"]
+                    self._uuid_cold_seq.clear()  # the file supersedes every blob
+                    self.bake_note = ""  # the full file carries every baked cache
+                    self.t2_unsupported = 0  # ditto anything we couldn't resend
             else:
                 self.seq -= 1
                 return _FLUSH_TICK  # backpressure: try again next tick
         if self._suppress_marks:
             return _FLUSH_TICK  # pre-handshake: the bootstrap will cover it
+        if not self._drain_t2_outbox():
+            return _FLUSH_TICK  # backpressure mid-blob: resume next tick
+        if self._auto_boot_at and now >= self._auto_boot_at:
+            if now - self._last_auto_boot >= _AUTO_BOOT_MIN_INTERVAL:
+                self._auto_boot_at = 0.0
+                self._last_auto_boot = now
+                self.auto_boots += 1
+                self.send_bootstrap()
+                return _FLUSH_TICK  # drain it first
+            # else: keep it pending until the interval allows
         if now - self._last_sweep >= _SWEEP_INTERVAL:
             self._sweep_deletions()
+            self._externalize_caches()
+            self._sweep_libraries()
             self._last_sweep = now
         if self.paused_fn() or not len(self.dirty):
+            self._prime_hashes()
             return _FLUSH_TICK
         ready_set = set(self.debounce.ready(now))
         tombstones, dirty = self.dirty.drain()
         for uuid in tombstones:
             self._send_tombstone(uuid)
+        t2_budget = _T2_PER_TICK
         for uuid, tier in dirty:
             if uuid not in ready_set:
                 self.dirty.requeue(uuid, tier)  # still being edited
                 continue
             if tier == Tier.T2:
+                if t2_budget <= 0:
+                    # Next tick. ready() consumed its debounce entry, so it
+                    # must be touched back as ready or it would read as
+                    # "still being edited" and requeue forever (bitten
+                    # 2026-09-23: 33 blobs silently never left).
+                    self.dirty.requeue(uuid, tier)
+                    self._touch_ready(uuid, now)
+                    continue
+                t2_budget -= 1
                 self._flush_t2(uuid)
             else:
                 self._flush_t1(uuid)
@@ -307,6 +476,8 @@ class HostSync:
         except ReferenceError:  # died between mark and flush; sweep will see it
             return
         diff = self.shadow.diff_and_update(uuid, snapshot)
+        if diff is None and db.users == 0 and not db.use_fake_user:
+            return  # orphan: primed, not shipped — nothing on the replica needs it yet
         if diff is None:
             # First contact AFTER the initial scan (which primes every
             # scan-time shadow): a datablock created mid-session, which the
@@ -324,23 +495,100 @@ class HostSync:
             # already debounce-ready, and no further event may ever touch it.
             if _DEBUG:
                 print(f"qcb escalate T2 {db.name}", flush=True)
-            self._flush_t2(uuid, snapshot)
+            # The shadow already advanced past these tier-1 changes; if the
+            # blob is refused (Scene) they must still go out (SYNC-AUDIT A2).
+            self._flush_t2(uuid, snapshot, fallback=diff["changes"])
             return
-        changes = diff["changes"]
+        self._send_t1(uuid, db, diff["changes"])
+
+    # "@" pointer setters and the bpy.data collection their names resolve in.
+    _POINTER_SETTERS = {
+        "@scene_world": "worlds", "@scene_camera": "objects",
+        "@instance_collection": "collections", "@dof_focus_object": "objects",
+        "@ll_receiver": "collections", "@ll_blocker": "collections",
+    }
+
+    def _send_t1(self, uuid: str, db, changes: list) -> None:
         if not changes:
             return
-        self.seq += 1
-        header = {"kind": "t1", "seq": self.seq, "uuid": uuid}
+        # Setters first: "@rbw" must create the world before
+        # "rigidbody_world.*" paths write into it.
+        changes = sorted(changes, key=lambda c: not c[0].startswith("@"))
+        # A pointer's target may be new to the replica (a world with no
+        # users is not in the bootstrap); ship it before naming it, and make
+        # this delta follow that blob on the replica (the fast lane would
+        # otherwise outrun it).
+        after = self._after_for(uuid)
+        for path, value in changes:
+            coll = self._POINTER_SETTERS.get(path)
+            if coll and value:
+                target = getattr(bpy.data, coll).get(value)
+                if target is not None and identity.is_stampable(target):
+                    t_uuid = identity.ensure_uuid(target, self.registry)
+                    self._uuid_to_db[t_uuid] = target
+                    if t_uuid not in self._shipped:
+                        self._flush_t2(t_uuid)
+                    if t_uuid in self._t2_outbox:
+                        self.dirty.requeue(uuid, Tier.T1)  # after the blob has fully left
+                        return
+                    after = max(after, self._uuid_cold_seq.get(t_uuid, 0))
+        self.seq_fast += 1
+        header = {"kind": "t1", "lane": "f", "seq": self.seq_fast, "uuid": uuid,
+                  "after": after}
         payload = json.dumps(changes).encode("utf-8")
-        if self.transport.send_cold(header, payload):
+        if self.transport.send_fast(header, payload):
             self.sent_t1 += len(changes)
             if _DEBUG:
                 print(f"qcb t1 send {db.name}: {[p for p, _ in changes]}", flush=True)
         else:
-            self.seq -= 1
+            self.seq_fast -= 1
             self.dirty.requeue(uuid, Tier.T1)
 
-    def _flush_t2(self, uuid: str, snapshot: dict | None = None) -> None:
+    def _after_for(self, uuid: str) -> int:
+        return max(self._uuid_cold_seq.get(uuid, 0), self._boot_last_seq, self._link_seq)
+
+    def _sweep_libraries(self) -> None:
+        """New or changed library usage → "link"; a library gone → "unlink".
+        The bootstrap carries the libraries it had (a full save keeps the
+        references and the replica localizes them), so the state is primed
+        at each bootstrap and only changes since then are messages."""
+        current: dict[str, tuple] = {}
+        for lib in bpy.data.libraries:
+            objects = sorted(o.name for o in bpy.data.objects if o.library == lib and o.users)
+            colls = sorted(c.name for c in bpy.data.collections if c.library == lib and c.users)
+            if objects or colls:
+                current[bpy.path.abspath(lib.filepath)] = (tuple(objects), tuple(colls))
+        for path, (objects, colls) in current.items():
+            if self._lib_state.get(path) != (objects, colls):
+                if self._send_cold_msg({"kind": "link", "lib": path,
+                                        "objects": list(objects), "collections": list(colls)}):
+                    self._lib_state[path] = (objects, colls)
+                    self.links_sent += 1
+        for path in list(self._lib_state):
+            if path not in current:
+                if self._send_cold_msg({"kind": "unlink", "lib": path}):
+                    del self._lib_state[path]
+
+    def _send_cold_msg(self, header: dict) -> bool:
+        self.seq += 1
+        header["seq"] = self.seq
+        if self.transport.send_cold(header, b""):
+            self._link_seq = self.seq
+            if _DEBUG:
+                print(f"qcb {header['kind']} send {header.get('lib')}", flush=True)
+            return True
+        self.seq -= 1
+        return False
+
+    def caught_up(self, peer_status: dict) -> bool:
+        """Has the replica seen everything we sent, on both lanes? (Smokes
+        and benches gate their steps on this.)"""
+        ps = peer_status or {}
+        return (ps.get("seq", -1) >= self.seq
+                and ps.get("seq_fast", self.seq_fast) >= self.seq_fast)
+
+    def _flush_t2(self, uuid: str, snapshot: dict | None = None,
+                  fallback: list | None = None) -> None:
         """snapshot — the caller's already-built build_snapshot(db), when it
         has one (pose digests on heavy rigs make building it twice a real
         main-thread cost)."""
@@ -364,38 +612,149 @@ class HostSync:
                 self._flush_t2(owner_uuid)
             return
         try:
-            data = tier2_io.serialize(db)
+            data = tier2_io.serialize(db, compress=self._blend_compress())
         except ReferenceError:
             return  # died between mark and flush; sweep will tombstone it
         if data is None:
-            # Type we don't resend (e.g. Scene structural change) — surfaced,
-            # not silent: force-resync (M6) is the recovery.
+            # Type we don't resend (Scene: it IS the file). The tier-1 half
+            # of the diff still goes out, and the structural half is covered
+            # by an automatic bootstrap, debounced and rate-limited — the
+            # replica may be behind, never wrong (decision #5).
             self.t2_unsupported += 1
+            if fallback:
+                self._send_t1(uuid, db, fallback)
+            self._auto_boot_at = time.monotonic() + _AUTO_BOOT_DEBOUNCE
             if _DEBUG:
-                print(f"qcb t2 UNSUPPORTED {type(db).__name__}:{db.name}", flush=True)
+                print(f"qcb t2 UNSUPPORTED {type(db).__name__}:{db.name} → auto bootstrap", flush=True)
             return
         # Refresh the shadow so tier-1 doesn't re-send state the blob carries.
-        self.shadow.diff_and_update(
-            uuid, snapshot if snapshot is not None else build_snapshot(db)
-        )
+        snapshot = snapshot if snapshot is not None else build_snapshot(db)
+        self.shadow.diff_and_update(uuid, snapshot)
+        # The digest covers the blob AND the point-cache signature: a bake
+        # changes is_baked, which libraries.write does not carry (CACHES.md
+        # finding 4), so the post-bake blob is byte-identical to the
+        # pre-bake one — and the replica needs that resend to rescan.
+        digest = self._blob_digest(db, data, snapshot)
+        if uuid in self._shipped and self._blob_hash.get(uuid) == digest:
+            self.t2_skipped += 1  # the replica already holds exactly this
+            if _DEBUG:
+                print(f"qcb t2 skip {db.name} (unchanged blob)", flush=True)
+            return
+        self._blob_hash[uuid] = digest
         blob_id = f"{uuid}.{self.seq + 1}"
         meta = {"uuid": uuid, "name": db.name, "coll": tier2_io.collection_of(db)}
-        for header, payload in protocol.chunk_blob("t2", blob_id, data, meta=meta):
-            self.seq += 1
-            header["seq"] = self.seq
-            if not self.transport.send_cold(header, payload):
-                self.seq -= 1
-                self.dirty.requeue(uuid, Tier.T2)  # partial superseded later
-                return
+        self._t2_outbox[uuid] = list(protocol.chunk_blob("t2", blob_id, data, meta=meta))
         self.sent_t2 += 1
         if _DEBUG:
             print(f"qcb t2 send {db.name} ({len(data)} bytes)", flush=True)
+        self._drain_t2_outbox(uuid)
+
+    def _blend_compress(self) -> bool:
+        """Compress .blend partials in Blender only when the transport does
+        not compress the wire itself (zmq): zstd on the main thread is the
+        replica's apply stall and the host's serialize stall."""
+        return not getattr(self.transport, "wire_compresses", False)
+
+    def _blob_digest(self, db, data: bytes, snapshot: dict | None = None) -> bytes:
+        pc = snapshot.get("~pcache") if snapshot is not None else (
+            _pcache_signature(db) if isinstance(db, bpy.types.Object) else None)
+        return hashlib.blake2b(
+            data + json.dumps(pc, sort_keys=True, default=str).encode(), digest_size=16
+        ).digest()
+
+    def _prime_hashes(self) -> None:
+        """Idle work: hash what the replica holds since the bootstrap."""
+        n = 0
+        while self._prime_queue and n < _T2_PER_TICK:
+            uuid = self._prime_queue.pop()
+            if uuid in self._blob_hash:
+                continue
+            db = self._uuid_to_db.get(uuid)
+            if db is None or not _alive(db):
+                continue
+            try:
+                data = tier2_io.serialize(db, compress=self._blend_compress())
+            except Exception:
+                continue
+            if data is None:
+                continue
+            self._blob_hash[uuid] = self._blob_digest(db, data)
+            self.primed += 1
+            n += 1
+
+    def _drain_t2_outbox(self, only: str | None = None) -> bool:
+        """Send queued tier-2 chunks in order; False on backpressure (the
+        remainder stays queued). `_shipped` gains a uuid only when its last
+        chunk has left, so a tier-1 naming it waits for the whole blob."""
+        for uuid in list(self._t2_outbox):
+            if only is not None and uuid != only:
+                continue
+            chunks = self._t2_outbox[uuid]
+            while chunks:
+                header, payload = chunks[0]
+                self.seq += 1
+                header["seq"] = self.seq
+                if self.transport.send_cold(header, payload):
+                    chunks.pop(0)
+                    self._uuid_cold_seq[uuid] = header["seq"]
+                else:
+                    self.seq -= 1
+                    return False
+            del self._t2_outbox[uuid]
+            self._shipped.add(uuid)
+        return True
 
     def _send_tombstone(self, uuid: str) -> None:
-        self.seq += 1
-        if not self.transport.send_cold({"kind": "tomb", "seq": self.seq, "uuid": uuid}):
-            self.seq -= 1
+        self.seq_fast += 1
+        header = {"kind": "tomb", "lane": "f", "seq": self.seq_fast, "uuid": uuid,
+                  "after": self._after_for(uuid)}
+        if not self.transport.send_fast(header):
+            self.seq_fast -= 1
             self.dirty.requeue_tombstone(uuid)
+
+    def _externalize_caches(self) -> None:
+        """Point caches without an external path get one under the shared
+        cache root — BEFORE they are baked, because Blender does not migrate
+        frames on conversion (CACHES.md §2 finding 6). Baked caches are left
+        alone and counted so the panel can say "re-bake to share"."""
+        if not self.cache_root:
+            return
+        if not os.path.isdir(self.cache_root):
+            self.cache_note = f"⚠ cache root not found: {self.cache_root}"
+            return
+        if not bpy.data.filepath:
+            # Blender silently ignores use_disk_cache on an unsaved file
+            # (probed 2026-09-18): the bake would stay in memory and write
+            # nothing under the root. Say so instead of pretending.
+            self.cache_note = "⚠ shared cache root needs a saved .blend — save the project first"
+            return
+        stem = os.path.splitext(bpy.path.basename(bpy.data.filepath))[0] or "untitled"
+        baked_kept = 0
+        for obj in bpy.data.objects:
+            uuid = self.registry.uuid_for(obj.session_uid)
+            if uuid is None:
+                continue
+            for tag, pc in _iter_point_caches(obj):
+                if pc.use_external:
+                    continue
+                if pc.is_baked:
+                    baked_kept += 1
+                    continue
+                safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in tag)
+                path = os.path.join(self.cache_root, stem, uuid[:12], safe)
+                try:
+                    os.makedirs(path, exist_ok=True)
+                    pc.use_disk_cache = True
+                    pc.use_external = True
+                    pc.filepath = path
+                    self.externalized += 1
+                except (OSError, AttributeError) as exc:
+                    self.cache_note = f"⚠ cache root: {exc!s:.60}"
+                    return
+        self.cache_note = (
+            f"⚠ {baked_kept} baked cache(s) not shared — re-bake to move them to the cache root"
+            if baked_kept else ""
+        )
 
     def _sweep_deletions(self) -> None:
         self._sweep_visibility()
@@ -447,7 +806,12 @@ def _is_syncable_id(db: bpy.types.ID) -> bool:
     # snapped it back on the next scrub).
     return isinstance(
         db, (bpy.types.Mesh, bpy.types.Curve, bpy.types.NodeTree,
-             bpy.types.Action, bpy.types.Lattice, bpy.types.Armature)
+             bpy.types.Action, bpy.types.Lattice, bpy.types.Armature,
+             # 2026-09-23 (COVERAGE.md): edits to these used to be invisible
+             bpy.types.Image, bpy.types.MetaBall, bpy.types.Volume,
+             bpy.types.Curves, bpy.types.PointCloud, bpy.types.LightProbe,
+             bpy.types.GreasePencil, bpy.types.Texture,
+             bpy.types.ParticleSettings, bpy.types.CacheFile)
     )
 
 
@@ -471,6 +835,10 @@ _DIGEST_SKIP = {"rna_type", "name", "type", "show_expanded", "is_active", "point
 
 
 def _digest_value(value):
+    if isinstance(value, (bpy.types.Texture, bpy.types.ParticleSettings)):
+        # Settings datablocks that only ever ride as a dependency: a change
+        # INSIDE them must re-ship the owner (COVERAGE.md cause 5).
+        return ("id", value.session_uid, _settings_digest(value, 1))
     if isinstance(value, bpy.types.ID):
         return ("id", value.session_uid)  # identity, rename-proof
     if isinstance(value, set):  # enum-flag props iterate unordered
@@ -572,7 +940,40 @@ _BBONE_PROPS = (
 )
 
 
-def _pose_digest(pose, full: bool) -> str:
+def _animated_bones(obj) -> frozenset:
+    """Bones whose transforms come from the action (or NLA strips): their
+    matrix_basis changes on every scrub and says nothing the action does
+    not already carry (SYNC-AUDIT D1). Manually posed bones are not here."""
+    anim = obj.animation_data
+    if anim is None:
+        return frozenset()
+    actions = [anim.action] if anim.action else []
+    for track in anim.nla_tracks:
+        actions.extend(st.action for st in track.strips if st.action)
+    names = set()
+    for act in actions:
+        for fc in _action_fcurves(act):
+            p = fc.data_path
+            if p.startswith('pose.bones["'):
+                names.add(p[12:p.index('"]', 12)])
+    return frozenset(names)
+
+
+def _action_fcurves(act):
+    try:
+        fcs = list(act.fcurves)
+        if fcs:
+            return fcs
+    except AttributeError:
+        pass
+    try:  # slotted actions (4.4+)
+        return [fc for layer in act.layers for strip in layer.strips
+                for bag in strip.channelbags for fc in bag.fcurves]
+    except AttributeError:
+        return []
+
+
+def _pose_digest(pose, full: bool, animated: frozenset = frozenset()) -> str:
     """Armature pose as one hash. full=True (flush snapshot) covers
     everything the tier-2 object blob would change; full=False is the sweep
     variant — transforms + bone idprops only, cheap enough for 0.5 s cadence
@@ -583,6 +984,7 @@ def _pose_digest(pose, full: bool) -> str:
     for pb in pose.bones:
         entry = [
             pb.name,
+            None if pb.name in animated else
             [round(v, 5) for row in pb.matrix_basis for v in row],
             [(k, _digest_value(v)) for k, v in sorted(
                 pb.items(), key=lambda kv: kv[0])],
@@ -597,13 +999,38 @@ def _pose_digest(pose, full: bool) -> str:
     return hashlib.md5(repr(parts).encode()).hexdigest()[:16]
 
 
+def _alive(db) -> bool:
+    try:
+        db.name
+        return True
+    except ReferenceError:
+        return False
+
+
+def _idprop_value(v):
+    if isinstance(v, idprop.types.IDPropertyGroup):
+        return ("group", repr(v.to_dict()))  # nested settings, e.g. scene["cycles"]
+    return _digest_value(v)
+
+
 def _idprops_digest(struct) -> str:
     parts = [
-        (k, _digest_value(v))
+        (k, _idprop_value(v))
         for k, v in sorted(struct.items(), key=lambda kv: kv[0])
         if k != identity.UUID_PROP and not k.startswith("_")
     ]
     return hashlib.md5(repr(parts).encode()).hexdigest()[:16]
+
+
+def _idprop_groups_signature(db) -> list:
+    """Group-valued custom props never ride tier 1 (a coerced group would
+    write back as a list), so a group appearing or changing is structure:
+    the tier-2 blob carries it whole."""
+    return sorted(
+        [k, _idprop_value(v)[1]]
+        for k, v in db.items()
+        if isinstance(v, idprop.types.IDPropertyGroup) and not k.startswith("_")
+    )
 
 
 def _object_sweep_vector(obj: bpy.types.Object) -> tuple:
@@ -619,10 +1046,34 @@ def _object_sweep_vector(obj: bpy.types.Object) -> tuple:
         eye, obj.hide_viewport, obj.hide_render,
         _pcache_signature(obj),  # bake_note logic indexes [3] — keep it there
         _idprops_digest(obj),
-        _pose_digest(obj.pose, full=False) if obj.pose is not None else None,
+        _pose_digest(obj.pose, full=False, animated=_animated_bones(obj)) if obj.pose is not None else None,
         obj.name,  # renames fire no depsgraph event; name-keyed setters
                    # (@scene_camera) die on stale names without this
+        # Cosmetic/instancing/visibility toggles whose depsgraph events are
+        # not relied on (COVERAGE.md): cheap to sample, so sample them.
+        obj.display_type, obj.show_in_front, obj.instance_type,
+        obj.instance_collection.name if obj.instance_collection else "",
+        obj.visible_camera, obj.is_holdout, obj.is_shadow_catcher,
+        obj.field.type if obj.field else "",
     )
+
+
+def _datablock_sweep_vector(db) -> tuple:
+    """Non-object tier-1 datablocks: custom props (raw writes fire nothing)
+    and, for scenes, the structure that no event reliably announces."""
+    vec = [_idprops_digest(db), db.name]
+    if isinstance(db, bpy.types.Scene):
+        # Render/engine settings (cycles.samples, eevee.*) fire no depsgraph
+        # event and live in registered groups .items() does not expose —
+        # so the sweep digests the scene's whole tier-1 snapshot. One scene,
+        # a few hundred paths: cheap.
+        vec.append(hashlib.md5(
+            json.dumps(build_snapshot(db), sort_keys=True, default=str).encode()
+        ).hexdigest())
+    return tuple(vec)
+
+
+_SWEPT_T1_TYPES = ("scenes", "materials", "worlds", "lights", "cameras")
 
 
 def _anim_signature(anim) -> list | None:
@@ -647,9 +1098,53 @@ def _anim_signature(anim) -> list | None:
     ]
     return [
         anim.action.session_uid if anim.action else None,
-        len(anim.nla_tracks),
+        [
+            [t.name, t.mute, t.is_solo, [
+                [st.name, round(st.frame_start, 3), round(st.frame_end, 3), st.mute,
+                 st.action.session_uid if st.action else None, st.blend_type,
+                 round(st.influence, 4), round(st.scale, 4), round(st.repeat, 4),
+                 round(st.action_frame_start, 3), round(st.action_frame_end, 3)]
+                for st in t.strips
+            ]]
+            for t in anim.nla_tracks
+        ],
         drivers,
     ]
+
+
+def _iter_point_caches(obj):
+    """(tag, PointCache) for every sim on the object."""
+    for m in obj.modifiers:
+        pc = getattr(m, "point_cache", None)
+        if pc is not None:
+            yield m.name, pc
+        canvas = getattr(m, "canvas_settings", None)
+        if canvas is not None:
+            for surf in canvas.canvas_surfaces:
+                if surf.point_cache is not None:
+                    yield f"{m.name}/{surf.name}", surf.point_cache
+    for psys in obj.particle_systems:
+        yield f"psys/{psys.name}", psys.point_cache
+
+
+_BAKE_NODE_IDS = {"GeometryNodeSimulationOutput", "GeometryNodeBake"}
+
+
+def _has_bake_nodes(obj) -> bool:
+    """A NODES modifier whose tree (one level of groups deep) has a
+    simulation zone or a Bake node: its bake changes no RNA the diff can see
+    (mod.bakes is RNA-invisible, CACHES.md), only the evaluated geometry."""
+    for m in obj.modifiers:
+        ng = getattr(m, "node_group", None)
+        if ng is None:
+            continue
+        for node in ng.nodes:
+            if node.bl_idname in _BAKE_NODE_IDS:
+                return True
+            inner = getattr(node, "node_tree", None)
+            if inner is not None and any(n.bl_idname in _BAKE_NODE_IDS for n in inner.nodes):
+                return True
+    return False
 
 
 def _pcache_signature(obj: bpy.types.Object) -> list:
@@ -664,7 +1159,8 @@ def _pcache_signature(obj: bpy.types.Object) -> list:
     def add(tag, pc):
         if pc is not None:
             sig.append([
-                tag, pc.is_baked, pc.use_disk_cache, pc.frame_start, pc.frame_end
+                tag, pc.is_baked, pc.use_disk_cache, pc.frame_start, pc.frame_end,
+                pc.use_external, pc.filepath,
             ])
 
     for m in obj.modifiers:
@@ -722,19 +1218,27 @@ def build_snapshot(db: bpy.types.ID) -> dict:
             [c.name, c.type, _settings_digest(c)] for c in db.constraints
         ]
         snapshot["~pcache"] = _pcache_signature(db)
+        # The datablock under the object and its material slots: a swap
+        # changes no tracked path, so it is structure (SYNC-AUDIT A4). The
+        # blob carries the new data/materials as dependencies.
+        snapshot["~data"] = None if db.data is None else [
+            type(db.data).__name__, db.data.session_uid]
+        snapshot["~materials"] = [
+            [slot.link, slot.material.session_uid if slot.material else None]
+            for slot in db.material_slots
+        ]
+        # Pointers that a name can carry (the replica has the same names).
+        snapshot["@instance_collection"] = (
+            db.instance_collection.name if db.instance_collection else "")
+        ll = db.light_linking
+        snapshot["@ll_receiver"] = ll.receiver_collection.name if ll.receiver_collection else ""
+        snapshot["@ll_blocker"] = ll.blocker_collection.name if ll.blocker_collection else ""
         # Custom properties: rig-control sliders live here. json.dumps in
         # the path so names with dots/quotes survive the replica's parse
         # (db[json.loads(path[1:-1])]). Add/remove changes the path set →
         # structural escalation for free. Non-coercible values (nested
         # groups) are skipped — documented limitation.
-        for prop_name, prop_value in db.items():
-            if prop_name == identity.UUID_PROP or prop_name.startswith("_"):
-                continue
-            value = _coerce(prop_value)
-            if value is not None and not _contains_none(value):
-                # a None inside an array would make the replica's idprop
-                # assignment raise per-apply — skip, don't half-send
-                snapshot[f"[{json.dumps(prop_name)}]"] = value
+        _snapshot_idprops(db, snapshot)
         if db.pose is not None:
             # Full pose digest: any pose change (bone transforms, per-bone
             # constraints/bbone/idprops) escalates to a tier-2 resend of the
@@ -742,7 +1246,7 @@ def build_snapshot(db: bpy.types.ID) -> dict:
             # blobs are bones-only light. The sweep watches a LIGHT variant
             # (transforms+idprops): bone-slider idprop edits fire no
             # depsgraph event at all (probed 5.2).
-            snapshot["~pose"] = _pose_digest(db.pose, full=True)
+            snapshot["~pose"] = _pose_digest(db.pose, full=True, animated=_animated_bones(db))
         try:
             # The eye toggle: per-view-layer state, not an RNA property —
             # rides as "@hide" and is applied via hide_set() on the replica.
@@ -757,9 +1261,35 @@ def build_snapshot(db: bpy.types.ID) -> dict:
             base = f"key_blocks[{json.dumps(kb.name)}]"
             snapshot[f"{base}.value"] = kb.value
             snapshot[f"{base}.mute"] = kb.mute
+    if isinstance(db, bpy.types.Camera):
+        snapshot["@dof_focus_object"] = db.dof.focus_object.name if db.dof.focus_object else ""
+        snapshot["~bg_images"] = [
+            [bg.source, bg.image.session_uid if bg.image else None, bg.alpha,
+             bg.display_depth, bg.frame_method, round(bg.scale, 4),
+             [round(v, 4) for v in bg.offset], round(bg.rotation, 4)]
+            for bg in db.background_images
+        ]
     if isinstance(db, bpy.types.Scene):
         # Active camera is a pointer — rides as a name, applied by setter.
         snapshot["@scene_camera"] = db.camera.name if db.camera else ""
+        snapshot["@scene_world"] = db.world.name if db.world else ""
+        snapshot["@rbw"] = db.rigidbody_world is not None
+        # Master-collection membership is Scene-embedded: no collection
+        # datablock's "~members" carries it (a new collection linked to the
+        # scene root, or an object moved out of it, was invisible).
+        snapshot["@master_members"] = [
+            sorted(o.name for o in db.collection.objects),
+            sorted(c.name for c in db.collection.children),
+        ]
+        # Scene structure nothing else carries: markers (camera binding!),
+        # view layers and their passes, the compositor. Structural → the
+        # auto-bootstrap path in _flush_t2.
+        comp = getattr(db, "compositing_node_group", None) or getattr(db, "node_tree", None)
+        snapshot["~scene_struct"] = [
+            [[m.name, m.frame, m.camera.name if m.camera else None] for m in db.timeline_markers],
+            [[vl.name, _settings_digest(vl, 1)] for vl in db.view_layers],
+            _nodes_signature(comp) if comp is not None else None,
+        ]
     if isinstance(db, bpy.types.Collection):
         # Membership is structural (link/unlink → tier-2 resend); the
         # view-layer pair (outliner checkbox + eye) applies by setter.
@@ -773,7 +1303,50 @@ def build_snapshot(db: bpy.types.ID) -> dict:
     node_tree = getattr(db, "node_tree", None)
     if node_tree is not None:
         _walk_sockets(node_tree, snapshot)
+        snapshot["~nodes"] = _nodes_signature(node_tree)
+    # Custom properties on every tier-1 type (not just objects): rig
+    # controls live on objects, but pipeline metadata lives anywhere.
+    if type_key is not None and not isinstance(db, bpy.types.Object):
+        _snapshot_idprops(db, snapshot)
+    if type_key is not None and not isinstance(db, bpy.types.Scene):
+        # Scene groups are addon settings (cycles, eevee…) whose scalars
+        # ride the tracked table; elsewhere a group is user data → tier 2.
+        snapshot["~idprop_groups"] = _idprop_groups_signature(db)
     return snapshot
+
+
+def _snapshot_idprops(db, snapshot: dict) -> None:
+    for prop_name, prop_value in db.items():
+        if prop_name == identity.UUID_PROP or prop_name.startswith("_"):
+            continue
+        if isinstance(prop_value, idprop.types.IDPropertyGroup):
+            continue  # see _idprop_groups_signature
+        value = _coerce(prop_value)
+        if value is not None and not _contains_none(value):
+            snapshot[f"[{json.dumps(prop_name)}]"] = value
+
+
+def _nodes_signature(node_tree) -> list:
+    """Per-node properties the socket walk cannot see: mute, the node's own
+    settings (a Math node's operation, a Mapping type, an Image Texture's
+    image and its image_user), and ColorRamp stops. A change escalates the
+    owning material/world to tier 2 on its own — previously it crossed only
+    as a side effect of the Mesh wearing it being resent (SYNC-AUDIT A1/D7)."""
+    sig = []
+    for node in node_tree.nodes:
+        entry = [node.name, node.bl_idname, node.mute, _settings_digest(node, 1)]
+        ramp = getattr(node, "color_ramp", None)
+        if ramp is not None:
+            entry.append([ramp.interpolation, ramp.color_mode, [
+                [round(e.position, 5), [round(c, 5) for c in e.color]]
+                for e in ramp.elements
+            ]])
+        curve = getattr(node, "mapping", None)  # RGB/Vector curves
+        if curve is not None and hasattr(curve, "curves"):
+            entry.append([[[round(p.location[0], 5), round(p.location[1], 5), p.handle_type]
+                           for p in c.points] for c in curve.curves])
+        sig.append(entry)
+    return sig
 
 
 def _walk_sockets(node_tree, snapshot: dict) -> None:
@@ -819,9 +1392,9 @@ def _flush_timer():
     return _sync.flush_tick()
 
 
-def start(transport, paused_fn, mappings=()) -> HostSync:
+def start(transport, paused_fn, mappings=(), cache_root: str = "") -> HostSync:
     global _sync
-    _sync = HostSync(transport, paused_fn, mappings)
+    _sync = HostSync(transport, paused_fn, mappings, cache_root=cache_root)
     bpy.app.handlers.depsgraph_update_post.append(_depsgraph_handler)
     bpy.app.handlers.load_post.append(_load_post_handler)
     bpy.app.timers.register(_flush_timer, first_interval=_FLUSH_TICK, persistent=True)

@@ -1,0 +1,65 @@
+[package]
+name = "qcbridge-agent"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+# GPL-3.0-or-later, matching the repository LICENSE. The transport is plain
+# quinn (Apache-2.0 OR MIT), so there is no AGPL component and no §13 source
+# offer to make. The Blender addon talks to this binary over a local socket.
+license = "GPL-3.0-or-later"
+description = "QCBridge Agent: tray app owning the QUIC connection, capture and Blender's lifecycle"
+
+[workspace]
+
+[lib]
+name = "qcbridge_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qcbridge-agent"
+path = "src/main.rs"
+
+[dependencies]
+# quinn re-exports quinn-proto, which is where the congestion Controller and
+# ControllerFactory traits in lib.rs come from — no separate dependency, and
+# no [patch.crates-io]: the vendored quinn-proto existed for a DATAGRAM
+# send-buffer fix, and nothing here sends QUIC datagrams any more.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# Unpinned on purpose so Cargo unifies it with quinn's own copy — the
+# congestion traits must be the same types quinn expects. RttEstimator lives
+# at the crate root, which quinn does not re-export.
+quinn-proto = { version = "0.11", default-features = false }
+# The beacon socket: SO_REUSEADDR/REUSEPORT and the multicast join. 0.6 is
+# the copy quinn-udp already brings in, so this adds no packages.
+socket2 = "0.6"
+
+anyhow = "1.0"
+bytes = "1.10"
+hex = "0.4"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
+ring = "0.17"
+rustls = { version = "0.23.31", default-features = false, features = ["logging", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "6"
+rand = "0.8"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util"] }
+# Cold-lane payloads are zstd-compressed HERE, on the agent's threads, so
+# Blender writes and loads uncompressed .blend partials: the replica's
+# libraries.load of a 640k-vertex mesh is 2 ms uncompressed vs 45 ms
+# decompressing (measured 2026-09-23) — that was the last of the
+# head-of-line cost, and it was on Blender's main thread.
+zstd = "0.13"
+tray-icon = "0.20"
+muda = "0.16"
+tao = "0.31"
+
+# gethostname and kill(pid, 0), for the beacon's machine name and the
+# single-instance guard. Already in the lock via quinn; adds no packages.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+debug = 1

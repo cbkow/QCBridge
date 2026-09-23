@@ -7,13 +7,20 @@ just samples and sends unconditionally.
 
 from __future__ import annotations
 
-import bpy
+import math
+import time
 
-from ..ring1 import protocol
+import bpy
+from mathutils import Quaternion
+
+from ..ring1 import probe, protocol
 
 _INTERVAL = 1.0 / 30.0
 
 _transport = None
+_probe_on = False
+_probe_seq = 0
+_orbit_rad_s = 0.0
 
 
 def _target_view():
@@ -30,12 +37,21 @@ def _target_view():
 
 
 def _tick():
+    global _probe_seq
     if _transport is None:
         return None  # unregister
     area = _target_view()
     if area is not None:
         space = area.spaces.active
         rv3d = space.region_3d
+        if _orbit_rad_s and rv3d.view_perspective != "CAMERA":
+            # Probe driver: constant orbit so every replica frame is real
+            # motion (Cycles reset included), not a static redraw.
+            step = Quaternion((0.0, 0.0, 1.0), _orbit_rad_s * _INTERVAL)
+            rv3d.view_rotation = step @ rv3d.view_rotation
+            # view_matrix only refreshes on draw: the packet below carries
+            # the previous tick's rotation (≤ 1 host tick of unmeasured lag).
+            area.tag_redraw()
         matrix = rv3d.view_matrix
         state = protocol.HotState(
             frame=bpy.context.scene.frame_current,
@@ -47,14 +63,20 @@ def _tick():
             camera=rv3d.view_perspective == "CAMERA",
             cam_zoom=rv3d.view_camera_zoom,
             cam_offset=tuple(rv3d.view_camera_offset),
+            t_host=time.time() if _probe_on else 0.0,
+            probe_seq=_probe_seq & 0xFFFF,
         )
+        _probe_seq += 1
         _transport.send_hot(state.pack())
     return _INTERVAL
 
 
 def start(transport) -> None:
-    global _transport
+    global _transport, _INTERVAL, _probe_on, _orbit_rad_s
     _transport = transport
+    _INTERVAL = 1.0 / probe.hot_hz()
+    _probe_on = probe.enabled()
+    _orbit_rad_s = math.radians(probe.orbit_deg_per_s()) if _probe_on else 0.0
     bpy.app.timers.register(_tick, first_interval=_INTERVAL, persistent=True)
 
 

@@ -1,0 +1,80 @@
+{
+ "rows": [
+  {
+   "key": "mat_socket_default",
+   "group": "material",
+   "desc": "base color socket value",
+   "status": "crossed",
+   "latency_ms": 419,
+   "expected": "[0.9, 0.1, 0.1, 1.0]",
+   "last_seen": "[0.9, 0.1, 0.1, 1.0]",
+   "error": null
+  },
+  {
+   "key": "mat_link_new",
+   "group": "material",
+   "desc": "link math \u2192 base color",
+   "status": "crossed",
+   "latency_ms": 403,
+   "expected": "\"CovMath\"",
+   "last_seen": "\"CovMath\"",
+   "error": null
+  },
+  {
+   "key": "mat_node_property",
+   "group": "material",
+   "desc": "Math node operation ADD \u2192 MULTIPLY",
+   "status": "crossed",
+   "latency_ms": 391,
+   "expected": "\"MULTIPLY\"",
+   "last_seen": "\"MULTIPLY\"",
+   "error": null
+  },
+  {
+   "key": "mat_node_mute",
+   "group": "material",
+   "desc": "mute a node",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "true",
+   "last_seen": "false",
+   "error": null
+  },
+  {
+   "key": "scene_tracked_edit_plus_scene_keyframe",
+   "group": "scene",
+   "desc": "resolution % edit in the same window as a Scene keyframe (structural)",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "33",
+   "last_seen": "44",
+   "error": null
+  },
+  {
+   "key": "scene_tracked_edit_after",
+   "group": "scene",
+   "desc": "the same tracked edit alone, afterwards",
+   "status": "crossed",
+   "latency_ms": 317,
+   "expected": "44",
+   "last_seen": "44",
+   "error": null
+  }
+ ],
+ "counts": {
+  "crossed": 4,
+  "NOT crossed": 2
+ },
+ "replica_stats": {
+  "seq": 8,
+  "gaps": 0,
+  "applied_t1": 2,
+  "apply_errors": 0,
+  "unknown_uuid": 0,
+  "applied_t2": 5,
+  "bootstraps": 1,
+  "unmapped_paths": 0,
+  "host_ended": false,
+  "last_error": ""
+ }
+}

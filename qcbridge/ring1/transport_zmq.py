@@ -28,6 +28,7 @@ def _endpoint(address: str, port: int) -> str:
 
 
 class HostTransportZmq:
+    wire_compresses = False  # nothing between Blender and the socket: keep .blend compression on
     def __init__(self, cfg: TransportConfig) -> None:
         self._cfg = cfg
         self._ctx: zmq.Context | None = None
@@ -114,6 +115,11 @@ class HostTransportZmq:
             self._hot.send(packed, zmq.NOBLOCK)
         except zmq.Again:
             pass  # no subscriber: hot is ephemeral by design
+
+    def send_fast(self, header: dict, payload: bytes = b"") -> bool:
+        """zmq has one cold stream; fast rides it (the replica merges by
+        header, so ordering is trivially satisfied)."""
+        return self.send_cold(header, payload)
 
     def send_cold(self, header: dict, payload: bytes = b"") -> bool:
         try:
@@ -237,6 +243,9 @@ class ReplicaTransportZmq:
     def poll_hot(self) -> bytes | None:
         with self._hot_lock:
             return self._hot_slot
+
+    def poll_fast(self, max_items: int) -> list[tuple[dict, bytes]]:
+        return []  # everything arrives on the cold queue
 
     def poll_cold(self, max_items: int) -> list[tuple[dict, bytes]]:
         items = []

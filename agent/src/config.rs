@@ -1,0 +1,470 @@
+//! Agent configuration: one TOML file in the user's config dir, plus a small
+//! JSON the addon reads to find the agent's local socket.
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// "replica" (listens, runs Blender for a host) or "host".
+    pub role: String,
+    /// Session token, checked at the QUIC layer and again by the addon's hello.
+    pub token: String,
+    /// Replica: UDP listen address. Host: the replica's address.
+    pub listen: String,
+    pub peer: String,
+    /// Host: pinned replica certificate SHA-256 (hex). Empty = learn on first use.
+    pub fingerprint: String,
+    /// Wire-rate cap for the video lane (replica), Mbps.
+    pub cap_mbps: f64,
+    /// Replica, native capture: stream resolution as a fraction of the
+    /// captured pixels (1.0 = native; 0.5 halves each dimension).
+    pub capture_scale: f64,
+    /// Host: local TCP port re-serving the stream to the viewer (0 = off).
+    /// Off by default since the quinn port: video no longer rides the
+    /// connection, QCView opens the replica's srt:// directly, and nothing
+    /// feeds this listener. Kept for compatibility with existing TOMLs.
+    pub video_port: u16,
+    /// Local socket for the addon (0 = pick a free port).
+    pub local_port: u16,
+    /// Replica: Blender binary and extra args; launched when a host connects.
+    pub blender_path: String,
+    pub blender_args: Vec<String>,
+    pub kiosk: bool,
+    /// Replica: close Blender this long after the host goes away (0 = never).
+    pub idle_secs: u64,
+    /// Show the tray icon (false = headless, for tests and services).
+    pub tray: bool,
+    /// Shown to peers and in the tray. Empty = the OS hostname.
+    pub name: String,
+    /// "off" | "direct" | "discoverable". Direct is the default: beaconing
+    /// on a facility network is opt-in, and the VPN cannot use it anyway.
+    pub discovery: String,
+    /// Shared directory for the phonebook (MinRender's pattern). Empty = off.
+    pub phonebook: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            role: "replica".into(),
+            token: String::new(),
+            listen: "0.0.0.0:19990".into(),
+            peer: "127.0.0.1:19990".into(),
+            fingerprint: String::new(),
+            cap_mbps: 400.0,
+            capture_scale: 1.0,
+            video_port: 0,
+            local_port: 0,
+            blender_path: default_blender_path(),
+            blender_args: Vec::new(),
+            kiosk: true,
+            idle_secs: 300,
+            tray: true,
+            name: String::new(),
+            discovery: "direct".into(),
+            phonebook: String::new(),
+        }
+    }
+}
+
+fn default_blender_path() -> String {
+    if cfg!(target_os = "macos") {
+        "/Applications/Blender.app/Contents/MacOS/Blender".into()
+    } else if cfg!(windows) {
+        r"C:\Program Files\Blender Foundation\Blender 5.2\blender.exe".into()
+    } else {
+        "blender".into()
+    }
+}
+
+pub const DISCOVERY_MODES: &[&str] = &["off", "direct", "discoverable"];
+
+/// What the machine is called, for the beacon and the tray. No crate: libc
+/// is already in the tree via quinn, and Windows always sets COMPUTERNAME.
+pub fn machine_name() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc == 0 {
+            if let Some(n) = buf.iter().position(|&b| b == 0) {
+                if let Ok(name) = std::str::from_utf8(&buf[..n]) {
+                    if !name.is_empty() {
+                        return name.to_string();
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(name) = std::env::var("COMPUTERNAME") {
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    "qcbridge".into()
+}
+
+impl Config {
+    /// The configured name, or the machine's when none is set.
+    pub fn display_name(&self) -> String {
+        if self.name.trim().is_empty() { machine_name() } else { self.name.clone() }
+    }
+}
+
+/// Fields that can change on a running agent, and are therefore accepted by
+/// `set_config` and reported in the `config` event. Anything that needs a
+/// rebuilt endpoint — role, listen, local_port, tray — is deliberately not
+/// here: the command says "needs_restart" rather than pretending.
+pub const LIVE_FIELDS: &[&str] = &[
+    "peer", "token", "fingerprint", "name", "discovery", "phonebook",
+    "blender_path", "blender_args", "kiosk", "idle_secs", "cap_mbps", "capture_scale",
+];
+pub const RESTART_FIELDS: &[&str] = &["role", "listen", "local_port", "tray"];
+
+/// What `apply_live` did with a patch. Reported back verbatim.
+#[derive(Debug, Default, PartialEq)]
+pub struct Applied {
+    pub changed: Vec<String>,
+    pub needs_restart: Vec<String>,
+    pub rejected: Vec<String>,
+}
+
+/// Apply the live fields of a JSON patch (`{"peer": "...", "idle_secs": 60}`)
+/// to a config, in place. Pure, so it can be unit-tested without an agent.
+/// Type mismatches and invalid values are rejected, not coerced.
+pub fn apply_live(cfg: &mut Config, patch: &serde_json::Value) -> Applied {
+    let mut out = Applied::default();
+    let Some(obj) = patch.as_object() else { return out };
+    for (key, val) in obj {
+        let k = key.as_str();
+        if RESTART_FIELDS.contains(&k) {
+            out.needs_restart.push(key.clone());
+            continue;
+        }
+        if !LIVE_FIELDS.contains(&k) {
+            out.rejected.push(key.clone());
+            continue;
+        }
+        let ok = match k {
+            "peer" => set_str(&mut cfg.peer, val),
+            "token" => set_str(&mut cfg.token, val),
+            "fingerprint" => set_str(&mut cfg.fingerprint, val),
+            "name" => set_str(&mut cfg.name, val),
+            "phonebook" => set_str(&mut cfg.phonebook, val),
+            "blender_path" => set_str(&mut cfg.blender_path, val),
+            "discovery" => match val.as_str() {
+                Some(m) if DISCOVERY_MODES.contains(&m) => { cfg.discovery = m.into(); true }
+                _ => false,
+            },
+            "blender_args" => match val.as_array() {
+                Some(a) if a.iter().all(|v| v.is_string()) => {
+                    cfg.blender_args = a.iter().map(|v| v.as_str().unwrap().to_string()).collect();
+                    true
+                }
+                _ => false,
+            },
+            "kiosk" => match val.as_bool() { Some(b) => { cfg.kiosk = b; true } None => false },
+            "idle_secs" => match val.as_u64() { Some(n) => { cfg.idle_secs = n; true } None => false },
+            "cap_mbps" => match val.as_f64() { Some(f) if f > 0.0 => { cfg.cap_mbps = f; true } _ => false },
+            "capture_scale" => match val.as_f64() { Some(f) if f > 0.0 && f <= 1.0 => { cfg.capture_scale = f; true } _ => false },
+            _ => false,
+        };
+        if ok { out.changed.push(key.clone()) } else { out.rejected.push(key.clone()) }
+    }
+    out
+}
+
+fn set_str(slot: &mut String, val: &serde_json::Value) -> bool {
+    match val.as_str() {
+        Some(v) => { *slot = v.to_string(); true }
+        None => false,
+    }
+}
+
+/// The live fields as JSON — the body of the `config` event and part of the
+/// attach reply. The token is included: this crosses the loopback socket
+/// under a per-start secret, the same trust domain that already carries it
+/// in QCB_AGENT_TOKEN.
+pub fn live_view(cfg: &Config) -> serde_json::Value {
+    serde_json::json!({
+        "peer": cfg.peer,
+        "token": cfg.token,
+        "fingerprint": cfg.fingerprint,
+        "name": cfg.display_name(),
+        "name_is_default": cfg.name.trim().is_empty(),
+        "discovery": cfg.discovery,
+        "phonebook": cfg.phonebook,
+        "blender_path": cfg.blender_path,
+        "blender_args": cfg.blender_args,
+        "kiosk": cfg.kiosk,
+        "idle_secs": cfg.idle_secs,
+        "cap_mbps": cfg.cap_mbps,
+        "capture_scale": cfg.capture_scale,
+        // Restart-only, reported so the addon can show them read-only.
+        "role": cfg.role,
+        "listen": cfg.listen,
+    })
+}
+
+/// Some(true)/Some(false) when the OS can say; None when it cannot (Windows
+/// without windows-sys — tracked for the port). Never claims "alive" on a
+/// guess: an unknown answer must not stop an agent from starting.
+pub fn pid_alive(pid: u32) -> Option<bool> {
+    if pid == std::process::id() {
+        return Some(true);
+    }
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if rc == 0 {
+            return Some(true);
+        }
+        return Some(std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Another agent of this role, still running, registered in this directory.
+/// agent.json has always recorded a pid; nothing read it, so two agents of
+/// one role silently overwrote each other. With discovery, two of them
+/// would also both beacon.
+pub fn registered_live_pid(base: &Path, role: &str) -> Option<u32> {
+    let text = std::fs::read_to_string(socket_info_path(base)).ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let pid = doc.get(role)?.get("pid")?.as_u64()? as u32;
+    if pid == std::process::id() {
+        return None;
+    }
+    (pid_alive(pid) == Some(true)).then_some(pid)
+}
+
+pub fn config_dir() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(std::env::temp_dir).join("QCBridge")
+}
+
+pub fn config_path() -> PathBuf {
+    config_dir().join("agent.toml")
+}
+
+/// Everything an agent instance owns sits beside its config file: the TOML,
+/// the certificate, and the agent.json the addon reads. Deriving them from
+/// the config path is what makes `--config` isolate an instance — before,
+/// only the TOML moved, so two agents pointed at different configs still
+/// shared one certificate and one agent.json. For the default config path
+/// this resolves to exactly where those files already live.
+pub fn base_dir(config_path: &Path) -> PathBuf {
+    config_path.parent().map(Path::to_path_buf).unwrap_or_else(config_dir)
+}
+
+/// Where the addon looks for {port, secret}: written by the agent at start.
+pub fn socket_info_path(base: &Path) -> PathBuf {
+    base.join("agent.json")
+}
+
+pub fn cert_dir(base: &Path) -> PathBuf {
+    base.join("cert")
+}
+
+pub fn load_or_create(path: &PathBuf) -> Result<Config> {
+    if path.exists() {
+        let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        return toml::from_str(&text).with_context(|| format!("parse {}", path.display()));
+    }
+    let cfg = Config::default();
+    save(path, &cfg)?;
+    Ok(cfg)
+}
+
+pub fn save(path: &PathBuf, cfg: &Config) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, toml::to_string_pretty(cfg)?)?;
+    Ok(())
+}
+
+/// agent.json holds one entry per role, so a host and a replica agent can
+/// share a machine (dev, or a workstation that is both).
+pub fn write_socket_info(base: &Path, role: &str, port: u16, secret: &str) -> Result<()> {
+    let path = socket_info_path(base);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mine = serde_json::json!({"port": port, "secret": secret, "pid": std::process::id()});
+    // Two agents starting together race on this file; write, re-read, and
+    // retry until our own entry is what's on disk. Only role keys survive.
+    for attempt in 0..5 {
+        let mut doc = serde_json::json!({});
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&text) {
+                for (k, v) in map {
+                    if (k == "host" || k == "replica") && v.is_object() {
+                        doc[k] = v;
+                    }
+                }
+            }
+        }
+        doc[role] = mine.clone();
+        std::fs::write(&path, doc.to_string())?;
+        std::thread::sleep(std::time::Duration::from_millis(50 + 30 * attempt));
+        let back: Option<serde_json::Value> = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok());
+        if back.as_ref().and_then(|d| d.get(role)) == Some(&mine) {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("could not register in {}", path.display())
+}
+
+pub fn remove_socket_info(base: &Path, role: &str) {
+    let path = socket_info_path(base);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(obj) = doc.as_object_mut() {
+                obj.remove(role);
+                if obj.is_empty() {
+                    let _ = std::fs::remove_file(&path);
+                } else {
+                    let _ = std::fs::write(&path, doc.to_string());
+                }
+            }
+        }
+    }
+}
+
+
+/// The one config, shared by everything that holds one.
+///
+/// It used to be cloned three ways — the agent, the Blender lifecycle and
+/// the host observer each owned a copy — and only the observer's was updated
+/// when a certificate was pinned. So `Agent.cfg.fingerprint` was stale for
+/// the life of the process, and the lifecycle could never see an edited
+/// `blender_path` or `idle_secs`. Any runtime settings work would have
+/// written to one copy and been invisible to the rest.
+///
+/// Read with `with`, change with `update`, and keep both closures short:
+/// the lock is held for their duration and every holder shares it.
+#[derive(Clone)]
+pub struct SharedConfig(Arc<Mutex<Config>>);
+
+impl SharedConfig {
+    pub fn new(cfg: Config) -> Self {
+        Self(Arc::new(Mutex::new(cfg)))
+    }
+
+    pub fn with<T>(&self, f: impl FnOnce(&Config) -> T) -> T {
+        f(&self.0.lock().unwrap())
+    }
+
+    pub fn update<T>(&self, f: impl FnOnce(&mut Config) -> T) -> T {
+        f(&mut self.0.lock().unwrap())
+    }
+
+    /// A whole copy, for the few places that want one (saving to disk).
+    pub fn snapshot(&self) -> Config {
+        self.0.lock().unwrap().clone()
+    }
+
+    // The two most-read facts, which never change after startup but are
+    // read often enough that `with(|c| ...)` at every site buries them.
+    pub fn role(&self) -> String {
+        self.with(|c| c.role.clone())
+    }
+
+    pub fn is_host(&self) -> bool {
+        self.with(|c| c.role == "host")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this type exists to prevent: the config used to be cloned per
+    /// holder, so a write through one was invisible to the rest. A pinned
+    /// fingerprint reached the host observer and nothing else.
+    #[test]
+    fn a_write_through_one_handle_is_visible_through_another() {
+        let a = SharedConfig::new(Config::default());
+        let b = a.clone();
+        assert!(b.with(|c| c.fingerprint.is_empty()));
+
+        a.update(|c| c.fingerprint = "abc123".into());
+
+        assert_eq!(b.with(|c| c.fingerprint.clone()), "abc123");
+        assert_eq!(a.snapshot().fingerprint, "abc123");
+    }
+
+    #[test]
+    fn a_toml_without_the_new_fields_gets_their_defaults() {
+        let cfg: Config = toml::from_str("role = \"host\"\ntoken = \"t\"\n").unwrap();
+        assert_eq!(cfg.discovery, "direct");
+        assert!(cfg.name.is_empty() && cfg.phonebook.is_empty());
+        assert!(!cfg.display_name().is_empty(), "falls back to the machine name");
+    }
+
+    #[test]
+    fn machine_name_is_never_empty() {
+        assert!(!machine_name().is_empty());
+    }
+
+    #[test]
+    fn apply_live_changes_live_fields_and_reports_the_rest() {
+        let mut cfg = Config::default();
+        let a = apply_live(&mut cfg, &serde_json::json!({
+            "peer": "10.0.0.5:19990", "idle_secs": 60, "discovery": "discoverable",
+            "listen": "0.0.0.0:1", "role": "host",
+            "nonsense": 1,
+        }));
+        assert_eq!(cfg.peer, "10.0.0.5:19990");
+        assert_eq!(cfg.idle_secs, 60);
+        assert_eq!(cfg.discovery, "discoverable");
+        // Order is not a contract: a JSON object iterates by sorted key.
+        let sorted = |v: &Vec<String>| { let mut v = v.clone(); v.sort(); v };
+        assert_eq!(sorted(&a.changed), vec!["discovery", "idle_secs", "peer"]);
+        assert_eq!(sorted(&a.needs_restart), vec!["listen", "role"]);
+        assert_eq!(a.rejected, vec!["nonsense"]);
+        // Restart-only fields were not touched.
+        assert_eq!(cfg.listen, Config::default().listen);
+        assert_eq!(cfg.role, Config::default().role);
+    }
+
+    #[test]
+    fn apply_live_rejects_bad_values_instead_of_coercing() {
+        let mut cfg = Config::default();
+        let a = apply_live(&mut cfg, &serde_json::json!({
+            "discovery": "loud", "idle_secs": "sixty", "capture_scale": 2.0, "kiosk": 1,
+        }));
+        assert!(a.changed.is_empty());
+        assert_eq!(a.rejected.len(), 4);
+        assert_eq!(cfg.discovery, "direct");
+    }
+
+    #[test]
+    fn our_own_pid_is_alive_and_a_nonsense_pid_is_not() {
+        assert_eq!(pid_alive(std::process::id()), Some(true));
+        if cfg!(unix) {
+            assert_eq!(pid_alive(u32::MAX - 7), Some(false));
+        }
+    }
+
+    /// A snapshot is a copy on purpose — it is what gets written to disk —
+    /// so changing it must not change what the others see.
+    #[test]
+    fn a_snapshot_is_detached() {
+        let a = SharedConfig::new(Config::default());
+        let mut snap = a.snapshot();
+        snap.token = "edited".into();
+        assert!(a.with(|c| c.token.is_empty()));
+    }
+}

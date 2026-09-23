@@ -146,6 +146,20 @@ def from_canonical(wire_path: str, mappings) -> str:
     return translate(WIRE_OS, current_os_tag(), wire_path, mappings)
 
 
+def localize_any(path: str, mappings) -> str:
+    """Host-native path of unknown OS → local native form. A bootstrap or a
+    blob carries the host's paths exactly as Blender stored them, in the
+    host's own form — nobody canonicalizes them. Try every source form the
+    table knows and take the first that matches a mapping; fall through
+    unchanged (the caller decides, by existence, whether that is a miss)."""
+    local = current_os_tag()
+    for source in (WIRE_OS, "mac", "lin"):
+        translated = translate(source, local, path, mappings)
+        if translated != to_native(path, local):
+            return translated
+    return path
+
+
 def is_mapped(source_os: str, path: str, mappings) -> bool:
     """True if some enabled mapping covers `path` — the honesty check:
     unmapped paths crossing the wire get surfaced in the status overlay."""
