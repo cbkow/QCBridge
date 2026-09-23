@@ -63,6 +63,17 @@ numbers behind `SYNC-AUDIT.md` §1 are in
 `spikes/parity/results/2026-09-23-sync-latency/`. Run it before and after any
 change to the debounce, the flush tick, the sweep, or the lanes.
 
+## The coverage survey
+
+`coverage/run_coverage.sh` is a survey, not a gate: it drives 120-odd user
+actions from `coverage/catalog.py` through a live pair and reports, per
+action, whether the property that matters reached the replica and how fast.
+A match after the settle window is reported as *piggybacked* — a later action
+shipped the datablock, the edit itself was not detected. `QCB_COV_ONLY`
+isolates rows so nothing later can rescue them. The results and their
+reading are `COVERAGE.md`; adding an action is one function with a `@probe`.
+Run it after any change to detection, and expect the counts to move.
+
 ## Things that are load-bearing
 
 - **Separate `BLENDER_USER_RESOURCES` per instance.** `save_settings` writes

@@ -96,7 +96,7 @@ on the pong.
 
 | # | finding | where | status |
 |---|---|---|---|
-| A1 | **Shader-node property edits never cross.** `_walk_sockets` reads socket `default_value` and links only; a Math node's operation, a ColorRamp, `node.image`, node mute — invisible. | `host_handlers.py:777-792` | confirmed |
+| A1 | **Shader-node property edits are invisible to the material's own diff.** `_walk_sockets` reads socket `default_value` and links only. Measured (`COVERAGE.md`): a Math operation, mute, ColorRamp stop or `node.image` on a node **wired into the shader** does reach the replica — but only because the Mesh wearing the material is resent whole (D7); on a dangling node, nothing crosses. | `host_handlers.py:777-792` | confirmed + measured |
 | A2 | **Tier-1 edits are destroyed when they share a diff with a Scene structural change.** The shadow advances at `:307` before the structural test at `:318`; a Scene cannot be tier-2 serialized (`tier2_io.py:49-58` returns `None`), so `@scene_camera`, view transform, resolution in that window are consumed and never sent. | `host_handlers.py:300-327` | confirmed |
 | A3 | **Image datablocks are not detected.** Not in `_is_syncable_id`; texture paint, reload, re-rendered bakes stay stale. | `host_handlers.py:446-449` | confirmed |
 | A4 | **`object.data` re-link, material slots, `instance_collection` are untracked** — swap the mesh under an object, empty diff, nothing sent. | `shadow.py:24-34`, `build_snapshot` | confirmed |
@@ -135,6 +135,7 @@ on the pong.
 | D4 | A 50 MiB blob is copied ≥4 times per direction (`pack_cold` join, `_read_exact` join, agent `vec!` per frame, `Reassembler` join); 4 MiB chunking is a zmq-era limit — lanes accept 256 MiB. | `transport_agent.py:78-80, 251-262`, `link.rs:179`, `protocol.py:217` | reported |
 | D5 | `stats` (rtt, loss, cwnd, mtu, mbps) is emitted at 1 Hz and read by nobody. `"listening"` event branch the agent never emits; `FLAG_HOLD`, cold kind `"sync"`, the fixed-rate pacer — declared, unused. | `transport_agent.py:525, 687`, `protocol.py:25, 144` | reported |
 | D6 | `build_snapshot` walks `_layer_collections()` once per collection — O(n²) on the main thread. | `host_handlers.py:767` | reported |
+| D7 | **Every shader-affecting material edit resends every Mesh that wears it, whole.** The depsgraph flags the mesh (shading), the handler discards `is_updated_geometry`, and Mesh is unconditional tier 2 — a 64 KB blob per slider tick on a four-vertex plane, a full mesh in production. | `classifier.py:54-55`, measured in `COVERAGE.md` | confirmed + measured |
 
 ---
 
@@ -199,11 +200,11 @@ light pose digest and take it from the depsgraph path only; D2
 `update_from_editmode()` before serializing a Mesh in edit mode, and rate-limit
 per-Mesh tier-2 to one in flight.
 
-**P4 — cover it (ongoing).** Smokes for every "never exercised" row in the
-detection sweep: visibility and collection exclude, rename and delete,
-material node edits, image reload, edit-mode, undo, replica restart, gap →
-resync, path mapping on a real mapping table. `replica_clean` should include
-`unmapped_paths` and a datablock-parity count.
+**P4 — cover it (ongoing).** `smokes/coverage/` now surveys 122 user
+actions (`COVERAGE.md`: 72 cross, 50 don't) and is the acceptance test for
+P1 and P3 — every fix should turn a row. Still missing from any harness:
+replica restart, gap → resync, path mapping on a real mapping table, undo.
+`replica_clean` should include `unmapped_paths` and a datablock-parity count.
 
 ---
 

@@ -1,0 +1,121 @@
+{
+ "rows": [
+  {
+   "key": "mat_image_assign",
+   "group": "material",
+   "desc": "assign an image to an Image Texture node",
+   "status": "piggybacked",
+   "latency_ms": 4435,
+   "expected": "\"CovImg\"",
+   "last_seen": "\"CovImg\"",
+   "error": null
+  },
+  {
+   "key": "mat_node_add",
+   "group": "material",
+   "desc": "add a node",
+   "status": "crossed",
+   "latency_ms": 376,
+   "expected": "true",
+   "last_seen": "true",
+   "error": null
+  },
+  {
+   "key": "mat_settings",
+   "group": "material",
+   "desc": "render method / backface culling / displacement",
+   "status": "crossed",
+   "latency_ms": 363,
+   "expected": "[\"BLENDED\", true, \"BOTH\"]",
+   "last_seen": "[\"BLENDED\", true, \"BOTH\"]",
+   "error": null
+  },
+  {
+   "key": "image_colorspace",
+   "group": "image",
+   "desc": "image colorspace",
+   "status": "crossed",
+   "latency_ms": 369,
+   "expected": "\"Non-Color\"",
+   "last_seen": "\"Non-Color\"",
+   "error": null
+  },
+  {
+   "key": "metaball_add",
+   "group": "othertypes",
+   "desc": "metaball object",
+   "status": "crossed",
+   "latency_ms": 351,
+   "expected": "1.7",
+   "last_seen": "1.7",
+   "error": null
+  },
+  {
+   "key": "grease_pencil_add",
+   "group": "othertypes",
+   "desc": "grease pencil object with a layer",
+   "status": "crossed",
+   "latency_ms": 341,
+   "expected": "[\"GREASEPENCIL\", [\"Color\", \"Lines\", \"CovLayer\"]]",
+   "last_seen": "[\"GREASEPENCIL\", [\"Color\", \"Lines\", \"CovLayer\"]]",
+   "error": null
+  },
+  {
+   "key": "metaball_edit_later",
+   "group": "othertypes",
+   "desc": "edit the metaball after it exists",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "0.6",
+   "last_seen": "1.7",
+   "error": null
+  },
+  {
+   "key": "gp_layer_later",
+   "group": "othertypes",
+   "desc": "add a grease pencil layer after it exists",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "[\"Color\", \"Lines\", \"CovLayer\", \"CovLayer2\"]",
+   "last_seen": "[\"Color\", \"Lines\", \"CovLayer\"]",
+   "error": null
+  },
+  {
+   "key": "lightprobe_add",
+   "group": "othertypes",
+   "desc": "light probe",
+   "status": "crossed",
+   "latency_ms": 238,
+   "expected": "4.2",
+   "last_seen": "4.2",
+   "error": null
+  },
+  {
+   "key": "lightprobe_edit_later",
+   "group": "othertypes",
+   "desc": "edit the light probe after it exists",
+   "status": "NOT crossed",
+   "latency_ms": null,
+   "expected": "1.1",
+   "last_seen": "4.2",
+   "error": null
+  }
+ ],
+ "counts": {
+  "piggybacked": 1,
+  "crossed": 6,
+  "NOT crossed": 3
+ },
+ "replica_stats": {
+  "seq": 16,
+  "gaps": 0,
+  "applied_t1": 1,
+  "apply_errors": 0,
+  "unknown_uuid": 0,
+  "applied_t2": 14,
+  "bootstraps": 1,
+  "unmapped_paths": 0,
+  "host_ended": false,
+  "last_error": ""
+ }
+}
