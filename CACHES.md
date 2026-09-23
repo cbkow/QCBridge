@@ -261,8 +261,14 @@ is what the sync already carries well.
 
 ## 5. What is still unprobed
 
-- Mantaflow: whether `cache_directory` survives a partial write, and whether a
-  domain reads an absolute mapped directory without a rescan.
+- ~~Mantaflow~~ — probed 2026-09-23 evening (`probes/caches/fluid_*.py`): a
+  liquid domain baked with an absolute `cache_directory` keeps it through a
+  partial write (unlike a GN `bake_directory`) and reads its frames as
+  appended and after the directory is remapped to an alias (domain mesh
+  1198 → 1172 vertices across frames on both sides). The renamed full copy
+  turns the directory into `//cache`, which `localize_object_paths` already
+  absolutizes against the mapped project dir. Step D covers fluids as
+  written.
 - The rigid-body world cache under an external path.
 - Whether a `CacheFile` repointed on the replica needs an explicit reload
   (only `Image` gets one today).

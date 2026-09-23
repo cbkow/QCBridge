@@ -46,3 +46,8 @@ reads the host's value after the bake. Run with `S=<scratch>` exported and
 tier-2 append path: the appended cache reads every frame untouched; assigning
 the path or toggling external is safe; `wipe` is the sequence that destroys
 the directory (re-setting the disk/external flags on an evaluated cache).
+
+`fluid_host.py` bakes a small Mantaflow liquid with an absolute
+`cache_directory` and writes a partial and a renamed copy; `fluid_replica.py
+-- append|boot` reads each, remaps the directory to an alias, and reports
+whether the domain still evaluates from the cache.
