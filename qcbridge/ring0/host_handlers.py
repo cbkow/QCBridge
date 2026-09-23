@@ -31,6 +31,8 @@ from . import bootstrap, identity, tier2_io
 
 _FLUSH_TICK = 0.05
 _SWEEP_INTERVAL = 0.5
+_AUTO_BOOT_DEBOUNCE = 1.0    # wait for the burst of Scene edits to end
+_AUTO_BOOT_MIN_INTERVAL = 5.0  # never more than one automatic bootstrap per
 _DEBUG = bool(os.environ.get("QCB_DEBUG"))
 
 # bpy ID type → shadow.TRACKED key (isinstance covers subclasses, e.g. the
@@ -59,11 +61,20 @@ def _layer_collections():
     walk(bpy.context.view_layer.layer_collection)
     return result
 
+# Geometry datablocks the depsgraph pings with a shading-only update when a
+# material or image they wear changes. An Action's keyframe edit also arrives
+# as shade=True (measured 5.2), so the skip is by type, not by flag alone.
+_SHADING_PINGED = (
+    bpy.types.Mesh, bpy.types.Curve, bpy.types.Curves, bpy.types.PointCloud,
+    bpy.types.Volume, bpy.types.MetaBall, bpy.types.GreasePencil, bpy.types.Lattice,
+)
+
 # Collections swept for deletions (only types we stamp/track).
 _SWEPT_COLLECTIONS = (
     "objects", "lights", "cameras", "materials", "worlds", "scenes", "meshes",
     "curves", "images", "node_groups", "collections", "actions", "shape_keys",
-    "lattices", "armatures",
+    "lattices", "armatures", "metaballs", "volumes", "hair_curves",
+    "pointclouds", "lightprobes", "grease_pencils", "textures", "particles",
 )
 
 
@@ -87,6 +98,13 @@ class HostSync:
                              # for Force Resync until one ships
         self.sync_errors = 0
         self.last_sync_error = ""
+        # uuids the replica holds: everything with users at the last
+        # bootstrap (a full save writes no orphans) plus every blob since.
+        # A pointer to anything else ships that datablock first.
+        self._shipped: set[str] = set()
+        self._auto_boot_at = 0.0     # monotonic; 0 = none pending
+        self._last_auto_boot = float("-inf")
+        self.auto_boots = 0
         # Nothing marks until the first bootstrap is serialized: every edit
         # and every depsgraph batch before that moment — the file-open
         # flood, pre-session edits, our own uuid stamping — is inside the
@@ -148,11 +166,33 @@ class HostSync:
                 lc.hide_viewport if lc else None,
                 coll.hide_viewport,
                 coll.hide_render,
+                _idprops_digest(coll),
             )
             if self._vis_state.get(uuid) != vector:
                 self._vis_state[uuid] = vector
                 self.dirty.mark(uuid, Tier.T1)
                 self.debounce.touch(uuid, now)
+        for coll_name in _SWEPT_T1_TYPES:
+            for db in getattr(bpy.data, coll_name):
+                uuid = self.registry.uuid_for(db.session_uid)
+                if uuid is None:
+                    continue
+                vector = _datablock_sweep_vector(db)
+                if self._vis_state.get(uuid) != vector:
+                    self._vis_state[uuid] = vector
+                    self.dirty.mark(uuid, Tier.T1)
+                    self.debounce.touch(uuid, now)
+        # Mesh custom props: tier-2-only type, the blob carries them.
+        for me in bpy.data.meshes:
+            uuid = self.registry.uuid_for(me.session_uid)
+            if uuid is None:
+                continue
+            digest = _idprops_digest(me)
+            if self._vis_state.get(uuid) != digest:
+                if uuid in self._vis_state:  # first sample primes only
+                    self.dirty.mark(uuid, Tier.T2)
+                    self.debounce.touch(uuid, now)
+                self._vis_state[uuid] = digest
 
     def reset_for_new_file(self) -> None:
         """The host opened a different file (or a new one) mid-session: all
@@ -187,6 +227,11 @@ class HostSync:
                 uuid = identity.ensure_uuid(db, self.registry)
                 self._uuid_to_db[uuid] = db
                 self.dirty.assume_known(uuid)
+                if db.users == 0 and not db.use_fake_user:
+                    # A full save writes no orphans: the replica does NOT
+                    # have this one. Leave its shadow unprimed so the first
+                    # reference or edit ships it whole (first contact).
+                    continue
                 if _type_key(db) is not None:
                     snapshot = build_snapshot(db)
                     self.shadow.diff_and_update(uuid, snapshot)
@@ -212,6 +257,17 @@ class HostSync:
                     continue
                 type_key = _type_key(db)
                 if type_key is None and not _is_syncable_id(db):
+                    continue
+                if (
+                    isinstance(db, _SHADING_PINGED)
+                    and update.is_updated_shading
+                    and not update.is_updated_geometry
+                    and not update.is_updated_transform
+                ):
+                    # A material/image edit pings every Mesh wearing it with
+                    # a shading-only update. The mesh did not change; the
+                    # material reports on its own ID. Resending the whole
+                    # mesh per slider tick was SYNC-AUDIT D7.
                     continue
                 uuid = identity.ensure_uuid(db, self.registry)
                 self._uuid_to_db[uuid] = db
@@ -244,6 +300,10 @@ class HostSync:
         }
         blob_id = f"boot.{self.sent_boot}.{self.seq + 1}"
         self._boot_outbox.extend(protocol.chunk_blob("boot", blob_id, data, meta=meta))
+        self._shipped = {
+            uuid for uuid, db in self._uuid_to_db.items()
+            if _alive(db) and (db.users > 0 or db.use_fake_user)
+        }
         self.sent_boot += 1
         # bake_note / t2_unsupported clear when the last chunk actually
         # leaves (flush), not here: a queued bootstrap is not a shipped one.
@@ -280,6 +340,14 @@ class HostSync:
                 return _FLUSH_TICK  # backpressure: try again next tick
         if self._suppress_marks:
             return _FLUSH_TICK  # pre-handshake: the bootstrap will cover it
+        if self._auto_boot_at and now >= self._auto_boot_at:
+            if now - self._last_auto_boot >= _AUTO_BOOT_MIN_INTERVAL:
+                self._auto_boot_at = 0.0
+                self._last_auto_boot = now
+                self.auto_boots += 1
+                self.send_bootstrap()
+                return _FLUSH_TICK  # drain it first
+            # else: keep it pending until the interval allows
         if now - self._last_sweep >= _SWEEP_INTERVAL:
             self._sweep_deletions()
             self._last_sweep = now
@@ -308,6 +376,8 @@ class HostSync:
         except ReferenceError:  # died between mark and flush; sweep will see it
             return
         diff = self.shadow.diff_and_update(uuid, snapshot)
+        if diff is None and db.users == 0 and not db.use_fake_user:
+            return  # orphan: primed, not shipped — nothing on the replica needs it yet
         if diff is None:
             # First contact AFTER the initial scan (which primes every
             # scan-time shadow): a datablock created mid-session, which the
@@ -325,11 +395,36 @@ class HostSync:
             # already debounce-ready, and no further event may ever touch it.
             if _DEBUG:
                 print(f"qcb escalate T2 {db.name}", flush=True)
-            self._flush_t2(uuid, snapshot)
+            # The shadow already advanced past these tier-1 changes; if the
+            # blob is refused (Scene) they must still go out (SYNC-AUDIT A2).
+            self._flush_t2(uuid, snapshot, fallback=diff["changes"])
             return
-        changes = diff["changes"]
+        self._send_t1(uuid, db, diff["changes"])
+
+    # "@" pointer setters and the bpy.data collection their names resolve in.
+    _POINTER_SETTERS = {
+        "@scene_world": "worlds", "@scene_camera": "objects",
+        "@instance_collection": "collections", "@dof_focus_object": "objects",
+        "@ll_receiver": "collections", "@ll_blocker": "collections",
+    }
+
+    def _send_t1(self, uuid: str, db, changes: list) -> None:
         if not changes:
             return
+        # Setters first: "@rbw" must create the world before
+        # "rigidbody_world.*" paths write into it.
+        changes = sorted(changes, key=lambda c: not c[0].startswith("@"))
+        # A pointer's target may be new to the replica (a world with no
+        # users is not in the bootstrap); ship it before naming it.
+        for path, value in changes:
+            coll = self._POINTER_SETTERS.get(path)
+            if coll and value:
+                target = getattr(bpy.data, coll).get(value)
+                if target is not None and identity.is_stampable(target):
+                    t_uuid = identity.ensure_uuid(target, self.registry)
+                    self._uuid_to_db[t_uuid] = target
+                    if t_uuid not in self._shipped:
+                        self._flush_t2(t_uuid)
         self.seq += 1
         header = {"kind": "t1", "seq": self.seq, "uuid": uuid}
         payload = json.dumps(changes).encode("utf-8")
@@ -341,7 +436,8 @@ class HostSync:
             self.seq -= 1
             self.dirty.requeue(uuid, Tier.T1)
 
-    def _flush_t2(self, uuid: str, snapshot: dict | None = None) -> None:
+    def _flush_t2(self, uuid: str, snapshot: dict | None = None,
+                  fallback: list | None = None) -> None:
         """snapshot — the caller's already-built build_snapshot(db), when it
         has one (pose digests on heavy rigs make building it twice a real
         main-thread cost)."""
@@ -369,11 +465,16 @@ class HostSync:
         except ReferenceError:
             return  # died between mark and flush; sweep will tombstone it
         if data is None:
-            # Type we don't resend (e.g. Scene structural change) — surfaced,
-            # not silent: force-resync (M6) is the recovery.
+            # Type we don't resend (Scene: it IS the file). The tier-1 half
+            # of the diff still goes out, and the structural half is covered
+            # by an automatic bootstrap, debounced and rate-limited — the
+            # replica may be behind, never wrong (decision #5).
             self.t2_unsupported += 1
+            if fallback:
+                self._send_t1(uuid, db, fallback)
+            self._auto_boot_at = time.monotonic() + _AUTO_BOOT_DEBOUNCE
             if _DEBUG:
-                print(f"qcb t2 UNSUPPORTED {type(db).__name__}:{db.name}", flush=True)
+                print(f"qcb t2 UNSUPPORTED {type(db).__name__}:{db.name} → auto bootstrap", flush=True)
             return
         # Refresh the shadow so tier-1 doesn't re-send state the blob carries.
         self.shadow.diff_and_update(
@@ -389,6 +490,7 @@ class HostSync:
                 self.dirty.requeue(uuid, Tier.T2)  # partial superseded later
                 return
         self.sent_t2 += 1
+        self._shipped.add(uuid)
         if _DEBUG:
             print(f"qcb t2 send {db.name} ({len(data)} bytes)", flush=True)
 
@@ -448,7 +550,12 @@ def _is_syncable_id(db: bpy.types.ID) -> bool:
     # snapped it back on the next scrub).
     return isinstance(
         db, (bpy.types.Mesh, bpy.types.Curve, bpy.types.NodeTree,
-             bpy.types.Action, bpy.types.Lattice, bpy.types.Armature)
+             bpy.types.Action, bpy.types.Lattice, bpy.types.Armature,
+             # 2026-09-23 (COVERAGE.md): edits to these used to be invisible
+             bpy.types.Image, bpy.types.MetaBall, bpy.types.Volume,
+             bpy.types.Curves, bpy.types.PointCloud, bpy.types.LightProbe,
+             bpy.types.GreasePencil, bpy.types.Texture,
+             bpy.types.ParticleSettings)
     )
 
 
@@ -472,6 +579,10 @@ _DIGEST_SKIP = {"rna_type", "name", "type", "show_expanded", "is_active", "point
 
 
 def _digest_value(value):
+    if isinstance(value, (bpy.types.Texture, bpy.types.ParticleSettings)):
+        # Settings datablocks that only ever ride as a dependency: a change
+        # INSIDE them must re-ship the owner (COVERAGE.md cause 5).
+        return ("id", value.session_uid, _settings_digest(value, 1))
     if isinstance(value, bpy.types.ID):
         return ("id", value.session_uid)  # identity, rename-proof
     if isinstance(value, set):  # enum-flag props iterate unordered
@@ -598,13 +709,38 @@ def _pose_digest(pose, full: bool) -> str:
     return hashlib.md5(repr(parts).encode()).hexdigest()[:16]
 
 
+def _alive(db) -> bool:
+    try:
+        db.name
+        return True
+    except ReferenceError:
+        return False
+
+
+def _idprop_value(v):
+    if isinstance(v, idprop.types.IDPropertyGroup):
+        return ("group", repr(v.to_dict()))  # nested settings, e.g. scene["cycles"]
+    return _digest_value(v)
+
+
 def _idprops_digest(struct) -> str:
     parts = [
-        (k, _digest_value(v))
+        (k, _idprop_value(v))
         for k, v in sorted(struct.items(), key=lambda kv: kv[0])
         if k != identity.UUID_PROP and not k.startswith("_")
     ]
     return hashlib.md5(repr(parts).encode()).hexdigest()[:16]
+
+
+def _idprop_groups_signature(db) -> list:
+    """Group-valued custom props never ride tier 1 (a coerced group would
+    write back as a list), so a group appearing or changing is structure:
+    the tier-2 blob carries it whole."""
+    return sorted(
+        [k, _idprop_value(v)[1]]
+        for k, v in db.items()
+        if isinstance(v, idprop.types.IDPropertyGroup) and not k.startswith("_")
+    )
 
 
 def _object_sweep_vector(obj: bpy.types.Object) -> tuple:
@@ -623,7 +759,31 @@ def _object_sweep_vector(obj: bpy.types.Object) -> tuple:
         _pose_digest(obj.pose, full=False) if obj.pose is not None else None,
         obj.name,  # renames fire no depsgraph event; name-keyed setters
                    # (@scene_camera) die on stale names without this
+        # Cosmetic/instancing/visibility toggles whose depsgraph events are
+        # not relied on (COVERAGE.md): cheap to sample, so sample them.
+        obj.display_type, obj.show_in_front, obj.instance_type,
+        obj.instance_collection.name if obj.instance_collection else "",
+        obj.visible_camera, obj.is_holdout, obj.is_shadow_catcher,
+        obj.field.type if obj.field else "",
     )
+
+
+def _datablock_sweep_vector(db) -> tuple:
+    """Non-object tier-1 datablocks: custom props (raw writes fire nothing)
+    and, for scenes, the structure that no event reliably announces."""
+    vec = [_idprops_digest(db), db.name]
+    if isinstance(db, bpy.types.Scene):
+        # Render/engine settings (cycles.samples, eevee.*) fire no depsgraph
+        # event and live in registered groups .items() does not expose —
+        # so the sweep digests the scene's whole tier-1 snapshot. One scene,
+        # a few hundred paths: cheap.
+        vec.append(hashlib.md5(
+            json.dumps(build_snapshot(db), sort_keys=True, default=str).encode()
+        ).hexdigest())
+    return tuple(vec)
+
+
+_SWEPT_T1_TYPES = ("scenes", "materials", "worlds", "lights", "cameras")
 
 
 def _anim_signature(anim) -> list | None:
@@ -648,7 +808,16 @@ def _anim_signature(anim) -> list | None:
     ]
     return [
         anim.action.session_uid if anim.action else None,
-        len(anim.nla_tracks),
+        [
+            [t.name, t.mute, t.is_solo, [
+                [st.name, round(st.frame_start, 3), round(st.frame_end, 3), st.mute,
+                 st.action.session_uid if st.action else None, st.blend_type,
+                 round(st.influence, 4), round(st.scale, 4), round(st.repeat, 4),
+                 round(st.action_frame_start, 3), round(st.action_frame_end, 3)]
+                for st in t.strips
+            ]]
+            for t in anim.nla_tracks
+        ],
         drivers,
     ]
 
@@ -723,19 +892,27 @@ def build_snapshot(db: bpy.types.ID) -> dict:
             [c.name, c.type, _settings_digest(c)] for c in db.constraints
         ]
         snapshot["~pcache"] = _pcache_signature(db)
+        # The datablock under the object and its material slots: a swap
+        # changes no tracked path, so it is structure (SYNC-AUDIT A4). The
+        # blob carries the new data/materials as dependencies.
+        snapshot["~data"] = None if db.data is None else [
+            type(db.data).__name__, db.data.session_uid]
+        snapshot["~materials"] = [
+            [slot.link, slot.material.session_uid if slot.material else None]
+            for slot in db.material_slots
+        ]
+        # Pointers that a name can carry (the replica has the same names).
+        snapshot["@instance_collection"] = (
+            db.instance_collection.name if db.instance_collection else "")
+        ll = db.light_linking
+        snapshot["@ll_receiver"] = ll.receiver_collection.name if ll.receiver_collection else ""
+        snapshot["@ll_blocker"] = ll.blocker_collection.name if ll.blocker_collection else ""
         # Custom properties: rig-control sliders live here. json.dumps in
         # the path so names with dots/quotes survive the replica's parse
         # (db[json.loads(path[1:-1])]). Add/remove changes the path set →
         # structural escalation for free. Non-coercible values (nested
         # groups) are skipped — documented limitation.
-        for prop_name, prop_value in db.items():
-            if prop_name == identity.UUID_PROP or prop_name.startswith("_"):
-                continue
-            value = _coerce(prop_value)
-            if value is not None and not _contains_none(value):
-                # a None inside an array would make the replica's idprop
-                # assignment raise per-apply — skip, don't half-send
-                snapshot[f"[{json.dumps(prop_name)}]"] = value
+        _snapshot_idprops(db, snapshot)
         if db.pose is not None:
             # Full pose digest: any pose change (bone transforms, per-bone
             # constraints/bbone/idprops) escalates to a tier-2 resend of the
@@ -758,9 +935,35 @@ def build_snapshot(db: bpy.types.ID) -> dict:
             base = f"key_blocks[{json.dumps(kb.name)}]"
             snapshot[f"{base}.value"] = kb.value
             snapshot[f"{base}.mute"] = kb.mute
+    if isinstance(db, bpy.types.Camera):
+        snapshot["@dof_focus_object"] = db.dof.focus_object.name if db.dof.focus_object else ""
+        snapshot["~bg_images"] = [
+            [bg.source, bg.image.session_uid if bg.image else None, bg.alpha,
+             bg.display_depth, bg.frame_method, round(bg.scale, 4),
+             [round(v, 4) for v in bg.offset], round(bg.rotation, 4)]
+            for bg in db.background_images
+        ]
     if isinstance(db, bpy.types.Scene):
         # Active camera is a pointer — rides as a name, applied by setter.
         snapshot["@scene_camera"] = db.camera.name if db.camera else ""
+        snapshot["@scene_world"] = db.world.name if db.world else ""
+        snapshot["@rbw"] = db.rigidbody_world is not None
+        # Master-collection membership is Scene-embedded: no collection
+        # datablock's "~members" carries it (a new collection linked to the
+        # scene root, or an object moved out of it, was invisible).
+        snapshot["@master_members"] = [
+            sorted(o.name for o in db.collection.objects),
+            sorted(c.name for c in db.collection.children),
+        ]
+        # Scene structure nothing else carries: markers (camera binding!),
+        # view layers and their passes, the compositor. Structural → the
+        # auto-bootstrap path in _flush_t2.
+        comp = getattr(db, "compositing_node_group", None) or getattr(db, "node_tree", None)
+        snapshot["~scene_struct"] = [
+            [[m.name, m.frame, m.camera.name if m.camera else None] for m in db.timeline_markers],
+            [[vl.name, _settings_digest(vl, 1)] for vl in db.view_layers],
+            _nodes_signature(comp) if comp is not None else None,
+        ]
     if isinstance(db, bpy.types.Collection):
         # Membership is structural (link/unlink → tier-2 resend); the
         # view-layer pair (outliner checkbox + eye) applies by setter.
@@ -774,7 +977,50 @@ def build_snapshot(db: bpy.types.ID) -> dict:
     node_tree = getattr(db, "node_tree", None)
     if node_tree is not None:
         _walk_sockets(node_tree, snapshot)
+        snapshot["~nodes"] = _nodes_signature(node_tree)
+    # Custom properties on every tier-1 type (not just objects): rig
+    # controls live on objects, but pipeline metadata lives anywhere.
+    if type_key is not None and not isinstance(db, bpy.types.Object):
+        _snapshot_idprops(db, snapshot)
+    if type_key is not None and not isinstance(db, bpy.types.Scene):
+        # Scene groups are addon settings (cycles, eevee…) whose scalars
+        # ride the tracked table; elsewhere a group is user data → tier 2.
+        snapshot["~idprop_groups"] = _idprop_groups_signature(db)
     return snapshot
+
+
+def _snapshot_idprops(db, snapshot: dict) -> None:
+    for prop_name, prop_value in db.items():
+        if prop_name == identity.UUID_PROP or prop_name.startswith("_"):
+            continue
+        if isinstance(prop_value, idprop.types.IDPropertyGroup):
+            continue  # see _idprop_groups_signature
+        value = _coerce(prop_value)
+        if value is not None and not _contains_none(value):
+            snapshot[f"[{json.dumps(prop_name)}]"] = value
+
+
+def _nodes_signature(node_tree) -> list:
+    """Per-node properties the socket walk cannot see: mute, the node's own
+    settings (a Math node's operation, a Mapping type, an Image Texture's
+    image and its image_user), and ColorRamp stops. A change escalates the
+    owning material/world to tier 2 on its own — previously it crossed only
+    as a side effect of the Mesh wearing it being resent (SYNC-AUDIT A1/D7)."""
+    sig = []
+    for node in node_tree.nodes:
+        entry = [node.name, node.bl_idname, node.mute, _settings_digest(node, 1)]
+        ramp = getattr(node, "color_ramp", None)
+        if ramp is not None:
+            entry.append([ramp.interpolation, ramp.color_mode, [
+                [round(e.position, 5), [round(c, 5) for c in e.color]]
+                for e in ramp.elements
+            ]])
+        curve = getattr(node, "mapping", None)  # RGB/Vector curves
+        if curve is not None and hasattr(curve, "curves"):
+            entry.append([[[round(p.location[0], 5), round(p.location[1], 5), p.handle_type]
+                           for p in c.points] for c in curve.curves])
+        sig.append(entry)
+    return sig
 
 
 def _walk_sockets(node_tree, snapshot: dict) -> None:

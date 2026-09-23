@@ -5,6 +5,59 @@ loopback.* Companion to `SYNC-AUDIT.md` (the mechanisms) and `CACHES.md`
 (simulation caches). This one answers a single question per user action:
 **does it reach the replica, and how fast?**
 
+## After P1 — 2026-09-23, same day
+
+The survey is the acceptance test for `SYNC-AUDIT.md` §5 P1, and P1 landed
+the same day: **116 of 122 actions now cross** (from 72), the 21-check and
+reconnect smokes stay green, and the latency bench is within its bands
+(tier-1 190 ms, hot 30 ms, sweep-path 423 ms p50). Results in
+`spikes/parity/results/2026-09-23-sync-coverage/full-agent-after-p1.json`.
+The per-row tables below are the **baseline** survey and are kept as the
+record of what was wrong; run the survey for the current state.
+
+What changed, by root cause:
+
+1. *Short tracked-path tables* — Object, Light, Camera, Scene, Material,
+   World and Collection tables widened (`ring1/shadow.py`); pointers ride as
+   `@` setters (`@instance_collection`, `@dof_focus_object`, `@scene_world`,
+   `@ll_receiver/@ll_blocker`, `@rbw`, `@master_members`), applied before
+   tracked paths so `@rbw` creates the world before `rigidbody_world.*` writes.
+2. *Object-only idprop sweep* — materials, worlds, lights, cameras, scenes
+   and collections are swept too; meshes' idprops resend the mesh. Group
+   values never ride tier 1 (`~idprop_groups` escalates instead).
+3. *Scene has no tier 2* — still true, and now handled: the tier-1 half of
+   a structural Scene diff goes out (the A2 loss is gone, measured), and the
+   structural half — markers, view layers, passes, compositor — triggers an
+   **automatic bootstrap**, debounced 1 s and rate-limited to one per 5 s.
+   Those rows show as *piggybacked ~4 s* in the survey because the settle
+   window is shorter than the bootstrap; that is the design, not a miss.
+4. *Socket-only node walk* — `~nodes` digests every node's settings, mute,
+   ColorRamp stops and curves; a material escalates on its own. With that
+   in place the Mesh-per-material-tweak resend (D7) is closed: shading-only
+   updates on geometry types are skipped, by type — an Action's keyframe
+   edit also arrives as `shade=True` and must not be (found by the survey
+   regressing, fixed the same hour).
+5. *Pointer-only digests* — textures and particle settings are digested
+   through the pointer.
+6. *Types outside every set* — metaballs, grease pencil, volumes, hair
+   curves, point clouds, light probes, textures, particle settings and
+   images are syncable, swept and paired.
+
+Plus two things the survey taught along the way: the host now tracks what
+the replica actually holds (`_shipped`: everything with users at the last
+bootstrap, plus every blob since), because a full save writes no orphans
+and each bootstrap wiped any orphan shipped earlier; and NLA strips are in
+the animation signature, not just the track count.
+
+**Still not crossing, and why:**
+
+| row | why |
+|---|---|
+| new *unused* image / edits to an *unused* node group | Blender fires no depsgraph update for a datablock nothing uses, and a full save does not write it. It appears on the replica the moment it is used (the pointer rule ships it first). By design. |
+| pixel edits on an unpacked generated image | `libraries.write` carries no pixels for it; pack the image, or paint on a file-backed one. Documented limitation. |
+| linking an object from another `.blend` | linked IDs cannot be stamped; needs its own message ("link `X` from `<mapped path>`"). Deferred. |
+| undo | not surveyed (segfaults background Blender). |
+
 ## Method
 
 `smokes/coverage/run_coverage.sh` drives a live host↔replica pair through

@@ -40,6 +40,16 @@ _COLLECTIONS = (
     ("actions", bpy.types.Action),
     ("lattices", bpy.types.Lattice),
     ("armatures", bpy.types.Armature),
+    # Added 2026-09-23 (COVERAGE.md inventory): types that used to cross only
+    # as a new object's data and never again.
+    ("metaballs", bpy.types.MetaBall),
+    ("volumes", bpy.types.Volume),
+    ("hair_curves", bpy.types.Curves),
+    ("pointclouds", bpy.types.PointCloud),
+    ("lightprobes", bpy.types.LightProbe),
+    ("grease_pencils", bpy.types.GreasePencil),
+    ("textures", bpy.types.Texture),
+    ("particles", bpy.types.ParticleSettings),
     # NOTE no shape_keys entry: libraries.load has no shape_keys namespace
     # (probed 5.2) — Keys always ride their owner's blob and are paired by
     # the dedicated post-pass in apply_blob below.

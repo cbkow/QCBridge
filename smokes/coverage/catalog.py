@@ -157,6 +157,9 @@ def setup():
     # a node group
     g = bpy.data.node_groups.new("CovGroup", "ShaderNodeTree")
     v = g.nodes.new("ShaderNodeValue"); v.name = "CovVal"; v.outputs[0].default_value = 0.1
+    # Used by CovMatA: an unused group has no users, is not written by the
+    # bootstrap save, and has no business on the replica until it is used.
+    gn = nt.nodes.new("ShaderNodeGroup"); gn.name = "CovGroupNode"; gn.node_tree = g
     # vertex-parent target
     _new_mesh_obj("CovVParentTarget")
     # object to receive light linking
@@ -1153,7 +1156,8 @@ def _():
 
 @action("gp_layer_later", "othertypes", "add a grease pencil layer after it exists")
 def gp_layer():
-    obj("CovGP").data.layers.new("CovLayer2")
+    gp = obj("CovGP").data; gp.layers.new("CovLayer2")
+    gp.update_tag()  # the GP editor tags on layer add; layers.new() alone does not
 @probe(gp_layer)
 def _():
     o = obj("CovGP"); return None if o is None else [l.name for l in o.data.layers]

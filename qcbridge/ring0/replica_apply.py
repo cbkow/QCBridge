@@ -28,7 +28,8 @@ _FRAME_MIN_INTERVAL = 0.1
 _SCANNED_COLLECTIONS = (
     "objects", "lights", "cameras", "materials", "worlds", "scenes", "meshes",
     "curves", "node_groups", "images", "collections", "actions", "shape_keys",
-    "lattices", "armatures",
+    "lattices", "armatures", "metaballs", "volumes", "hair_curves",
+    "pointclouds", "lightprobes", "grease_pencils", "textures", "particles",
 )
 
 _transport = None
@@ -69,6 +70,7 @@ _uuid_map: dict[str, bpy.types.ID] = {}
 _reassembler = protocol.Reassembler()
 _inbox: collections.deque = collections.deque()  # polled-but-unprocessed msgs
 _blob_by_uuid: dict[str, str] = {}   # uuid → latest in-flight blob id
+_at_state: dict[str, dict[str, object]] = {}  # uuid → last "@" values applied
 _pending_t2: tuple[dict, bytes] | None = None  # applied on the NEXT tick so
                                                # the "⟳ applying" label gets a redraw first
 _mappings: list = []
@@ -231,12 +233,57 @@ def _layer_collection_for(coll):
 
 
 def _write_rna(db, path: str, value) -> None:
-    # "@" paths: view-layer state applied by setter, not RNA (shadow.py)
+    # "@" paths: view-layer state and pointers applied by setter, not RNA
+    # (shadow.py). Pointers ride as names: the replica's copy has the same
+    # names, and tier-1 renames keep them in step.
     if path == "@hide":  # the object eye toggle
         db.hide_set(bool(value))
         return
     if path == "@scene_camera":
         db.camera = bpy.data.objects.get(value) if value else None
+        return
+    if path == "@scene_world":
+        db.world = bpy.data.worlds.get(value) if value else None
+        return
+    if path == "@instance_collection":
+        db.instance_collection = bpy.data.collections.get(value) if value else None
+        return
+    if path == "@ll_receiver":
+        db.light_linking.receiver_collection = bpy.data.collections.get(value) if value else None
+        return
+    if path == "@ll_blocker":
+        db.light_linking.blocker_collection = bpy.data.collections.get(value) if value else None
+        return
+    if path == "@dof_focus_object":
+        db.dof.focus_object = bpy.data.objects.get(value) if value else None
+        return
+    if path == "@rbw":  # the rigid-body world exists (settings ride tier 1)
+        if value and db.rigidbody_world is None:
+            with bpy.context.temp_override(scene=db):
+                bpy.ops.rigidbody.world_add()
+        elif not value and db.rigidbody_world is not None:
+            with bpy.context.temp_override(scene=db):
+                bpy.ops.rigidbody.world_remove()
+        return
+    if path == "@master_members":
+        # Direct membership of the scene's master collection: objects and
+        # child collections, by name. Scene-embedded, so no tier 2 carries it.
+        want_objs, want_colls = set(value[0]), set(value[1])
+        master = db.collection
+        for o in list(master.objects):
+            if o.name not in want_objs:
+                master.objects.unlink(o)
+        for name in want_objs:
+            o = bpy.data.objects.get(name)
+            if o is not None and o.name not in master.objects:
+                master.objects.link(o)
+        for c in list(master.children):
+            if c.name not in want_colls:
+                master.children.unlink(c)
+        for name in want_colls:
+            c = bpy.data.collections.get(name)
+            if c is not None and c.name not in master.children:
+                master.children.link(c)
         return
     if path in ("@lc_exclude", "@lc_hide"):
         lc = _layer_collection_for(db)
@@ -280,6 +327,11 @@ def _apply_t1(header: dict, payload: bytes) -> None:
         try:
             _write_rna(db, path, value)
             stats["applied_t1"] += 1
+            if path.startswith("@"):
+                # View-layer / pointer state a later blob will not carry and
+                # the host will not resend (its shadow already has it):
+                # keep it to re-apply after apply_blob (SYNC-AUDIT A5).
+                _at_state.setdefault(header["uuid"], {})[path] = value
         except Exception as exc:
             stats["apply_errors"] += 1
             stats["last_error"] = f"{header['uuid']}.{path}: {exc!r}"
@@ -296,6 +348,24 @@ def _apply_tombstone(header: dict) -> None:
         stats["apply_errors"] += 1
     _uuid_map.pop(header["uuid"], None)
     _last_hot = None  # same camera-view risk as a t2 apply (see above)
+
+
+def _reapply_at_state(uuid: str) -> None:
+    """After a blob replaced a datablock, put back the "@" state the host
+    sent earlier: the blob does not carry it, and the host's shadow already
+    holds it so it will never be resent."""
+    saved = _at_state.get(uuid)
+    if not saved:
+        return
+    db = _resolve(uuid)
+    if db is None:
+        return
+    for path, value in saved.items():
+        try:
+            _write_rna(db, path, value)
+        except Exception as exc:
+            stats["apply_errors"] += 1
+            stats["last_error"] = f"{uuid}.{path} (re-apply): {exc!r}"
 
 
 def _point_caches():
@@ -362,6 +432,10 @@ def _apply_pending_t2() -> None:
             stats["applied_t2"] += 1
             stats["apply_errors"] += errors
         _rebuild_uuid_map()
+        if header.get("kind") == "boot":
+            _at_state.clear()  # the file carries view-layer state itself
+        else:
+            _reapply_at_state(header.get("uuid", ""))
         stats["frozen_caches"] = _count_frozen_caches()
     except Exception as exc:
         stats["apply_errors"] += 1
@@ -580,6 +654,7 @@ def _handle_new_session() -> None:
     _seq_tracker = protocol.SeqTracker()
     _reassembler = protocol.Reassembler()
     _blob_by_uuid.clear()
+    _at_state.clear()
     stats["seq"] = 0
     stats["gaps"] = 0
     stats["want_resync"] = False
@@ -680,6 +755,7 @@ def start(transport, mappings=()) -> None:
     _reassembler = protocol.Reassembler()
     _inbox.clear()
     _blob_by_uuid.clear()
+    _at_state.clear()
     _pending_t2 = None
     _mappings = list(mappings)
     stats.update(

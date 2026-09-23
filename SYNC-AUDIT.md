@@ -96,16 +96,16 @@ on the pong.
 
 | # | finding | where | status |
 |---|---|---|---|
-| A1 | **Shader-node property edits are invisible to the material's own diff.** `_walk_sockets` reads socket `default_value` and links only. Measured (`COVERAGE.md`): a Math operation, mute, ColorRamp stop or `node.image` on a node **wired into the shader** does reach the replica — but only because the Mesh wearing the material is resent whole (D7); on a dangling node, nothing crosses. | `host_handlers.py:777-792` | confirmed + measured |
-| A2 | **Tier-1 edits are destroyed when they share a diff with a Scene structural change.** The shadow advances at `:307` before the structural test at `:318`; a Scene cannot be tier-2 serialized (`tier2_io.py:49-58` returns `None`), so `@scene_camera`, view transform, resolution in that window are consumed and never sent. | `host_handlers.py:300-327` | confirmed |
-| A3 | **Image datablocks are not detected.** Not in `_is_syncable_id`; texture paint, reload, re-rendered bakes stay stale. | `host_handlers.py:446-449` | confirmed |
-| A4 | **`object.data` re-link, material slots, `instance_collection` are untracked** — swap the mesh under an object, empty diff, nothing sent. | `shadow.py:24-34`, `build_snapshot` | confirmed |
-| A5 | **View-layer state is lost on every tier-2 resend.** `@hide`/`@lc_exclude`/`@lc_hide` are not in the blob, and the shadow is refreshed before the blob goes so the host never resends them. A hidden object reappears after any structural edit. | `host_handlers.py:375-377` | confirmed |
+| A1 | **Shader-node property edits are invisible to the material's own diff.** `_walk_sockets` reads socket `default_value` and links only. Measured (`COVERAGE.md`): a Math operation, mute, ColorRamp stop or `node.image` on a node **wired into the shader** does reach the replica — but only because the Mesh wearing the material is resent whole (D7); on a dangling node, nothing crosses. | `host_handlers.py:777-792` | confirmed + measured → **fixed 09-23**: `~nodes` signature (node settings, mute, ColorRamp stops, curves) escalates the material itself; D7 closed alongside |
+| A2 | **Tier-1 edits are destroyed when they share a diff with a Scene structural change.** The shadow advances at `:307` before the structural test at `:318`; a Scene cannot be tier-2 serialized (`tier2_io.py:49-58` returns `None`), so `@scene_camera`, view transform, resolution in that window are consumed and never sent. | `host_handlers.py:300-327` | confirmed → **fixed 09-23**: the tier-1 half of a structural diff goes out via `_send_t1` when the blob is refused, and Scene structure triggers an automatic rate-limited bootstrap (empirical in `COVERAGE.md`) |
+| A3 | **Image datablocks are not detected.** Not in `_is_syncable_id`; texture paint, reload, re-rendered bakes stay stale. | `host_handlers.py:446-449` | confirmed → **fixed 09-23** for file-backed images (Image is syncable; a reload/colourspace change resends it). Pixels of an unpacked generated image still cannot cross — pack them |
+| A4 | **`object.data` re-link, material slots, `instance_collection` are untracked** — swap the mesh under an object, empty diff, nothing sent. | `shadow.py:24-34`, `build_snapshot` | confirmed → **fixed 09-23**: `~data`, `~materials`, `@instance_collection` |
+| A5 | **View-layer state is lost on every tier-2 resend.** `@hide`/`@lc_exclude`/`@lc_hide` are not in the blob, and the shadow is refreshed before the blob goes so the host never resends them. A hidden object reappears after any structural edit. | `host_handlers.py:375-377` | confirmed → **fixed 09-23**: the replica keeps the last `@` values per uuid and re-applies them after `apply_blob` |
 | A6 | **Cold frames dropped and credited.** When the agent's session is down or its queue full, the frame is discarded and `T_COLD_ACK`ed; on session start the stale queue is drained and acked. `send_cold` returns True, the dirty set clears, the replica counts a gap. | `link.rs:197-201`, `session.rs:458-466` | confirmed → **mitigated 09-23**: the agent now emits `cold_dropped` (panel counts it) and every reconnect re-handshakes with a fresh epoch and re-bootstraps, so nothing sent into an outage is relied on |
 | A7 | **Disk point caches are frozen on the replica after every resync** — see `CACHES.md` §2. | `bootstrap.py:112-119` | confirmed (probed) |
 | A8 | **`unmapped_paths` and `last_error` are counted and never displayed**, contradicting three docstrings; `//` paths are silently skipped when the project dir is unknown and there is no `isdir` check on the mapped dir. | `replica_apply.py:300`, `bootstrap.py:73-96` | confirmed → **fixed 09-23**: overlay + pong + host panel show unmapped/last_error; an unresolvable project dir counts its `//` paths as unmapped instead of skipping |
 | A9 | **The replica is not read-only.** No handler on the replica role; a local edit diverges forever because the host diffs against its *own* previous value. | `session.py:273`, `shadow.py:113-117` | reported |
-| A10 | Particle settings, rigid-body world/constraints, force fields; grease pencil, volumes, metaballs, point clouds, hair curves; NLA beyond a track count; extra view layers; scene frame range/fps/markers/world pointer — none detected. | `host_handlers.py:63-67, 446-449, 648`, `shadow.py:61-76` | reported |
+| A10 | Particle settings, rigid-body world/constraints, force fields; grease pencil, volumes, metaballs, point clouds, hair curves; NLA beyond a track count; extra view layers; scene frame range/fps/markers/world pointer — none detected. | `host_handlers.py:63-67, 446-449, 648`, `shadow.py:61-76` | reported → **fixed 09-23**: particles/textures/force fields/rigid-body world/NLA strips/scene scalars all detected (`COVERAGE.md`: 116 of 122 cross); linked libraries remain |
 
 **B. Stuck — visible, but only a human at the host can recover**
 
@@ -135,7 +135,7 @@ on the pong.
 | D4 | A 50 MiB blob is copied ≥4 times per direction (`pack_cold` join, `_read_exact` join, agent `vec!` per frame, `Reassembler` join); 4 MiB chunking is a zmq-era limit — lanes accept 256 MiB. | `transport_agent.py:78-80, 251-262`, `link.rs:179`, `protocol.py:217` | reported |
 | D5 | `stats` (rtt, loss, cwnd, mtu, mbps) is emitted at 1 Hz and read by nobody. `"listening"` event branch the agent never emits; `FLAG_HOLD`, cold kind `"sync"`, the fixed-rate pacer — declared, unused. | `transport_agent.py:525, 687`, `protocol.py:25, 144` | reported |
 | D6 | `build_snapshot` walks `_layer_collections()` once per collection — O(n²) on the main thread. | `host_handlers.py:767` | reported |
-| D7 | **Every shader-affecting material edit resends every Mesh that wears it, whole.** The depsgraph flags the mesh (shading), the handler discards `is_updated_geometry`, and Mesh is unconditional tier 2 — a 64 KB blob per slider tick on a four-vertex plane, a full mesh in production. | `classifier.py:54-55`, measured in `COVERAGE.md` | confirmed + measured |
+| D7 | **Every shader-affecting material edit resends every Mesh that wears it, whole.** The depsgraph flags the mesh (shading), the handler discards `is_updated_geometry`, and Mesh is unconditional tier 2 — a 64 KB blob per slider tick on a four-vertex plane, a full mesh in production. | `classifier.py:54-55`, measured in `COVERAGE.md` | confirmed + measured → **fixed 09-23**: shading-only updates on geometry types are skipped (by type — an Action's keyframe edit also arrives as shade=True and must not be) |
 
 ---
 
@@ -177,7 +177,7 @@ session is down (the host requeues, which is the path that already works);
 `CACHES.md` step A (frozen-cache warning). None of this changes what
 crosses; all of it changes whether anyone knows.
 
-**P1 — close the silent holes (two to three days).** A2 test `structural`
+**P1 — close the silent holes (two to three days). Done 2026-09-23 — survey 72 → 116 of 122.** A2 test `structural`
 before advancing the shadow, and give Scene a tier-2 path or a tier-1-only
 fallback; A1 add node property digests to `_walk_sockets` (mute, operation,
 color-ramp elements, image pointer) as `~node.*` signatures; A3 stamp Image
