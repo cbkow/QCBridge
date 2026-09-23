@@ -221,6 +221,87 @@ should know before relying on operator calls from timers anywhere else.
   QUIC control port), unscoped for MinRender's reasons, `-Remove` to
   delete. Needs elevation; parsed, not run here.
 
+## S7 — native capture on Windows (afternoon; the owner's call to do it now)
+
+`WINDOWS-SESSION.md` and `PLAN-windows.md` put native capture outside this
+release ("the ffmpeg capture path works"). The owner overruled that at the
+box, for macOS parity, once the ffmpeg path had shown its cost — and the
+first thing the parity check turned up is that the *ffmpeg* path on
+Windows was not what the rung said either:
+
+**The ffmpeg path.** `ddagrab` hands NVENC 8-bit BGRA GPU frames, and with
+only `-profile:v main10` NVENC wrote an SPS that says Main 10 over 8-bit
+samples; QCView's D3D11VA refused the surface format ("Invalid pixfmt for
+hwaccel") and decoded 4K in software, while the same content as plain 8-bit
+Main, or the 10-bit file over SRT, decoded zero-copy. Fixed (`176c76d`):
+the Windows branch downloads and converts to P010 inside the ddagrab graph
+(ffmpeg refuses a `-vf` beside a `-filter_complex` source, which also
+means the 4:4:4 rung's `-vf` never worked on Windows). Cost of that fix:
+**~2.4 cores at 4K30** for the download and swscale — the price of the
+ffmpeg path, and the number that settled the question.
+
+**The design question: NVENC direct or a D3D pipeline?** The plan text
+said NVENC. Weighed at the box: the Mac helper is one system API
+(ScreenCaptureKit + VideoToolbox); the Windows parallel is Desktop
+Duplication + the D3D11 video processor + the vendor's hardware HEVC
+encoder behind Media Foundation — one system API, no vendor header, no
+bindgen, any GPU. NVENC direct buys exact low-latency knobs at the price of
+NVIDIA-only code and a vendored SDK header. The Mac's S6 gain came from
+removing the pipe and the avfoundation hop, not the encoder brand. So the
+D3D route was built first, to be measured against the ffmpeg path and
+against NVENC only if it fell short. It did not.
+
+**`agent/capture-win`** (`0e942e9`), Rust, the twin of `qcb-capture-mac`
+with the same contract — Annex-B with an AUD per access unit, VPS/SPS/PPS
+on every keyframe, `key`/`quit` on stdin, the same flags, the same stats
+line. Verified by parsing the stream: every AU starts with an AUD, every
+keyframe carries all three parameter sets, `ffprobe` reads Main / Main 10
+at the display's size.
+
+| run (display 1, a 60 fps clip playing full-screen) | out fps | encode ms avg / max | queue ms |
+| --- | ---: | ---: | ---: |
+| 4K, Main, 50 Mbps, `--fps 60` | **58** of 60 in | **3.5 / 4.2** | 0.0 |
+| 4K, Main 10 (P010), 50 Mbps, `--fps 60` | 53 | **3.0 / 4.3** | 0.0 |
+| `--region 100,100,1920,1080`, Main | 57 | 1.8 / 2.3 | 0.0 |
+| `--scale 0.5 --10bit` (1920x1080) | 56 | 2.0 / 2.6 | 0.0 |
+| `--fps 30`, 4K | 30 | 3.7 / 4.3 | 0.0 |
+
+For the Mac's column: VideoToolbox took 27–48 ms at 25 MP (6720×3780); this
+is 3.5 ms at 8.3 MP, on a discrete GPU with the frame never leaving it.
+
+**The trap, and the hour it cost.** The first build measured 24 ms per
+frame at 4K, 38 ms at `--fps 30`, 16 ms at `--fps 120` — latency that
+tracked the capture tick, not the pixel count (27 ms at 540p). Bind flags,
+shared textures, MF_LOW_LATENCY on or off, the codec API on or off, CBR or
+VBR, the declared frame rate, the sample duration, a context flush: none
+moved it. The cause was `AcquireNextFrame(timeout)`: while it waits it
+holds the D3D11 device's multithread lock, and the encoder, on the same
+device, waits with it. A zero-timeout poll with a 1 ms sleep took the
+encode from 24 ms to 3.5 and the output from 42 fps to 58. Written in the
+code where the next person will look. Also found: without declaring
+per-monitor DPI awareness DXGI reports the desktop in DIPs (3072×1728 for
+this 3840×2160 at 125 %), so a region would crop the wrong pixels; the
+duplication surface's own mode is the truth and is what the helper uses.
+
+**Wiring it in** (`2927a38`). Since the video lane left the transport
+(2026-09-22) the addon spawns the capture itself, on both platforms; the
+agent's `video_start` hook and the native helpers beside it were dormant —
+which means the Mac's `qcb-capture-mac` is not in the shipping path today
+either. The pixel path now finds the helper the way the transport finds
+the agent and, for the 4:2:0 rungs, runs *helper → ffmpeg mux → SRT*, the
+two supervised together. The Mac gets the same path for free; **flagged to
+the Mac side**: it changes what "native capture" means in the addon flow
+there too, and the S6 numbers should be re-taken through it.
+
+End to end on this box — Blender replica → helper → mux → SRT → QCView:
+QCView LIVE, `hevc 3840x2160 yuv420p10le`, **d3d11va zero-copy**; helper 3.0
+ms/frame, 30 fps at the addon's 30 fps capture setting; CPU: helper 0.04
+cores, mux 0.01 — against 2.4 for the ffmpeg path an hour earlier. This
+was the "not a release blocker" item; it is now the Windows path.
+
+Glass-to-glass through the whole chain, the way the Mac measured it, is
+still owed (needs the host/replica pair with a burned-in clock).
+
 ## Two-machine items — not attempted on one box
 
 Cross-OS path mapping (a mac host's absolute paths on this replica),
