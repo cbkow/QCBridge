@@ -1489,6 +1489,7 @@ dependencies = [
  "tokio",
  "toml",
  "tray-icon",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
