@@ -1,0 +1,37 @@
+[package]
+name = "qcb-capture-win"
+version = "0.2.0"
+edition = "2024"
+publish = false
+# GPL-3.0-or-later, matching the repository LICENSE.
+license = "GPL-3.0-or-later"
+description = "QCBridge Agent: native Windows capture + encode (Desktop Duplication -> D3D11 video processor -> Media Foundation HEVC), the twin of qcb-capture-mac"
+
+[workspace]
+
+[[bin]]
+name = "qcb-capture-win"
+path = "src/main.rs"
+
+[dependencies]
+# One system API end to end, the way qcb-capture-mac is ScreenCaptureKit +
+# VideoToolbox: DXGI Desktop Duplication for the pixels, the D3D11 video
+# processor for crop/scale/colour, the vendor's hardware HEVC encoder behind
+# Media Foundation. No vendor SDK, no per-GPU code path. 0.61 is the copy
+# the agent's tray already brings in.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_HiDpi",
+] }
+
+[profile.release]
+debug = 1

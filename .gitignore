@@ -15,3 +15,6 @@ spikes/parity/mux-tax/muxsend.o
 
 # Rust build dir (was committed by accident on main, 2026-09-22)
 agent/target/
+
+# The capture helper crate has its own target dir (same reason as agent/target)
+agent/capture-win/target/
