@@ -113,6 +113,9 @@ fn attach_reply(agent: &Agent) -> Value {
             .or_else(|| agent.host_obs.as_ref().map(|h| h.up.load(Relaxed))).unwrap_or(false),
         "video_port": agent.cfg.with(|c| if c.role == "host" { c.video_port } else { 0 }),
         "video_state": *agent.ctx.video_src.state.lock().unwrap(),
+        // COLD_ACK carries bytes since 2026-09-23; an addon that does not
+        // see this key falls back to counting messages against an old agent.
+        "credits": "bytes",
         // The live settings, so the addon mirrors them instead of owning
         // its own copy. The addon already received `role` and `port` and
         // threw them away; now there is a reason to keep them.
@@ -190,10 +193,11 @@ fn main() -> Result<()> {
 
     // Addon link + queues.
     let (out_tx, out_rx) = mpsc::channel(256);
-    let link = Arc::new(Link::new(out_tx));
+    let (prio_tx, prio_rx) = mpsc::channel(1024);
+    let link = Arc::new(Link::new(out_tx, prio_tx));
     {
         let link = link.clone();
-        std::thread::Builder::new().name("link-writer".into()).spawn(move || writer_thread(link, out_rx))?;
+        std::thread::Builder::new().name("link-writer".into()).spawn(move || writer_thread(link, out_rx, prio_rx))?;
     }
     let (control_tx, control_rx) = mpsc::channel(1024);
     let (cold_tx, cold_rx) = mpsc::channel(256);

@@ -576,6 +576,9 @@ def _replica_overlay_text() -> str:
     now = _time.time()
     clock = _time.strftime("%H:%M:%S", _time.localtime(now)) + f".{int(now * 10) % 10}"
     bits = [f"● live · seq {stats['seq']} · {clock}"]
+    st = getattr(transport, "stats", None) or {}
+    if st.get("rtt_ms") is not None:
+        bits.append(f"rtt {st['rtt_ms']:.0f} ms")
     if _version_warning():
         bits.append("⚠ version mismatch")
     if stats["gaps"]:
@@ -622,6 +625,12 @@ def status_text() -> str:
     note = getattr(transport, "link_note", "")
     if note:
         bits.append(f"link: {note}")
+    st = getattr(transport, "stats", None) or {}
+    if st.get("rtt_ms") is not None:
+        bits.append(
+            f"rtt {st['rtt_ms']:.0f} ms · lost {st.get('quic_lost', 0)}"
+            f" · ↑{st.get('tx_mbps', 0):.1f} ↓{st.get('rx_mbps', 0):.1f} Mb/s"
+        )
     fp = getattr(transport, "peer_fingerprint", "")
     if fp and state["role"] == "HOST":
         pinned = getattr(transport, "peer_pinned", True)

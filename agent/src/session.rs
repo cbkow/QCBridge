@@ -457,8 +457,8 @@ async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Resu
         while rx.try_recv().is_ok() {}
         let mut rx = ctx.cold_rx.lock().await;
         let mut stale = 0u32;
-        while rx.try_recv().is_ok() {
-            stale += 1;
+        while let Ok(b) = rx.try_recv() {
+            stale += b.len() as u32;
         }
         if stale > 0 {
             ack_cold(&ctx.link, stale).await;
@@ -513,8 +513,12 @@ async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Resu
         tasks.spawn(async move {
             let mut rx = c.cold_rx.lock().await;
             while let Some(body) = rx.recv().await {
+                // Credits are bytes: the window bounds what sits between the
+                // addon and quinn, not a message count a 4 MiB chunk and a
+                // 200-byte delta would share (SYNC-AUDIT §3 B3/D4).
+                let len = body.len() as u32;
                 let sent = send_msg(&mut cold_send, &body.slice(1..)).await;
-                ack_cold(&c.link, 1).await;
+                ack_cold(&c.link, len).await;
                 sent?;
             }
             Ok(())

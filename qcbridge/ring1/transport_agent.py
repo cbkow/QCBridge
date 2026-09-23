@@ -50,7 +50,8 @@ T_CMD = 0x10
 T_EVENT = 0x20
 
 HOT_KEY_CAMERA = b"cam"
-_COLD_WINDOW = 64  # same intent as zmq's SNDHWM: backlog belongs in the dirty set
+_COLD_WINDOW = 64                 # messages, against an agent that acks counts
+_COLD_WINDOW_BYTES = 32 << 20     # bytes in flight between us and quinn  # same intent as zmq's SNDHWM: backlog belongs in the dirty set
 _PEER = b"\x00"    # one peer today; the byte keeps several replicas possible
 _TICK = 0.05
 
@@ -375,6 +376,8 @@ class HostTransportAgent:
         self.peer_fingerprint = ""   # replica certificate SHA-256 (hex)
         self.peer_pinned = True      # False right after trust-on-first-use
         self.link_note = ""          # last helper-reported reason for being down
+        self.cold_dropped = 0        # frames the agent had to discard (cold_dropped events)
+        self._credits_bytes = False  # COLD_ACK unit; set from the attached event
         self.video_port = 0          # localhost TCP port serving Annex-B HEVC
         self.stats: dict = {}
         self.agent_version = ""      # set in agent mode
@@ -464,11 +467,18 @@ class HostTransportAgent:
             self._link.send_hot(key, value)
 
     def send_cold(self, header: dict, payload: bytes = b"") -> bool:
+        frame = _PEER + pack_cold(header, payload)
+        cost = len(frame) if self._credits_bytes else 1
         with self._lock:
-            if not self._link_up or self._cold_outstanding >= _COLD_WINDOW:
+            window = _COLD_WINDOW_BYTES if self._credits_bytes else _COLD_WINDOW
+            # A frame larger than the window still goes when nothing is in
+            # flight, or it could never go at all.
+            if not self._link_up or (
+                self._cold_outstanding and self._cold_outstanding + cost > window
+            ):
                 return False
-            self._cold_outstanding += 1
-        self._link.send(T_COLD, _PEER + pack_cold(header, payload))
+            self._cold_outstanding += cost
+        self._link.send(T_COLD, frame)
         return True
 
     @property
@@ -501,6 +511,7 @@ class HostTransportAgent:
             self.peer_fingerprint = event.get("peer_fingerprint") or ""
             self.peer_pinned = True
             self.agent_config = dict(event.get("config") or {})
+            self._credits_bytes = event.get("credits") == "bytes"
             self._attached.set()
         elif name == "config":   # every settings change, from us or the tray
             self.agent_config = dict(event.get("config") or self.agent_config)

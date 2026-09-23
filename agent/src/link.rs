@@ -9,7 +9,8 @@
 //!   0x01 CONTROL   u8 peer | json bytes
 //!   0x02 HOT       u8 peer | u8 keylen | key | value
 //!   0x03 COLD      u8 peer | opaque (addon packs header+payload)
-//!   0x04 COLD_ACK  u32 BE count            agent -> addon: credits returned
+//!   0x04 COLD_ACK  u32 BE bytes            agent -> addon: credits returned
+//!                                          (bytes of COLD body accepted or dropped)
 //!   0x10 CMD       json                    addon -> agent
 //!   0x20 EVENT     json                    agent -> addon
 
@@ -37,8 +38,14 @@ pub enum Out {
 }
 
 /// Agent -> addon side of the link.
+///
+/// Two queues toward the addon: `tx` for cold frames (bounded, so a slow
+/// addon pushes back on QUIC) and `prio_tx` for control, acks and events,
+/// drained first by the writer — a pong must not wait behind a 4 MiB chunk
+/// and trip the host's 3 s liveness window (SYNC-AUDIT B4).
 pub struct Link {
     pub tx: mpsc::Sender<Out>,
+    prio_tx: mpsc::Sender<Out>,
     hot: Mutex<HashMap<Vec<u8>, Bytes>>,
     hot_dirty: AtomicBool,
     sink: Mutex<Option<TcpStream>>,
@@ -47,9 +54,10 @@ pub struct Link {
 }
 
 impl Link {
-    pub fn new(tx: mpsc::Sender<Out>) -> Self {
+    pub fn new(tx: mpsc::Sender<Out>, prio_tx: mpsc::Sender<Out>) -> Self {
         Self {
             tx,
+            prio_tx,
             hot: Mutex::new(HashMap::new()),
             hot_dirty: AtomicBool::new(false),
             sink: Mutex::new(None),
@@ -58,12 +66,26 @@ impl Link {
         }
     }
 
+    fn is_prio(kind: u8) -> bool {
+        matches!(kind, T_CONTROL | T_COLD_ACK | T_EVENT)
+    }
+
     pub async fn frame(&self, kind: u8, body: Bytes) {
-        let _ = self.tx.send(Out::Frame(kind, body)).await;
+        if Self::is_prio(kind) {
+            let _ = self.prio_tx.send(Out::Frame(kind, body)).await;
+            let _ = self.tx.try_send(Out::Wake);
+        } else {
+            let _ = self.tx.send(Out::Frame(kind, body)).await;
+        }
     }
 
     pub fn frame_blocking(&self, kind: u8, body: Bytes) {
-        let _ = self.tx.blocking_send(Out::Frame(kind, body));
+        if Self::is_prio(kind) {
+            let _ = self.prio_tx.blocking_send(Out::Frame(kind, body));
+            let _ = self.tx.try_send(Out::Wake);
+        } else {
+            let _ = self.tx.blocking_send(Out::Frame(kind, body));
+        }
     }
 
     pub async fn event(&self, v: Value) {
@@ -76,7 +98,8 @@ impl Link {
 
     /// Non-blocking (safe from async tasks); drops the event if the queue is full.
     pub fn event_try(&self, v: Value) {
-        let _ = self.tx.try_send(Out::Frame(T_EVENT, Bytes::from(v.to_string())));
+        let _ = self.prio_tx.try_send(Out::Frame(T_EVENT, Bytes::from(v.to_string())));
+        let _ = self.tx.try_send(Out::Wake);
     }
 
     /// Events the addon must see even if the queue is full (attach replies).
@@ -129,8 +152,13 @@ pub fn write_frame(w: &mut impl Write, kind: u8, body: &[u8]) -> std::io::Result
     w.write_all(body)
 }
 
-pub fn writer_thread(link: Arc<Link>, mut rx: mpsc::Receiver<Out>) {
+pub fn writer_thread(link: Arc<Link>, mut rx: mpsc::Receiver<Out>, mut prio_rx: mpsc::Receiver<Out>) {
     while let Some(item) = rx.blocking_recv() {
+        // Priority frames first, always: whatever woke us, a queued pong,
+        // ack or event goes out before the next cold chunk.
+        while let Ok(Out::Frame(kind, body)) = prio_rx.try_recv() {
+            link.write_when_attached(kind, &body);
+        }
         match item {
             Out::Frame(kind, body) => {
                 link.write_when_attached(kind, &body);
@@ -195,12 +223,13 @@ fn reader_loop(mut r: impl Read, inb: &Inbound, link: &Link, on_cmd: &(dyn Fn(&V
                 }
             }
             T_COLD => {
+                let len = body.len() as u32;
                 let sent = inb.connected.load(Relaxed) && inb.cold_tx.try_send(body).is_ok();
                 if !sent {
                     // Credit it back so the addon never stalls on a dead
                     // session — and say so: the frame is gone, not delivered.
                     link.event_try(serde_json::json!({"event": "cold_dropped", "n": 1}));
-                    link.frame_blocking(T_COLD_ACK, Bytes::copy_from_slice(&1u32.to_be_bytes()));
+                    link.frame_blocking(T_COLD_ACK, Bytes::copy_from_slice(&len.to_be_bytes()));
                 }
             }
             T_CMD => match serde_json::from_slice::<Value>(&body) {

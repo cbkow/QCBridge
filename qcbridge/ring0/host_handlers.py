@@ -84,6 +84,11 @@ class HostSync:
         self.paused_fn = paused_fn
         self.mappings = list(mappings)
         self._boot_outbox: list[tuple[dict, bytes]] = []
+        # Tier-2 blobs mid-flight under backpressure, per uuid: the next
+        # tick resumes from the chunk that was refused instead of
+        # re-serializing and restarting from chunk 0 (SYNC-AUDIT B3). A
+        # newer escalation of the same uuid replaces the entry.
+        self._t2_outbox: dict[str, list[tuple[dict, bytes]]] = {}
         self.sent_boot = 0
         self.registry = IdentityRegistry()
         self.shadow = ShadowStore()
@@ -340,6 +345,8 @@ class HostSync:
                 return _FLUSH_TICK  # backpressure: try again next tick
         if self._suppress_marks:
             return _FLUSH_TICK  # pre-handshake: the bootstrap will cover it
+        if not self._drain_t2_outbox():
+            return _FLUSH_TICK  # backpressure mid-blob: resume next tick
         if self._auto_boot_at and now >= self._auto_boot_at:
             if now - self._last_auto_boot >= _AUTO_BOOT_MIN_INTERVAL:
                 self._auto_boot_at = 0.0
@@ -425,6 +432,9 @@ class HostSync:
                     self._uuid_to_db[t_uuid] = target
                     if t_uuid not in self._shipped:
                         self._flush_t2(t_uuid)
+                    if t_uuid in self._t2_outbox:
+                        self.dirty.requeue(uuid, Tier.T1)  # after the blob has fully left
+                        return
         self.seq += 1
         header = {"kind": "t1", "seq": self.seq, "uuid": uuid}
         payload = json.dumps(changes).encode("utf-8")
@@ -482,17 +492,32 @@ class HostSync:
         )
         blob_id = f"{uuid}.{self.seq + 1}"
         meta = {"uuid": uuid, "name": db.name, "coll": tier2_io.collection_of(db)}
-        for header, payload in protocol.chunk_blob("t2", blob_id, data, meta=meta):
-            self.seq += 1
-            header["seq"] = self.seq
-            if not self.transport.send_cold(header, payload):
-                self.seq -= 1
-                self.dirty.requeue(uuid, Tier.T2)  # partial superseded later
-                return
+        self._t2_outbox[uuid] = list(protocol.chunk_blob("t2", blob_id, data, meta=meta))
         self.sent_t2 += 1
-        self._shipped.add(uuid)
         if _DEBUG:
             print(f"qcb t2 send {db.name} ({len(data)} bytes)", flush=True)
+        self._drain_t2_outbox(uuid)
+
+    def _drain_t2_outbox(self, only: str | None = None) -> bool:
+        """Send queued tier-2 chunks in order; False on backpressure (the
+        remainder stays queued). `_shipped` gains a uuid only when its last
+        chunk has left, so a tier-1 naming it waits for the whole blob."""
+        for uuid in list(self._t2_outbox):
+            if only is not None and uuid != only:
+                continue
+            chunks = self._t2_outbox[uuid]
+            while chunks:
+                header, payload = chunks[0]
+                self.seq += 1
+                header["seq"] = self.seq
+                if self.transport.send_cold(header, payload):
+                    chunks.pop(0)
+                else:
+                    self.seq -= 1
+                    return False
+            del self._t2_outbox[uuid]
+            self._shipped.add(uuid)
+        return True
 
     def _send_tombstone(self, uuid: str) -> None:
         self.seq += 1

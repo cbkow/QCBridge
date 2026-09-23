@@ -122,15 +122,19 @@ def test_hot_latest_wins_and_keys_are_independent(pair):
     assert wait_for(lambda: replica.poll_hot_keyed().get(b"light.energy") == b"50")
 
 
-def test_cold_ordered_delivery_and_chunked_blob(pair):
+def test_cold_ordered_delivery_and_chunked_blob(pair, monkeypatch):
     host, replica = pair
     assert wait_for(lambda: host.peer_alive)
+    # On loopback the agent drains faster than Python can fill 32 MiB, so
+    # the pushback would never show; shrink the window for the assertion.
+    from ring1 import transport_agent
+    monkeypatch.setattr(transport_agent, "_COLD_WINDOW_BYTES", 1 << 20)
     seq = 0
     sent = []
     for _ in range(3):
         seq += 1
         sent.append(({"kind": "t1", "seq": seq}, b"delta"))
-    blob = b"MESH" * 2_000_000  # 8 MB: far more chunks than the credit window
+    blob = b"MESH" * 2_000_000  # 8 MB: far more than the (shrunk) window
     for header, payload in protocol.chunk_blob(
         "t2", "blob-9", blob, meta={"uuid": "u9"}, chunk_size=64_000
     ):
@@ -284,3 +288,12 @@ def test_discover_by_direct_probe_finds_the_replica(pair):
     assert p["port"] == replica.bound_ports()[0]
     assert p["paired"] is True
     assert host.peers == peers
+
+
+def test_agent_advertises_byte_credits(pair):
+    """COLD_ACK carries bytes since 2026-09-23; the attached event says so
+    and the host transport switches its window to bytes on that field."""
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    assert host._credits_bytes, "attached event lacked credits=bytes — stale agent binary?"
+    assert replica._credits_bytes if hasattr(replica, "_credits_bytes") else True
