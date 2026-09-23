@@ -61,14 +61,23 @@ def build_command(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> list
     fps = probe.capture_fps()  # 30 unless the parity spike overrides it
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "warning"]
     if sys.platform == "win32":
-        cmd += ["-filter_complex", f"ddagrab=output_idx=0:framerate={fps}:draw_mouse=0"]
+        # ddagrab hands NVENC 8-bit BGRA frames on the GPU. Any pixel-format
+        # change has to happen inside this one filtergraph (ffmpeg refuses a
+        # -vf next to a -filter_complex source): download, then convert.
+        # With only `-profile:v main10` on BGRA input NVENC writes an SPS
+        # that says Main 10 over 8-bit samples, and a hardware decoder
+        # (QCView's D3D11VA, found 2026-09-23) refuses the surface format
+        # and falls to software; the macOS branch pins p010le, so does this.
+        graph = f"ddagrab=output_idx=0:framerate={fps}:draw_mouse=0"
         if rung == "hevc_10_444_50":
             # True 4:4:4 needs the CPU path — NVENC silently downgrades 4:4:4
             # requests on GPU frames (verify receiver-side, always).
-            cmd += ["-vf", "hwdownload,format=bgra,format=yuv444p10le"]
-            cmd += ["-c:v", "hevc_nvenc", "-profile:v", "rext"]
+            graph += ",hwdownload,format=bgra,format=yuv444p10le"
+            codec = ["-c:v", "hevc_nvenc", "-profile:v", "rext"]
         else:
-            cmd += ["-c:v", "hevc_nvenc", "-profile:v", "main10"]
+            graph += ",hwdownload,format=bgra,format=p010le"
+            codec = ["-c:v", "hevc_nvenc", "-profile:v", "main10"]
+        cmd += ["-filter_complex", graph] + codec
         # -delay 0: NVENC's default output delay holds ~4 frames (~130 ms)
         # for nothing we need; ull + bf 0 keep the encoder frame-in/frame-out.
         cmd += [
