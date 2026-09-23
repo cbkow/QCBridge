@@ -657,6 +657,12 @@ fn capture_loop(opts: &Opts, shared: Arc<Shared>, tx: std::sync::mpsc::SyncSende
     // on a key request with nothing new on screen, re-sends the last frame
     // so a joining viewer is not left waiting for the desktop to move.
     let interval = Duration::from_secs_f64(1.0 / opts.fps.max(1) as f64);
+    // An idle desktop yields no frames at all from DDA, and a viewer joining
+    // an SRT stream that carries nothing sits in its demuxer probe for ever
+    // (found 2026-09-23 with QCView). Keep a floor: re-send the last frame
+    // a few times a second when nothing changed — an unchanged P-frame is
+    // a few hundred bytes — so the stream never goes silent.
+    let idle_floor = Duration::from_secs_f64(1.0 / (opts.fps.max(1) as f64 / 8.0).clamp(2.0, 10.0));
     let t0 = Instant::now();
     let mut last_sent = Instant::now() - interval;
     let mut last_tex: Option<ID3D11Texture2D> = None;   // last frame sent (re-sent on a key request)
@@ -713,7 +719,8 @@ fn capture_loop(opts: &Opts, shared: Arc<Shared>, tx: std::sync::mpsc::SyncSende
             continue;
         }
         let want_key = shared.force_key.swap(false, Relaxed);
-        let tex = match pending.take().or_else(|| if want_key { last_tex.clone() } else { None }) {
+        let idle_resend = last_sent.elapsed() >= idle_floor;
+        let tex = match pending.take().or_else(|| if want_key || idle_resend { last_tex.clone() } else { None }) {
             Some(t) => t,
             None => continue,
         };

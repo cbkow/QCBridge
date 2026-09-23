@@ -70,10 +70,17 @@ def build_native_pipeline(
     cap = [capture, "--fps", str(fps), "--bitrate", str(rung_mbps(rung)), "--gop", str(fps)]
     if _NATIVE_RUNGS.get(rung):
         cap.append("--10bit")
+    # The mux gets a keyframe request on spawn (below), so VPS/SPS/PPS lead
+    # its input and a tiny probe is enough; without that, ffmpeg's default
+    # 5 MB probe on a raw HEVC pipe kept a joining viewer waiting long
+    # enough to give up, the mux then died on the vanished socket, and the
+    # pair restarted into the same wait (found 2026-09-23 on Windows).
     mux = [
         ffmpeg, "-hide_banner", "-loglevel", "warning",
-        "-fflags", "nobuffer", "-f", "hevc", "-framerate", str(fps), "-i", "pipe:0",
-        "-c", "copy", "-fps_mode", "passthrough", "-f", "mpegts", url,
+        "-fflags", "nobuffer", "-probesize", "65536", "-analyzeduration", "0",
+        "-f", "hevc", "-framerate", str(fps), "-i", "pipe:0",
+        "-c", "copy", "-fps_mode", "passthrough", "-flush_packets", "1",
+        "-f", "mpegts", url,
     ]
     return cap, mux
 
@@ -246,6 +253,11 @@ def _supervise_native(cap_cmd: list[str], mux_cmd: list[str], log_path: Path) ->
                     _cap_proc.kill()
                 return
             _cap_proc.stdout.close()  # the mux owns that end now
+            try:
+                _cap_proc.stdin.write(b"key\n")  # parameter sets first, for the mux and its viewer
+                _cap_proc.stdin.flush()
+            except OSError:
+                pass
             _status = "streaming (native)"
             pumps = [
                 threading.Thread(target=_pump_log, args=(_proc, log), name="qcb-pixel-log", daemon=True),
@@ -267,7 +279,7 @@ def _supervise_native(cap_cmd: list[str], mux_cmd: list[str], log_path: Path) ->
         if _stop.is_set():
             break
         _status = f"stream ended (mux {_proc.returncode}, capture {_cap_proc.returncode}) — restarting"
-        _stop.wait(_RESTART_BACKOFF)
+        _stop.wait(_RESTART_BACKOFF / 4)  # a viewer leaving is the normal case; be back before the next one
     _status = "off"
 
 
