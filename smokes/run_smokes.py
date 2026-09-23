@@ -37,6 +37,14 @@ import tempfile
 import time
 import zipfile
 
+# The Blender halves write UTF-8 (the host's notes carry a bullet); a Windows
+# console defaults to cp1252 and would make printing them a crash.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 WIN = sys.platform == "win32"
@@ -188,7 +196,10 @@ def link_dir(target: str, link: str) -> None:
 
 
 def run_python(script: str, *args: str) -> int:
-    return subprocess.run([sys.executable, script, *args]).returncode
+    # The pollers and the bench report print arrows and bullets; give the
+    # child a UTF-8 stdout whatever the console's code page is.
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    return subprocess.run([sys.executable, script, *args], env=env).returncode
 
 
 # --- suites -----------------------------------------------------------------

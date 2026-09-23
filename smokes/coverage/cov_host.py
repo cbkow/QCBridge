@@ -12,6 +12,7 @@ import bpy
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO)
+from smokes._atomic import replace as _atomic_replace  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 OUT = sys.argv[sys.argv.index("--") + 1]
 sys.path.insert(0, os.path.join(OUT, "pysite"))
@@ -47,7 +48,7 @@ def dump():
     tmp = os.path.join(OUT, "host.json.tmp")
     with open(tmp, "w") as f:
         json.dump({"step": state["step"], "seq": sync.seq, **results}, f)
-    os.replace(tmp, os.path.join(OUT, "host.json"))
+    _atomic_replace(tmp, os.path.join(OUT, "host.json"))
 
 
 def peer_caught_up():

@@ -11,6 +11,7 @@ import bpy
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+from smokes._atomic import replace as _atomic_replace  # noqa: E402
 OUT = sys.argv[sys.argv.index("--") + 1]
 sys.path.insert(0, os.path.join(OUT, "pysite"))
 
@@ -64,7 +65,7 @@ def dump():
     with open(tmp, "w") as f:
         json.dump({"step": state["step"], "seq": sync.seq,
                    "sent_t2": sync.sent_t2, **results}, f, indent=1)
-    os.replace(tmp, os.path.join(OUT, "host.json"))
+    _atomic_replace(tmp, os.path.join(OUT, "host.json"))
 
 
 def mat(obj):
