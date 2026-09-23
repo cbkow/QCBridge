@@ -118,7 +118,8 @@ struct Stats {
     frames_out: AtomicU64,
     bytes_out: AtomicU64,
     keys_out: AtomicU64,
-    dropped: AtomicU64,
+    dropped: AtomicU64, // skipped because 3 frames were in flight (the Mac's meaning)
+    paced: AtomicU64,   // replaced by a newer frame before the tick sent it
     encode_us_sum: AtomicI64,
     encode_us_max: AtomicI64,
     queue_us_sum: AtomicI64,
@@ -704,7 +705,7 @@ fn capture_loop(opts: &Opts, shared: Arc<Shared>, tx: std::sync::mpsc::SyncSende
         }
         if fresh.is_some() {
             if pending.is_some() {
-                shared.stats.dropped.fetch_add(1, Relaxed); // newest wins, the parked one never went out
+                shared.stats.paced.fetch_add(1, Relaxed); // newest wins; the parked one never went out
             }
             pending = fresh;
         }
@@ -717,7 +718,7 @@ fn capture_loop(opts: &Opts, shared: Arc<Shared>, tx: std::sync::mpsc::SyncSende
             None => continue,
         };
         if shared.in_flight.load(Relaxed) >= 3 {
-            // Skip rather than queue: park it; a newer frame replacing it counts as the drop.
+            shared.stats.dropped.fetch_add(1, Relaxed); // skip rather than queue
             if want_key {
                 shared.force_key.store(true, Relaxed);
             }
@@ -801,12 +802,13 @@ fn main() {
                 let qs = s.queue_us_sum.swap(0, Relaxed);
                 let n = fo - prev_out;
                 log(format!(
-                    "fps={} mbps={:.1} keys={} in={} dropped={} encode_ms avg={:.1} max={:.1} queue_ms avg={:.1}",
+                    "fps={} mbps={:.1} keys={} in={} dropped={} paced={} encode_ms avg={:.1} max={:.1} queue_ms avg={:.1}",
                     n,
                     (bo - prev_bytes) as f64 * 8.0 / 1e6,
                     s.keys_out.load(Relaxed),
                     s.frames_in.load(Relaxed),
                     s.dropped.load(Relaxed),
+                    s.paced.load(Relaxed),
                     if n > 0 { sum as f64 / n as f64 / 1000.0 } else { 0.0 },
                     mx as f64 / 1000.0,
                     if n > 0 { qs as f64 / n as f64 / 1000.0 } else { 0.0 }

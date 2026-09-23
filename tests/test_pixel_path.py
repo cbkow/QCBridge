@@ -43,3 +43,23 @@ def test_fatal_output_lines_arm_the_reaper():
     assert pixel_path.is_fatal_output_line("[out#0/mpegts @ 0x1] Error muxing a packet")
     assert pixel_path.is_fatal_output_line("[out#0/mpegts @ 0x1] Error closing file: Input/output error")
     assert not pixel_path.is_fatal_output_line("[hevc @ 0x1] Error constructing the frame RPS.")
+
+
+def test_native_pipeline_shape(monkeypatch):
+    # The helper encodes; ffmpeg is only the mux to SRT, on the helper's stdout.
+    cap, mux = pixel_path.build_native_pipeline(
+        "qcb-capture-win.exe", "ffmpeg.exe", "hevc_10_420_50",
+        "srt://0.0.0.0:9998?mode=listener&latency=120000", "secret123456",
+    )
+    assert cap[0] == "qcb-capture-win.exe" and "--10bit" in cap and "--bitrate" in cap
+    assert cap[cap.index("--bitrate") + 1] == "50"
+    assert cap[cap.index("--gop") + 1] == cap[cap.index("--fps") + 1]  # one-second GOP
+    joined = " ".join(mux)
+    assert "-f hevc" in joined and "-i pipe:0" in joined and "-c copy" in joined
+    assert "-c:v" not in joined  # no encoding in the mux
+    assert mux[-1].count("passphrase=") == 1 and "pbkeylen=16" in mux[-1]
+
+
+def test_native_capture_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("QCB_CAPTURE_NATIVE", "0")
+    assert pixel_path.find_native_capture() is None
