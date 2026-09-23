@@ -50,6 +50,19 @@ transport boundary bought.
 | `run_smoke4.sh` | The field setup: kiosk replica starting **camera-less**, host pre-connected in camera view through a camera parented to a 2.5× scaled bezier circle | 5 checks including `camera_view_BOUND` and `follows_rail_orbit` |
 | `run_smoke5.sh` | Production-file validation. Opens a real `.blend` read-only as host and never saves it. **Set `QCB_SMOKE_FILE`** — no path is committed here | 11 checks including `object_count_parity` and `startup_storm_free`. Written, never yet run |
 
+## The latency bench
+
+`bench_latency.sh agent|zmq [work-dir]` is not a pass/fail suite: it measures
+edit→visible latency per lane and tier. The host makes timestamped edits
+(tier-1 property, tier-2 structural, hot frame, sweep-only custom prop, and a
+tier-1 edit queued behind a large blob); the replica samples the watched
+values on a 2 ms timer and records when each first appeared. Same machine,
+so `time.time()` is shared. The report prints p50/p90 per phase and writes
+`latency.json`; the same pysite/agent requirements as the smokes apply. The
+numbers behind `SYNC-AUDIT.md` §1 are in
+`spikes/parity/results/2026-09-23-sync-latency/`. Run it before and after any
+change to the debounce, the flush tick, the sweep, or the lanes.
+
 ## Things that are load-bearing
 
 - **Separate `BLENDER_USER_RESOURCES` per instance.** `save_settings` writes
