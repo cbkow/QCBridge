@@ -46,12 +46,15 @@ T_CONTROL = 0x01
 T_HOT = 0x02
 T_COLD = 0x03
 T_COLD_ACK = 0x04
+T_FAST = 0x05       # tier-1 deltas and tombstones: their own QUIC stream
+T_FAST_ACK = 0x06
 T_CMD = 0x10
 T_EVENT = 0x20
 
 HOT_KEY_CAMERA = b"cam"
 _COLD_WINDOW = 64                 # messages, against an agent that acks counts
-_COLD_WINDOW_BYTES = 32 << 20     # bytes in flight between us and quinn  # same intent as zmq's SNDHWM: backlog belongs in the dirty set
+_COLD_WINDOW_BYTES = 32 << 20     # bytes in flight between us and quinn
+_FAST_WINDOW_BYTES = 4 << 20      # deltas are small; this only bounds a storm  # same intent as zmq's SNDHWM: backlog belongs in the dirty set
 _PEER = b"\x00"    # one peer today; the byte keeps several replicas possible
 _TICK = 0.05
 
@@ -378,6 +381,8 @@ class HostTransportAgent:
         self.link_note = ""          # last helper-reported reason for being down
         self.cold_dropped = 0        # frames the agent had to discard (cold_dropped events)
         self._credits_bytes = False  # COLD_ACK unit; set from the attached event
+        self._has_fast = False       # agent has the fast lane (attached event)
+        self._fast_outstanding = 0
         self.video_port = 0          # localhost TCP port serving Annex-B HEVC
         self.stats: dict = {}
         self.agent_version = ""      # set in agent mode
@@ -481,6 +486,22 @@ class HostTransportAgent:
         self._link.send(T_COLD, frame)
         return True
 
+    def send_fast(self, header: dict, payload: bytes = b"") -> bool:
+        """Tier-1 deltas and tombstones. Own stream and own window on an
+        agent that has the lane; the cold lane otherwise (the header still
+        carries lane/after, so the replica merges either way)."""
+        if not self._has_fast:
+            return self.send_cold(header, payload)
+        frame = _PEER + pack_cold(header, payload)
+        with self._lock:
+            if not self._link_up or (
+                self._fast_outstanding and self._fast_outstanding + len(frame) > _FAST_WINDOW_BYTES
+            ):
+                return False
+            self._fast_outstanding += len(frame)
+        self._link.send(T_FAST, frame)
+        return True
+
     @property
     def peer_alive(self) -> bool:
         return self._alive
@@ -499,6 +520,10 @@ class HostTransportAgent:
             (count,) = struct.unpack(">I", body[:4])
             with self._lock:
                 self._cold_outstanding = max(0, self._cold_outstanding - count)
+        elif kind == T_FAST_ACK:
+            (count,) = struct.unpack(">I", body[:4])
+            with self._lock:
+                self._fast_outstanding = max(0, self._fast_outstanding - count)
         elif kind == T_EVENT:
             self._handle_event(json.loads(body.decode("utf-8")))
 
@@ -512,6 +537,7 @@ class HostTransportAgent:
             self.peer_pinned = True
             self.agent_config = dict(event.get("config") or {})
             self._credits_bytes = event.get("credits") == "bytes"
+            self._has_fast = "fast" in (event.get("lanes") or [])
             self._attached.set()
         elif name == "config":   # every settings change, from us or the tray
             self.agent_config = dict(event.get("config") or self.agent_config)
@@ -613,6 +639,7 @@ class ReplicaTransportAgent:
         self._hot: dict[bytes, bytes] = {}
         self._hot_lock = threading.Lock()
         self._cold_q: collections.deque[tuple[dict, bytes]] = collections.deque()
+        self._fast_q: collections.deque[tuple[dict, bytes]] = collections.deque()
         self._last_ping = 0.0
         self._ready = threading.Event()
         self._port = 0
@@ -654,6 +681,15 @@ class ReplicaTransportAgent:
         """Snapshot of every key's latest value."""
         with self._hot_lock:
             return dict(self._hot)
+
+    def poll_fast(self, max_items: int) -> list[tuple[dict, bytes]]:
+        items = []
+        while len(items) < max_items:
+            try:
+                items.append(self._fast_q.popleft())
+            except IndexError:
+                break
+        return items
 
     def poll_cold(self, max_items: int) -> list[tuple[dict, bytes]]:
         items = []
@@ -698,6 +734,10 @@ class ReplicaTransportAgent:
             decoded = unpack_cold(body[1:])
             if decoded is not None:
                 self._cold_q.append(decoded)
+        elif kind == T_FAST:
+            decoded = unpack_cold(body[1:])
+            if decoded is not None:
+                self._fast_q.append(decoded)
         elif kind == T_EVENT:
             event = json.loads(body.decode("utf-8"))
             name = event.get("event")

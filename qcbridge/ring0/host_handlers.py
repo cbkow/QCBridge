@@ -94,7 +94,13 @@ class HostSync:
         self.shadow = ShadowStore()
         self.debounce = Debouncer()
         self.dirty = DirtySet()
-        self.seq = 0
+        self.seq = 0            # cold lane: bootstraps and blobs
+        self.seq_fast = 0       # fast lane: tier-1 deltas and tombstones
+        # Ordering across the two lanes: every fast message names the cold
+        # seq it must follow — the last chunk of the newest blob for its
+        # datablock, or the last bootstrap chunk, whichever is later.
+        self._uuid_cold_seq: dict[str, int] = {}
+        self._boot_last_seq = 0
         self.sent_t1 = 0
         self.sent_t2 = 0
         self.t2_unsupported = 0
@@ -338,6 +344,8 @@ class HostSync:
             if self.transport.send_cold(header, payload):
                 self._boot_outbox.pop(0)
                 if not self._boot_outbox:
+                    self._boot_last_seq = header["seq"]
+                    self._uuid_cold_seq.clear()  # the file supersedes every blob
                     self.bake_note = ""  # the full file carries every baked cache
                     self.t2_unsupported = 0  # ditto anything we couldn't resend
             else:
@@ -422,7 +430,10 @@ class HostSync:
         # "rigidbody_world.*" paths write into it.
         changes = sorted(changes, key=lambda c: not c[0].startswith("@"))
         # A pointer's target may be new to the replica (a world with no
-        # users is not in the bootstrap); ship it before naming it.
+        # users is not in the bootstrap); ship it before naming it, and make
+        # this delta follow that blob on the replica (the fast lane would
+        # otherwise outrun it).
+        after = self._after_for(uuid)
         for path, value in changes:
             coll = self._POINTER_SETTERS.get(path)
             if coll and value:
@@ -435,16 +446,28 @@ class HostSync:
                     if t_uuid in self._t2_outbox:
                         self.dirty.requeue(uuid, Tier.T1)  # after the blob has fully left
                         return
-        self.seq += 1
-        header = {"kind": "t1", "seq": self.seq, "uuid": uuid}
+                    after = max(after, self._uuid_cold_seq.get(t_uuid, 0))
+        self.seq_fast += 1
+        header = {"kind": "t1", "lane": "f", "seq": self.seq_fast, "uuid": uuid,
+                  "after": after}
         payload = json.dumps(changes).encode("utf-8")
-        if self.transport.send_cold(header, payload):
+        if self.transport.send_fast(header, payload):
             self.sent_t1 += len(changes)
             if _DEBUG:
                 print(f"qcb t1 send {db.name}: {[p for p, _ in changes]}", flush=True)
         else:
-            self.seq -= 1
+            self.seq_fast -= 1
             self.dirty.requeue(uuid, Tier.T1)
+
+    def _after_for(self, uuid: str) -> int:
+        return max(self._uuid_cold_seq.get(uuid, 0), self._boot_last_seq)
+
+    def caught_up(self, peer_status: dict) -> bool:
+        """Has the replica seen everything we sent, on both lanes? (Smokes
+        and benches gate their steps on this.)"""
+        ps = peer_status or {}
+        return (ps.get("seq", -1) >= self.seq
+                and ps.get("seq_fast", self.seq_fast) >= self.seq_fast)
 
     def _flush_t2(self, uuid: str, snapshot: dict | None = None,
                   fallback: list | None = None) -> None:
@@ -512,6 +535,7 @@ class HostSync:
                 header["seq"] = self.seq
                 if self.transport.send_cold(header, payload):
                     chunks.pop(0)
+                    self._uuid_cold_seq[uuid] = header["seq"]
                 else:
                     self.seq -= 1
                     return False
@@ -520,9 +544,11 @@ class HostSync:
         return True
 
     def _send_tombstone(self, uuid: str) -> None:
-        self.seq += 1
-        if not self.transport.send_cold({"kind": "tomb", "seq": self.seq, "uuid": uuid}):
-            self.seq -= 1
+        self.seq_fast += 1
+        header = {"kind": "tomb", "lane": "f", "seq": self.seq_fast, "uuid": uuid,
+                  "after": self._after_for(uuid)}
+        if not self.transport.send_fast(header):
+            self.seq_fast -= 1
             self.dirty.requeue_tombstone(uuid)
 
     def _sweep_deletions(self) -> None:

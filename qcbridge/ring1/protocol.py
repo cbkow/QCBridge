@@ -114,12 +114,17 @@ def srt_passphrase(token: str) -> str:
 
 
 def make_hello(
-    token: str, epoch: str, blender_version: str, addon_version: str = ""
+    token: str, epoch: str, blender_version: str, addon_version: str = "",
+    seq: int = 0, seq_fast: int = 0,
 ) -> dict:
     return {
         "kind": "hello",
         "token": token,
         "epoch": epoch,
+        # Where the host's lane counters stand, so the replica primes its
+        # trackers: a lost first message after a re-handshake is still a gap.
+        "seq": seq,
+        "seq_fast": seq_fast,
         "protocol": PROTOCOL_VERSION,
         "blender": blender_version,
         # Informational, never gates the handshake: mismatched ends mostly

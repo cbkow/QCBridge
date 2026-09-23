@@ -10,7 +10,7 @@
 //! the same framing shape the addon link uses, preceded by a one-byte lane
 //! tag so the acceptor can demux regardless of arrival order.
 
-use crate::link::{Inbound, Link, T_COLD, T_COLD_ACK, T_CONTROL};
+use crate::link::{Inbound, Link, T_COLD, T_COLD_ACK, T_CONTROL, T_FAST, T_FAST_ACK};
 use crate::load_or_create_cert;
 use crate::video::{VideoSink, VideoSource};
 use anyhow::{Context, Result, anyhow, bail};
@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 const LANE_CONTROL: u8 = 1;
 const LANE_HOT: u8 = 2;
 const LANE_COLD: u8 = 3;
+const LANE_FAST: u8 = 4;
 const HANDSHAKE: Duration = Duration::from_secs(5);
 /// Cold blobs are chunked by the addon, but the addon link tolerates frames
 /// this large and a lane should not be the thing that truncates one.
@@ -52,6 +53,7 @@ pub struct Ctx {
     pub inb: Arc<Inbound>,
     pub control_rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
     pub cold_rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
+    pub fast_rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
     pub video_src: Arc<VideoSource>,
     pub video_sink: Arc<VideoSink>,
     pub observer: Arc<dyn PeerObserver>,
@@ -67,6 +69,10 @@ fn lane_body(peer: u8, payload: &[u8]) -> Bytes {
 
 async fn ack_cold(link: &Link, n: u32) {
     link.frame(T_COLD_ACK, Bytes::copy_from_slice(&n.to_be_bytes())).await;
+}
+
+async fn ack_fast(link: &Link, n: u32) {
+    link.frame(T_FAST_ACK, Bytes::copy_from_slice(&n.to_be_bytes())).await;
 }
 
 /// Constant-time token comparison. Kyber compared tokens with `!=`; the check
@@ -125,6 +131,8 @@ struct Lanes {
     hot_recv: Option<quinn::RecvStream>,
     cold_send: Option<quinn::SendStream>,
     cold_recv: Option<quinn::RecvStream>,
+    fast_send: Option<quinn::SendStream>,
+    fast_recv: Option<quinn::RecvStream>,
 }
 
 // ---- transport configuration ----------------------------------------------
@@ -202,7 +210,8 @@ pub async fn serve_one(ctx: Arc<Ctx>, endpoint: &quinn::Endpoint) -> Result<()> 
 
     let mut hot_recv = None;
     let mut cold_recv = None;
-    for _ in 0..2 {
+    let mut fast_recv = None;
+    for _ in 0..3 {
         let mut r = tokio::time::timeout(HANDSHAKE, conn.accept_uni())
             .await
             .context("lane accept timeout")?
@@ -210,6 +219,7 @@ pub async fn serve_one(ctx: Arc<Ctx>, endpoint: &quinn::Endpoint) -> Result<()> 
         match read_tag(&mut r).await? {
             LANE_HOT => hot_recv = Some(r),
             LANE_COLD => cold_recv = Some(r),
+            LANE_FAST => fast_recv = Some(r),
             t => bail!("unknown lane tag {t}"),
         }
     }
@@ -222,6 +232,8 @@ pub async fn serve_one(ctx: Arc<Ctx>, endpoint: &quinn::Endpoint) -> Result<()> 
         hot_recv,
         cold_send: None,
         cold_recv,
+        fast_send: None,
+        fast_recv,
     };
     let r = run_lanes(ctx.clone(), conn, lanes).await;
     ctx.observer.peer_down(r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
@@ -390,6 +402,8 @@ async fn dial(
     write_tag(&mut hot_send, LANE_HOT).await?;
     let mut cold_send = conn.open_uni().await.context("open cold lane")?;
     write_tag(&mut cold_send, LANE_COLD).await?;
+    let mut fast_send = conn.open_uni().await.context("open fast lane")?;
+    write_tag(&mut fast_send, LANE_FAST).await?;
 
     let fingerprint = seen.lock().unwrap().as_deref().map(hex::encode);
     let lanes = Lanes {
@@ -399,6 +413,8 @@ async fn dial(
         hot_recv: None,
         cold_send: Some(cold_send),
         cold_recv: None,
+        fast_send: Some(fast_send),
+        fast_recv: None,
     };
     Ok((conn, lanes, fingerprint))
 }
@@ -450,7 +466,7 @@ pub async fn host_loop(ctx: Arc<Ctx>, control: Arc<HostControl>) {
 
 async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Result<()> {
     let mut tasks = tokio::task::JoinSet::<Result<()>>::new();
-    let Lanes { mut control_send, mut control_recv, hot_send, hot_recv, cold_send, cold_recv } = lanes;
+    let Lanes { mut control_send, mut control_recv, hot_send, hot_recv, cold_send, cold_recv, fast_send, fast_recv } = lanes;
 
     {
         let mut rx = ctx.control_rx.lock().await;
@@ -462,6 +478,14 @@ async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Resu
         }
         if stale > 0 {
             ack_cold(&ctx.link, stale).await;
+        }
+        let mut rx = ctx.fast_rx.lock().await;
+        let mut stale = 0u32;
+        while let Ok(b) = rx.try_recv() {
+            stale += b.len() as u32;
+        }
+        if stale > 0 {
+            ack_fast(&ctx.link, stale).await;
         }
     }
     ctx.inb.connected.store(true, Relaxed);
@@ -523,6 +547,18 @@ async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Resu
             }
             Ok(())
         });
+        let mut fast_send = fast_send.ok_or_else(|| anyhow!("host session without a fast lane"))?;
+        let c = ctx.clone();
+        tasks.spawn(async move {
+            let mut rx = c.fast_rx.lock().await;
+            while let Some(body) = rx.recv().await {
+                let len = body.len() as u32;
+                let sent = send_msg(&mut fast_send, &body.slice(1..)).await;
+                ack_fast(&c.link, len).await;
+                sent?;
+            }
+            Ok(())
+        });
     } else {
         let mut hot_recv = hot_recv.ok_or_else(|| anyhow!("replica session without a hot lane"))?;
         let mut cold_recv = cold_recv.ok_or_else(|| anyhow!("replica session without a cold lane"))?;
@@ -543,6 +579,14 @@ async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Resu
         tasks.spawn(async move {
             while let Some(payload) = recv_msg(&mut cold_recv).await? {
                 c.link.frame(T_COLD, lane_body(0, &payload)).await;
+            }
+            Ok(())
+        });
+        let mut fast_recv = fast_recv.ok_or_else(|| anyhow!("replica session without a fast lane"))?;
+        let c = ctx.clone();
+        tasks.spawn(async move {
+            while let Some(payload) = recv_msg(&mut fast_recv).await? {
+                c.link.frame(T_FAST, lane_body(0, &payload)).await;
             }
             Ok(())
         });

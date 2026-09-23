@@ -79,9 +79,12 @@ Run it after any change to detection, and expect the counts to move.
 
 - **Separate `BLENDER_USER_RESOURCES` per instance.** `save_settings` writes
   there; without it a smoke run would edit real preferences.
-- **Steps advance on the replica's pong sequence catching up, plus a settle
+- **Steps advance on the replica's pong sequences catching up, plus a settle
   window** — polled, never on a fixed timeline. That is why the suites are
-  reliable rather than flaky.
+  reliable rather than flaky. Use `sync.caught_up(peer_status)`: since the
+  fast lane (2026-09-23) there are two counters, cold (`seq`: bootstraps and
+  blobs) and fast (`seq_fast`: deltas and tombstones), and a step is only
+  settled when both have arrived.
 - **API-driven edits must `obj.update_tag()`** where the UI would tag, because
   raw idprop writes fire nothing — *except* when the point of the check is the
   sweep path, where tagging would hide the bug.

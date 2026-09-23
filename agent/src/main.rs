@@ -116,6 +116,7 @@ fn attach_reply(agent: &Agent) -> Value {
         // COLD_ACK carries bytes since 2026-09-23; an addon that does not
         // see this key falls back to counting messages against an old agent.
         "credits": "bytes",
+        "lanes": ["fast"],  // tier-1 has its own stream; absent = send it on cold
         // The live settings, so the addon mirrors them instead of owning
         // its own copy. The addon already received `role` and `port` and
         // threw them away; now there is a reason to keep them.
@@ -201,8 +202,9 @@ fn main() -> Result<()> {
     }
     let (control_tx, control_rx) = mpsc::channel(1024);
     let (cold_tx, cold_rx) = mpsc::channel(256);
+    let (fast_tx, fast_rx) = mpsc::channel(1024);
     let inb = Arc::new(Inbound {
-        control_tx, cold_tx, hot: Mutex::new(Default::default()), hot_notify: Notify::new(),
+        control_tx, cold_tx, fast_tx, hot: Mutex::new(Default::default()), hot_notify: Notify::new(),
         connected: AtomicBool::new(false),
     });
     let status = Arc::new(Mutex::new("starting".to_string()));
@@ -263,6 +265,7 @@ fn main() -> Result<()> {
         inb: inb.clone(),
         control_rx: tokio::sync::Mutex::new(control_rx),
         cold_rx: tokio::sync::Mutex::new(cold_rx),
+        fast_rx: tokio::sync::Mutex::new(fast_rx),
         video_src: video_src.clone(),
         video_sink: video_sink.clone(),
         observer,

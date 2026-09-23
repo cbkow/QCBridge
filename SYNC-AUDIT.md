@@ -61,6 +61,11 @@ What the numbers say:
   loopback (next point). On a 100 Mbps link the blob is ~3 s and the delta
   waits all of it, on either transport. `hol0` does not show it because both
   edits flush in one tick and the delta is serialized first.
+- *After P2 (2026-09-23): with tier-1 on its own stream `hol150` reads
+  240 ms against a 189 ms `t1` — the wire share is gone; the ~50 ms left is
+  the replica's indivisible apply of the 640k-vertex blob on its main
+  thread, which no lane can hide. Splitting or threading big applies is the
+  remaining lever (P3+).* Results in `results/2026-09-23-sync-latency/agent-after-p2/`.
 - **quinn is slower than zmq on large payloads** — +40 % on the Heavy blob,
   and the earlier bootstrap bench showed 3.02 s vs 1.21 s at 40 M verts
   (`spikes/parity/results/2026-09-22-quinn-port/notes.md`). Loopback QUIC
@@ -79,14 +84,27 @@ geometry/transform/shading flags — `host_handlers.py:210-224`,
 timer drains those untouched for 150 ms; the shadow diff decides tier 1
 (property tuples), tier 2 (`libraries.write` of the datablock, chunked at
 4 MiB) or, for `~` structural changes, tier 2 again. Tier 3 is the whole file,
-manual. Everything cold rides **one** ordered QUIC stream with a 64-message
-credit window whose credits return when the *host's own* agent hands the
-frame to quinn (`session.rs:514-520`) — a local bound, not backpressure. Hot
-is a second stream, conflated twice. Control is a bidi stream carrying
+manual. *(As audited:)* everything cold rode **one** ordered QUIC stream with
+a 64-message credit window whose credits returned when the *host's own* agent
+handed the frame to quinn — a local bound, not backpressure. Hot is a second
+stream, conflated twice. Control is a bidi stream carrying
 hello/shot/zoom/ping/pong/goodbye. Replica: a 15 ms timer applies ≤8 cold
 messages under a 10 ms budget (`replica_apply.py:23-24`), with tier-2 applies
-explicitly outside the budget. Nothing flows replica→host except four scalars
-on the pong.
+explicitly outside the budget. Nothing flowed replica→host except four
+scalars on the pong.
+
+*(Since 2026-09-23, P2:)* cold carries bootstraps and blobs; a **fast** lane
+— its own QUIC stream and its own byte window — carries tier-1 deltas and
+tombstones, so a delta is never behind a blob on the wire. Every fast
+message names the cold seq it must follow (`after`: the last chunk of the
+newest blob for its datablock or of a pointer target just shipped, or the
+last bootstrap chunk); the replica's `ring1/merge.LaneMerger` parks it until
+that seq has *applied*, and applies fast messages even while a blob apply is
+pending. Sequence numbers are per lane; the hello carries the host's
+counters so a re-handshake primes the trackers. Credits are bytes. The zmq
+transport aliases the fast lane onto its single stream and still merges by
+header. The pong carries epoch, both seqs, gaps, parked count, want_resync,
+bootstraps, unmapped paths, frozen caches and the last error.
 
 ---
 
@@ -113,8 +131,8 @@ on the pong.
 |---|---|---|---|
 | B1 | **A replica restart is never re-bootstrapped.** The handshake timer returns `None` on first success and is never re-armed; `on_peer_state` is implemented in the transport and registered by nobody. Host says connected, replica says listening, deltas hit unknown uuids. | `session.py:260`, `transport_agent.py:478` | confirmed → **fixed 09-23**: `on_peer_state` registered; down→up or a new replica epoch on the pong re-arms the handshake with a fresh host epoch and bootstraps (`smokes/run_smoke_reconnect.sh`) |
 | B2 | **Gaps are counted, never acted on.** `SeqTracker.observe` increments; nothing escalates; Force Resync is host-only. An unattended replica with gaps stays wrong. | `replica_apply.py:344-348`, `session.py:489` | confirmed → **fixed 09-23**: a gap or unknown uuid raises `want_resync` on the pong; `ring1/liveness.ResyncPolicy` sends one bootstrap per replica state, rate-limited |
-| B3 | **Tier-2 restarts from chunk 0 on any credit refusal** with a new `blob_id`. Over 64 chunks (256 MiB) it depends on credits returning mid-loop; otherwise it re-serializes every 50 ms. | `host_handlers.py:380-387` | confirmed |
-| B4 | Replica pongs share the agent's 256-slot link queue with inbound cold frames (`link.frame` for both), so a big transfer can trip the 3 s liveness window. | `main.rs:192-193`, `session.rs:489, 541` | confirmed |
+| B3 | **Tier-2 restarts from chunk 0 on any credit refusal** with a new `blob_id`. Over 64 chunks (256 MiB) it depends on credits returning mid-loop; otherwise it re-serializes every 50 ms. | `host_handlers.py:380-387` | confirmed → **fixed 09-23**: `_t2_outbox` resumes from the refused chunk; credits are bytes (32 MiB window) so chunk count no longer matters |
+| B4 | Replica pongs share the agent's 256-slot link queue with inbound cold frames (`link.frame` for both), so a big transfer can trip the 3 s liveness window. | `main.rs:192-193`, `session.rs:489, 541` | confirmed → **fixed 09-23**: the link has a priority queue for control/acks/events, drained ahead of cold frames |
 
 **C. Slow — correct, later than it should be**
 
@@ -122,7 +140,7 @@ on the pong.
 |---|---|---|---|
 | C1 | **150 ms debounce + 50 ms tick = 80 % of tier-1 latency** (§1). | `classifier.py:14`, `host_handlers.py:32` | measured |
 | C2 | **Sweep-only edits** (eye toggle, rename, custom props, bone idprops, collection exclude) wait for the 0.5 s sweep *and then* a full debounce cycle, since the sweep runs before the drain in the same tick. | `host_handlers.py:280-291` | measured (§1 sweep row) |
-| C3 | **One cold stream, no priority.** No `set_priority` in `agent/src`; tier-1 waits behind every blob and the bootstrap (§1 hol150). | `session.rs:371-392` | confirmed |
+| C3 | **One cold stream, no priority.** No `set_priority` in `agent/src`; tier-1 waits behind every blob and the bootstrap (§1 hol150). | `session.rs:371-392` | confirmed → **fixed 09-23**: tier-1 and tombstones on their own stream with the `after` merge rule; contract test `test_fast_lane_is_not_behind_a_cold_blob` |
 | C4 | Replica `frame_set` is clamped to 10 Hz, so host playback never plays back. | `replica_apply.py:25` | reported |
 
 **D. Wasteful — work that produces nothing**
@@ -133,7 +151,7 @@ on the pong.
 | D2 | **Edit-mode and sculpt strokes resend the whole Mesh, and the blob is the pre-edit datablock** — no `update_from_editmode()` anywhere. Correctness arrives on mode exit; the host stalls on every ≥150 ms pause. | `tier2_io.py:56-66` | confirmed |
 | D3 | Tier-2 `libraries.write` is synchronous on the host main thread with no per-tick byte budget; a multi-object structural edit is a serialize storm. | `host_handlers.py:289-296` | reported |
 | D4 | A 50 MiB blob is copied ≥4 times per direction (`pack_cold` join, `_read_exact` join, agent `vec!` per frame, `Reassembler` join); 4 MiB chunking is a zmq-era limit — lanes accept 256 MiB. | `transport_agent.py:78-80, 251-262`, `link.rs:179`, `protocol.py:217` | reported |
-| D5 | `stats` (rtt, loss, cwnd, mtu, mbps) is emitted at 1 Hz and read by nobody. `"listening"` event branch the agent never emits; `FLAG_HOLD`, cold kind `"sync"`, the fixed-rate pacer — declared, unused. | `transport_agent.py:525, 687`, `protocol.py:25, 144` | reported |
+| D5 | `stats` (rtt, loss, cwnd, mtu, mbps) is emitted at 1 Hz and read by nobody. `"listening"` event branch the agent never emits; `FLAG_HOLD`, cold kind `"sync"`, the fixed-rate pacer — declared, unused. | `transport_agent.py:525, 687`, `protocol.py:25, 144` | reported → **stats on the panel and burn-in 09-23**; the dead declarations remain a cleanup item |
 | D6 | `build_snapshot` walks `_layer_collections()` once per collection — O(n²) on the main thread. | `host_handlers.py:767` | reported |
 | D7 | **Every shader-affecting material edit resends every Mesh that wears it, whole.** The depsgraph flags the mesh (shading), the handler discards `is_updated_geometry`, and Mesh is unconditional tier 2 — a 64 KB blob per slider tick on a four-vertex plane, a full mesh in production. | `classifier.py:54-55`, measured in `COVERAGE.md` | confirmed + measured → **fixed 09-23**: shading-only updates on geometry types are skipped (by type — an Action's keyframe edit also arrives as shade=True and must not be) |
 
@@ -185,7 +203,7 @@ and treat a reload/paint as a tier-2 dependency resend; A4 `~data`,
 `~materials`, `~instance` signatures; A5 replica-side cache of the last `@`
 values per uuid, re-applied after `apply_blob`.
 
-**P2 — use the lanes (two to three days, agent + addon).** C3 tier-1 on its
+**P2 — use the lanes (two to three days, agent + addon). Done 2026-09-23: part 1 (byte credits, resume-from-chunk, pong priority, stats) and part 2 (fast stream, `LaneMerger`, per-lane seqs, hello-primed trackers).** C3 tier-1 on its
 own stream with the merge rule; B3 resume from the failed chunk like
 `_boot_outbox`; a byte-based window (32 MiB) replacing the 64-message one, which
 also retires the 4 MiB chunk as a transport limit; B4 pongs on their own

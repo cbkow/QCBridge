@@ -236,9 +236,12 @@ def _start_host(prefs) -> None:
             return None  # session stopped/replaced
         now = _time.monotonic()
         if pending["req"] is None:
+            sync = state.get("sync")
             hello = protocol.make_hello(
                 token, state["epoch"], bpy.app.version_string,
                 addon_version=_addon_version(),
+                seq=sync.seq if sync else 0,
+                seq_fast=getattr(sync, "seq_fast", 0) if sync else 0,
             )
             pending["req"] = transport.request_nowait(hello)
             pending["sent_at"] = now
@@ -364,7 +367,7 @@ def _start_replica(prefs) -> None:
             ok, reason = protocol.check_hello(msg, token)
             if ok:
                 if state["peer_epoch"] != msg.get("epoch"):
-                    replica_apply.notify_new_session()
+                    replica_apply.notify_new_session(msg.get("seq", 0), msg.get("seq_fast", 0))
                 state["peer_epoch"] = msg.get("epoch")
                 state["peer_addon"] = msg.get("addon", "")
                 state["note"] = "host connected"
@@ -398,6 +401,8 @@ def _start_replica(prefs) -> None:
             # (SYNC-AUDIT §4.2): who we are, what we want, what went wrong.
             "epoch": epoch,
             "want_resync": replica_apply.stats["want_resync"],
+            "seq_fast": replica_apply.stats["seq_fast"],
+            "parked": replica_apply.stats["parked"],
             "bootstraps": replica_apply.stats["bootstraps"],
             "unmapped": replica_apply.stats["unmapped_paths"],
             "frozen": replica_apply.stats["frozen_caches"],

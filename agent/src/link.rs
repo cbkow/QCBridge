@@ -11,6 +11,9 @@
 //!   0x03 COLD      u8 peer | opaque (addon packs header+payload)
 //!   0x04 COLD_ACK  u32 BE bytes            agent -> addon: credits returned
 //!                                          (bytes of COLD body accepted or dropped)
+//!   0x05 FAST      u8 peer | opaque        tier-1 deltas and tombstones: their own
+//!                                          QUIC stream, never behind a blob
+//!   0x06 FAST_ACK  u32 BE bytes
 //!   0x10 CMD       json                    addon -> agent
 //!   0x20 EVENT     json                    agent -> addon
 
@@ -27,6 +30,8 @@ pub const T_CONTROL: u8 = 0x01;
 pub const T_HOT: u8 = 0x02;
 pub const T_COLD: u8 = 0x03;
 pub const T_COLD_ACK: u8 = 0x04;
+pub const T_FAST: u8 = 0x05;
+pub const T_FAST_ACK: u8 = 0x06;
 pub const T_CMD: u8 = 0x10;
 pub const T_EVENT: u8 = 0x20;
 
@@ -67,7 +72,7 @@ impl Link {
     }
 
     fn is_prio(kind: u8) -> bool {
-        matches!(kind, T_CONTROL | T_COLD_ACK | T_EVENT)
+        matches!(kind, T_CONTROL | T_COLD_ACK | T_FAST | T_FAST_ACK | T_EVENT)
     }
 
     pub async fn frame(&self, kind: u8, body: Bytes) {
@@ -183,6 +188,7 @@ pub fn writer_thread(link: Arc<Link>, mut rx: mpsc::Receiver<Out>, mut prio_rx: 
 pub struct Inbound {
     pub control_tx: mpsc::Sender<Bytes>,
     pub cold_tx: mpsc::Sender<Bytes>,
+    pub fast_tx: mpsc::Sender<Bytes>,
     pub hot: Mutex<HashMap<Vec<u8>, Bytes>>,
     pub hot_notify: Notify,
     pub connected: AtomicBool,
@@ -230,6 +236,14 @@ fn reader_loop(mut r: impl Read, inb: &Inbound, link: &Link, on_cmd: &(dyn Fn(&V
                     // session — and say so: the frame is gone, not delivered.
                     link.event_try(serde_json::json!({"event": "cold_dropped", "n": 1}));
                     link.frame_blocking(T_COLD_ACK, Bytes::copy_from_slice(&len.to_be_bytes()));
+                }
+            }
+            T_FAST => {
+                let len = body.len() as u32;
+                let sent = inb.connected.load(Relaxed) && inb.fast_tx.try_send(body).is_ok();
+                if !sent {
+                    link.event_try(serde_json::json!({"event": "cold_dropped", "n": 1, "lane": "fast"}));
+                    link.frame_blocking(T_FAST_ACK, Bytes::copy_from_slice(&len.to_be_bytes()));
                 }
             }
             T_CMD => match serde_json::from_slice::<Value>(&body) {

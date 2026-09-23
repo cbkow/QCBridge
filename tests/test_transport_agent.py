@@ -297,3 +297,27 @@ def test_agent_advertises_byte_credits(pair):
     assert wait_for(lambda: host.peer_alive)
     assert host._credits_bytes, "attached event lacked credits=bytes — stale agent binary?"
     assert replica._credits_bytes if hasattr(replica, "_credits_bytes") else True
+
+
+def test_fast_lane_is_not_behind_a_cold_blob(pair):
+    """A tier-1 delta sent right after a large blob must reach the replica
+    before the blob finishes — that is what the second stream is for."""
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    assert host._has_fast, "attached event lacked lanes=[fast] — stale agent binary?"
+    blob = b"MESH" * 8_000_000  # 32 MB on the cold lane
+    chunks = list(protocol.chunk_blob("t2", "blob-big", blob, meta={"uuid": "big"}))
+    seq = 0
+    for header, payload in chunks:
+        seq += 1
+        header["seq"] = seq
+        while not host.send_cold(header, payload):
+            time.sleep(0.002)
+    assert host.send_fast({"kind": "t1", "lane": "f", "seq": 1, "uuid": "x", "after": 0}, b"delta")
+    fast = []
+    assert wait_for(lambda: fast.extend(replica.poll_fast(8)) or bool(fast), timeout=5.0)
+    assert fast[0][0]["uuid"] == "x"
+    # the cold lane must still deliver the whole blob, in order
+    cold = []
+    assert wait_for(lambda: cold.extend(replica.poll_cold(64)) or len(cold) >= len(chunks), timeout=15.0)
+    assert [h["blob"]["i"] for h, _ in cold[: len(chunks)]] == list(range(len(chunks)))

@@ -53,7 +53,7 @@ def dump():
 def peer_caught_up():
     transport = session.state["transport"]
     ps = getattr(transport, "peer_status", {}) or {}
-    return session.state["note"] == "connected" and ps.get("seq", -1) >= sync.seq
+    return session.state["note"] == "connected" and sync.caught_up(ps)
 
 
 def _driver():

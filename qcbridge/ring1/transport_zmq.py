@@ -115,6 +115,11 @@ class HostTransportZmq:
         except zmq.Again:
             pass  # no subscriber: hot is ephemeral by design
 
+    def send_fast(self, header: dict, payload: bytes = b"") -> bool:
+        """zmq has one cold stream; fast rides it (the replica merges by
+        header, so ordering is trivially satisfied)."""
+        return self.send_cold(header, payload)
+
     def send_cold(self, header: dict, payload: bytes = b"") -> bool:
         try:
             self._cold.send_multipart(protocol.encode_cold(header, payload), zmq.NOBLOCK)
@@ -237,6 +242,9 @@ class ReplicaTransportZmq:
     def poll_hot(self) -> bytes | None:
         with self._hot_lock:
             return self._hot_slot
+
+    def poll_fast(self, max_items: int) -> list[tuple[dict, bytes]]:
+        return []  # everything arrives on the cold queue
 
     def poll_cold(self, max_items: int) -> list[tuple[dict, bytes]]:
         items = []

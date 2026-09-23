@@ -17,7 +17,7 @@ import time
 import bpy
 from mathutils import Matrix
 
-from ..ring1 import protocol
+from ..ring1 import merge, protocol
 from . import bootstrap, kiosk, overlay, pixel_path, tier2_io
 from .identity import UUID_PROP
 
@@ -55,6 +55,8 @@ stats = {
     # Raised on a seq gap or an unknown uuid, cleared when a bootstrap
     # applies; rides the pong so the host can ship one without a human.
     "want_resync": False,
+    "seq_fast": 0,     # fast lane (tier-1 deltas, tombstones)
+    "parked": 0,       # fast messages waiting for their blob to apply
     # Baked disk caches with no external path: their blendcache_<name>/ dir
     # belongs to the host's file name, which this machine never had
     # (CACHES.md §2) — frozen at rest with every flag green.
@@ -65,12 +67,14 @@ stats = {
 # gap → want_resync → bootstrap path without a lossy network.
 _TEST_DROP_FIRST_T1 = bool(os.environ.get("QCB_TEST_DROP_FIRST_T1"))
 
-_seq_tracker = protocol.SeqTracker()
+_merger = merge.LaneMerger()
 _uuid_map: dict[str, bpy.types.ID] = {}
 _reassembler = protocol.Reassembler()
-_inbox: collections.deque = collections.deque()  # polled-but-unprocessed msgs
+_inbox: collections.deque = collections.deque()  # polled-but-unprocessed cold msgs
+_inbox_fast: collections.deque = collections.deque()  # fast lane: never waits on a blob apply
 _blob_by_uuid: dict[str, str] = {}   # uuid → latest in-flight blob id
 _at_state: dict[str, dict[str, object]] = {}  # uuid → last "@" values applied
+_pending_t2_seq: int | None = None  # cold seq of the blob's last chunk
 _pending_t2: tuple[dict, bytes] | None = None  # applied on the NEXT tick so
                                                # the "⟳ applying" label gets a redraw first
 _mappings: list = []
@@ -442,6 +446,7 @@ def _apply_pending_t2() -> None:
         stats["last_error"] = f"{header.get('kind')} {header.get('name')}: {exc!r}"
     finally:
         stats["applying"] = ""
+        _release(_merger.cold_done(_pending_t2_seq))
         # A t2/boot apply can replace the very camera the viewport is
         # looking through — batch_remove knocks the view out of CAMERA
         # perspective. A static host view means every hot packet is
@@ -457,35 +462,61 @@ def _apply_pending_t2() -> None:
 
 
 def _process_cold(deadline: float) -> None:
-    # One message at a time through _inbox so a mid-batch stop (a completed
-    # tier-2 blob deferring its apply) never drops already-polled messages.
+    # One message at a time through the inboxes so a mid-batch stop (a
+    # completed tier-2 blob deferring its apply) never drops already-polled
+    # messages. Fast messages are applied even while a blob apply is
+    # pending: the merge rule parks any that must follow it (LaneMerger),
+    # so the rest are independent of it by construction.
     global _pending_t2
-    while time.monotonic() < deadline and _pending_t2 is None:
-        if not _inbox:
-            transport = _transport
-            if transport is None:
-                return
-            items = transport.poll_cold(8)
-            if not items:
-                return
-            _inbox.extend(items)
-        header, payload = _inbox.popleft()
+    transport = _transport
+    if transport is None:
+        return
+    while time.monotonic() < deadline:
+        if not _inbox_fast and hasattr(transport, "poll_fast"):
+            _inbox_fast.extend(transport.poll_fast(64))
+        if _inbox_fast:
+            header, payload = _inbox_fast.popleft()
+        elif _pending_t2 is None:
+            if not _inbox:
+                _inbox.extend(transport.poll_cold(8))
+                if not _inbox:
+                    return
+            header, payload = _inbox.popleft()
+        else:
+            return  # cold waits for the pending apply; fast is drained
         seq = header.get("seq")
         kind = header.get("kind")
         global _TEST_DROP_FIRST_T1
         if _TEST_DROP_FIRST_T1 and kind == "t1":
             _TEST_DROP_FIRST_T1 = False
             continue  # simulate a lost frame: the next seq reveals the gap
-        if seq is not None:
-            if not _seq_tracker.observe(seq):
-                stats["want_resync"] = True
-            stats["seq"] = _seq_tracker.last_seen or 0
-            stats["gaps"] = _seq_tracker.gaps
+        if not _merger.observe(header):
+            stats["want_resync"] = True
+        stats["seq"] = _merger.cold.last_seen or 0
+        stats["seq_fast"] = _merger.fast.last_seen or 0
+        stats["gaps"] = _merger.gaps
+        if not _merger.admit(header, payload):
+            stats["parked"] = _merger.parked
+            continue  # fast message waiting for the blob it must follow
+        _dispatch(header, payload, seq)
+
+
+def _dispatch(header: dict, payload: bytes, seq) -> None:
+    global _pending_t2, _pending_t2_seq
+    kind = header.get("kind")
+    if _merger.lane_of(header) == merge.LANE_FAST:
         if kind == "t1":
             _apply_t1(header, payload)
         elif kind == "tomb":
             _apply_tombstone(header)
-        elif kind in ("t2", "boot"):
+        return
+    if kind == "t1":
+        _apply_t1(header, payload)
+        _release(_merger.cold_done(seq))
+    elif kind == "tomb":
+        _apply_tombstone(header)
+        _release(_merger.cold_done(seq))
+    elif kind in ("t2", "boot"):
             uuid = header.get("uuid", "")
             blob_id = header["blob"]["id"]
             stale = _blob_by_uuid.get(uuid)
@@ -498,9 +529,19 @@ def _process_cold(deadline: float) -> None:
                 # Defer the indivisible apply one tick: label first.
                 stats["applying"] = done[0].get("name", "?")
                 _pending_t2 = done
+                _pending_t2_seq = seq  # cold_done only once it has applied
                 area = _target_view()
                 if area:
                     area.tag_redraw()
+            else:
+                _release(_merger.cold_done(seq))  # a middle chunk: nothing waits on it
+
+
+def _release(items: list) -> None:
+    """Parked fast messages whose blob has now applied."""
+    for header, payload in items:
+        _dispatch(header, payload, header.get("seq"))
+    stats["parked"] = _merger.parked
 
 
 def _target_view():
@@ -641,21 +682,34 @@ def notify_host_goodbye() -> None:
     _host_goodbye = True
 
 
-def notify_new_session() -> None:
-    """Fresh handshake: the new host session restarts its seq numbering, so
-    the old tracker would count a false gap. IO thread — flag only."""
-    global _new_session
+_new_session_seqs = (0, 0)
+
+
+def notify_new_session(seq_cold: int = 0, seq_fast: int = 0) -> None:
+    """Fresh handshake: the host's lane counters are wherever it left them,
+    so the trackers prime to what the hello reports — otherwise the first
+    message on a lane is a fresh start and a lost first message is no gap.
+    IO thread — flag only."""
+    global _new_session, _new_session_seqs
+    _new_session_seqs = (int(seq_cold or 0), int(seq_fast or 0))
     _new_session = True
 
 
 def _handle_new_session() -> None:
-    global _new_session, _seq_tracker, _reassembler
+    global _new_session, _reassembler
     _new_session = False
-    _seq_tracker = protocol.SeqTracker()
+    _merger.reset()
+    # Keep zeros: 0 means "the next message is seq 1", not "unknown" — a
+    # lane the host never used before a restart must still show its gaps.
+    _merger.cold.last_seen = _new_session_seqs[0]
+    _merger.fast.last_seen = _new_session_seqs[1]
+    _merger.cold_applied = _new_session_seqs[0]
     _reassembler = protocol.Reassembler()
     _blob_by_uuid.clear()
     _at_state.clear()
     stats["seq"] = 0
+    stats["seq_fast"] = 0
+    stats["parked"] = 0
     stats["gaps"] = 0
     stats["want_resync"] = False
 
@@ -746,14 +800,15 @@ def _tick_inner(transport):
 
 
 def start(transport, mappings=()) -> None:
-    global _transport, _last_hot, _last_hot_applied, _seq_tracker, \
+    global _transport, _last_hot, _last_hot_applied, \
         _reassembler, _mappings, _pending_t2
     _transport = transport
     _last_hot = None
     _last_hot_applied = 0.0
-    _seq_tracker = protocol.SeqTracker()
+    _merger.reset()
     _reassembler = protocol.Reassembler()
     _inbox.clear()
+    _inbox_fast.clear()
     _blob_by_uuid.clear()
     _at_state.clear()
     _pending_t2 = None
@@ -761,7 +816,7 @@ def start(transport, mappings=()) -> None:
     stats.update(
         seq=0, gaps=0, applied_t1=0, applied_t2=0, apply_errors=0,
         unknown_uuid=0, bootstraps=0, unmapped_paths=0, applying="", last_error="",
-        want_resync=False, frozen_caches=0,
+        want_resync=False, frozen_caches=0, seq_fast=0, parked=0,
     )
     _rebuild_uuid_map()
     # persistent: the apply loop must survive the bootstrap's open_mainfile

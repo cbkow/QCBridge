@@ -49,6 +49,12 @@ bootstrap, plus every blob since), because a full save writes no orphans
 and each bootstrap wiped any orphan shipped earlier; and NLA strips are in
 the animation signature, not just the track count.
 
+*After P2 (same day):* tier-1 moved to its own lane with the merge rule;
+the survey re-ran at 115–116 crossed with zero parked leftovers and zero
+apply errors (`full-agent-after-p2.json`). The pointer rule gained one
+detail the fast lane exposed: a delta that names a just-shipped target must
+also *follow* that target's blob (`after`), or the fast lane outruns it.
+
 **Still not crossing, and why:**
 
 | row | why |

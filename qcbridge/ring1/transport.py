@@ -50,6 +50,13 @@ class HostTransport(Protocol):
         — the caller keeps the datablock dirty and retries on a later flush."""
         ...
 
+    def send_fast(self, header: dict, payload: bytes = b"") -> bool:
+        """Tier-1 deltas and tombstones: an ordered lane of its own where the
+        transport has one, so a delta never waits behind a blob. The header
+        carries lane="f" and `after` (the cold seq it must follow); the
+        replica's LaneMerger orders the two lanes. Same contract as send_cold."""
+        ...
+
     @property
     def peer_alive(self) -> bool: ...
 
@@ -84,6 +91,11 @@ class ReplicaTransport(Protocol):
 
     def poll_cold(self, max_items: int) -> list[tuple[dict, bytes]]:
         """Up to max_items complete cold messages, oldest first."""
+        ...
+
+    def poll_fast(self, max_items: int) -> list[tuple[dict, bytes]]:
+        """Up to max_items fast-lane messages, oldest first ([] when the
+        transport has no such lane — they arrive via poll_cold instead)."""
         ...
 
     @property
