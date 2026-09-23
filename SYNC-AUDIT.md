@@ -64,6 +64,13 @@ What the numbers say:
 - *After P3 (2026-09-23, `agent-after-p3/`): `t1` **103** / `t2` 137 / `hot`
   29 / `sweep` **184** / `hol150` **152** / `heavy` 302 ms p50. The debounce
   and tick were the budget, as §1 said.*
+- *Profiled after that (evening): the replica's apply of the 640k-vertex
+  blob is 46 ms, of which 45 is `libraries.load` decompressing the 18 MB
+  zstd partial — remap, remove, link and depsgraph are ~0, and the same
+  partial uncompressed loads in 2 ms. The residual in `hol150` is
+  decompression on Blender's main thread. The lever would be compressing on
+  the agent's thread instead of in `libraries.write`/`load` (a wire change,
+  ~3× the local-link bytes); deferred to after the Windows pass.*
 - *After P2 (2026-09-23): with tier-1 on its own stream `hol150` reads
   240 ms against a 189 ms `t1` — the wire share is gone; the ~50 ms left is
   the replica's indivisible apply of the 640k-vertex blob on its main
