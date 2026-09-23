@@ -164,6 +164,14 @@ def setup():
     _new_mesh_obj("CovVParentTarget")
     # object to receive light linking
     _new_mesh_obj("CovLLTarget")
+    # a keyed rig: scrubbing it must not resend the armature object per frame
+    with ops_ctx():
+        bpy.ops.object.armature_add(location=(0, 6, 0))
+    rig = bpy.context.active_object; rig.name = "CovRig"
+    pb = rig.pose.bones[0]
+    pb.location = (0, 0, 0); pb.keyframe_insert("location", frame=1)
+    pb.location = (0, 0, 2); pb.keyframe_insert("location", frame=20)
+    sc.frame_set(1)
 
 
 # ── objects ──────────────────────────────────────────────────────────────────
@@ -1034,6 +1042,19 @@ def anim_drv_edit():
 def _():
     o = obj("CovDrv"); ad = None if o is None else o.animation_data
     return None if ad is None or not ad.drivers else ad.drivers[0].driver.expression
+
+
+@action("anim_rig_scrub", "animation", "scrub 12 frames of a keyed rig (D1: no rig blob per frame)")
+def anim_rig_scrub():
+    for f in range(1, 13):
+        bpy.context.scene.frame_set(f)
+        bpy.context.view_layer.update()
+@probe(anim_rig_scrub)
+def _():
+    o = obj("CovRig")
+    if o is None or bpy.context.scene.frame_current != 12:
+        return None
+    return r4(o.pose.bones[0].location)
 
 
 # ── physics ──────────────────────────────────────────────────────────────────

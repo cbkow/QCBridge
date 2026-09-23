@@ -61,6 +61,9 @@ What the numbers say:
   loopback (next point). On a 100 Mbps link the blob is ~3 s and the delta
   waits all of it, on either transport. `hol0` does not show it because both
   edits flush in one tick and the delta is serialized first.
+- *After P3 (2026-09-23, `agent-after-p3/`): `t1` **103** / `t2` 137 / `hot`
+  29 / `sweep` **184** / `hol150` **152** / `heavy` 302 ms p50. The debounce
+  and tick were the budget, as §1 said.*
 - *After P2 (2026-09-23): with tier-1 on its own stream `hol150` reads
   240 ms against a 189 ms `t1` — the wire share is gone; the ~50 ms left is
   the replica's indivisible apply of the 640k-vertex blob on its main
@@ -138,8 +141,8 @@ bootstraps, unmapped paths, frozen caches and the last error.
 
 | # | finding | where | status |
 |---|---|---|---|
-| C1 | **150 ms debounce + 50 ms tick = 80 % of tier-1 latency** (§1). | `classifier.py:14`, `host_handlers.py:32` | measured |
-| C2 | **Sweep-only edits** (eye toggle, rename, custom props, bone idprops, collection exclude) wait for the 0.5 s sweep *and then* a full debounce cycle, since the sweep runs before the drain in the same tick. | `host_handlers.py:280-291` | measured (§1 sweep row) |
+| C1 | **150 ms debounce + 50 ms tick = 80 % of tier-1 latency** (§1). | `classifier.py:14`, `host_handlers.py:32` | measured → **fixed 09-23**: debounce 80 ms, tick 25 ms — `t1` 189 → **103 ms** p50; the 21-check, storm counter and survey unchanged |
+| C2 | **Sweep-only edits** (eye toggle, rename, custom props, bone idprops, collection exclude) wait for the 0.5 s sweep *and then* a full debounce cycle, since the sweep runs before the drain in the same tick. | `host_handlers.py:280-291` | measured → **fixed 09-23**: sweep every 250 ms and sweep-marked datablocks skip the debounce — `sweep` 429 → **184 ms** p50 |
 | C3 | **One cold stream, no priority.** No `set_priority` in `agent/src`; tier-1 waits behind every blob and the bootstrap (§1 hol150). | `session.rs:371-392` | confirmed → **fixed 09-23**: tier-1 and tombstones on their own stream with the `after` merge rule; contract test `test_fast_lane_is_not_behind_a_cold_blob` |
 | C4 | Replica `frame_set` is clamped to 10 Hz, so host playback never plays back. | `replica_apply.py:25` | reported |
 
@@ -147,8 +150,8 @@ bootstraps, unmapped paths, frozen caches and the last error.
 
 | # | finding | where | status |
 |---|---|---|---|
-| D1 | **`~pose` hashes animated `matrix_basis`** in both the flush and the sweep digest: scrubbing a rigged shot escalates a full tier-2 Object blob per rig each time the pose is sampled changed, for zero information. | `host_handlers.py:578-590` | confirmed by code, unmeasured |
-| D2 | **Edit-mode and sculpt strokes resend the whole Mesh, and the blob is the pre-edit datablock** — no `update_from_editmode()` anywhere. Correctness arrives on mode exit; the host stalls on every ≥150 ms pause. | `tier2_io.py:56-66` | confirmed |
+| D1 | **`~pose` hashes animated `matrix_basis`** in both the flush and the sweep digest: scrubbing a rigged shot escalates a full tier-2 Object blob per rig each time the pose is sampled changed, for zero information. | `host_handlers.py:578-590` | confirmed by code → **fixed 09-23**: the digest ignores `matrix_basis` on bones the action (or NLA) animates; the survey's `anim_rig_scrub` row sends **0** rig blobs across a 12-frame scrub (no pre-fix measurement of that row exists — the baseline is the code) |
+| D2 | **Edit-mode and sculpt strokes resend the whole Mesh, and the blob is the pre-edit datablock** — no `update_from_editmode()` anywhere. Correctness arrives on mode exit; the host stalls on every ≥150 ms pause. | `tier2_io.py:56-66` | confirmed → **half fixed 09-23**: `serialize` flushes the edit-mesh first, so the blob is current; the per-pause whole-mesh resend remains |
 | D3 | Tier-2 `libraries.write` is synchronous on the host main thread with no per-tick byte budget; a multi-object structural edit is a serialize storm. | `host_handlers.py:289-296` | reported |
 | D4 | A 50 MiB blob is copied ≥4 times per direction (`pack_cold` join, `_read_exact` join, agent `vec!` per frame, `Reassembler` join); 4 MiB chunking is a zmq-era limit — lanes accept 256 MiB. | `transport_agent.py:78-80, 251-262`, `link.rs:179`, `protocol.py:217` | reported |
 | D5 | `stats` (rtt, loss, cwnd, mtu, mbps) is emitted at 1 Hz and read by nobody. `"listening"` event branch the agent never emits; `FLAG_HOLD`, cold kind `"sync"`, the fixed-rate pacer — declared, unused. | `transport_agent.py:525, 687`, `protocol.py:25, 144` | reported → **stats on the panel and burn-in 09-23**; the dead declarations remain a cleanup item |
@@ -210,7 +213,7 @@ also retires the 4 MiB chunk as a transport limit; B4 pongs on their own
 queue; D5 stats on the panel. Verify with `hol150` → ≈ `t1` and the bootstrap
 bench unchanged.
 
-**P3 — faster where it counts (a day, mostly tuning with the bench).** C1 try
+**P3 — faster where it counts (a day, mostly tuning with the bench). Done 2026-09-23 — see the after-P3 row below §1.** C1 try
 `DEBOUNCE_S` 0.15 → 0.08 and the flush tick 50 → 25 ms and watch the bench
 and the smoke's startup-storm counter; C2 sweep at 0.25 s with the drain
 *after* the sweep in the same tick; D1 drop `matrix_basis` from the sweep's

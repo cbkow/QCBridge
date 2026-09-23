@@ -23,14 +23,14 @@ import idprop
 import mathutils
 
 from ..ring1 import protocol
-from ..ring1.classifier import Debouncer, classify_update
+from ..ring1.classifier import DEBOUNCE_S, Debouncer, classify_update
 from ..ring1.dirtyset import DirtySet, Tier
 from ..ring1.registry import IdentityRegistry
 from ..ring1.shadow import TRACKED, ShadowStore
 from . import bootstrap, identity, tier2_io
 
-_FLUSH_TICK = 0.05
-_SWEEP_INTERVAL = 0.5
+_FLUSH_TICK = 0.025   # was 0.05: up to a tick of latency on every delta
+_SWEEP_INTERVAL = 0.25  # was 0.5: eye toggles, renames, custom props ride this
 _AUTO_BOOT_DEBOUNCE = 1.0    # wait for the burst of Scene edits to end
 _AUTO_BOOT_MIN_INTERVAL = 5.0  # never more than one automatic bootstrap per
 _DEBUG = bool(os.environ.get("QCB_DEBUG"))
@@ -165,7 +165,7 @@ class HostSync:
                         self.bake_note = f"sim bake changed ({obj.name})"
                 self._vis_state[uuid] = vector
                 self.dirty.mark(uuid, Tier.T1)
-                self.debounce.touch(uuid, now)
+                self._touch_ready(uuid, now)
         layer_collections = _layer_collections()
         for coll in bpy.data.collections:
             uuid = self.registry.uuid_for(coll.session_uid)
@@ -182,7 +182,7 @@ class HostSync:
             if self._vis_state.get(uuid) != vector:
                 self._vis_state[uuid] = vector
                 self.dirty.mark(uuid, Tier.T1)
-                self.debounce.touch(uuid, now)
+                self._touch_ready(uuid, now)
         for coll_name in _SWEPT_T1_TYPES:
             for db in getattr(bpy.data, coll_name):
                 uuid = self.registry.uuid_for(db.session_uid)
@@ -192,7 +192,7 @@ class HostSync:
                 if self._vis_state.get(uuid) != vector:
                     self._vis_state[uuid] = vector
                     self.dirty.mark(uuid, Tier.T1)
-                    self.debounce.touch(uuid, now)
+                    self._touch_ready(uuid, now)
         # Mesh custom props: tier-2-only type, the blob carries them.
         for me in bpy.data.meshes:
             uuid = self.registry.uuid_for(me.session_uid)
@@ -202,8 +202,14 @@ class HostSync:
             if self._vis_state.get(uuid) != digest:
                 if uuid in self._vis_state:  # first sample primes only
                     self.dirty.mark(uuid, Tier.T2)
-                    self.debounce.touch(uuid, now)
+                    self._touch_ready(uuid, now)
                 self._vis_state[uuid] = digest
+
+    def _touch_ready(self, uuid: str, now: float) -> None:
+        """A sweep-detected change is already coalesced by the sweep cadence;
+        it flushes on this very tick instead of waiting a debounce window
+        (the sweep runs before the drain — SYNC-AUDIT C2)."""
+        self.debounce.touch(uuid, now - DEBOUNCE_S)
 
     def reset_for_new_file(self) -> None:
         """The host opened a different file (or a new one) mid-session: all
@@ -735,7 +741,40 @@ _BBONE_PROPS = (
 )
 
 
-def _pose_digest(pose, full: bool) -> str:
+def _animated_bones(obj) -> frozenset:
+    """Bones whose transforms come from the action (or NLA strips): their
+    matrix_basis changes on every scrub and says nothing the action does
+    not already carry (SYNC-AUDIT D1). Manually posed bones are not here."""
+    anim = obj.animation_data
+    if anim is None:
+        return frozenset()
+    actions = [anim.action] if anim.action else []
+    for track in anim.nla_tracks:
+        actions.extend(st.action for st in track.strips if st.action)
+    names = set()
+    for act in actions:
+        for fc in _action_fcurves(act):
+            p = fc.data_path
+            if p.startswith('pose.bones["'):
+                names.add(p[12:p.index('"]', 12)])
+    return frozenset(names)
+
+
+def _action_fcurves(act):
+    try:
+        fcs = list(act.fcurves)
+        if fcs:
+            return fcs
+    except AttributeError:
+        pass
+    try:  # slotted actions (4.4+)
+        return [fc for layer in act.layers for strip in layer.strips
+                for bag in strip.channelbags for fc in bag.fcurves]
+    except AttributeError:
+        return []
+
+
+def _pose_digest(pose, full: bool, animated: frozenset = frozenset()) -> str:
     """Armature pose as one hash. full=True (flush snapshot) covers
     everything the tier-2 object blob would change; full=False is the sweep
     variant — transforms + bone idprops only, cheap enough for 0.5 s cadence
@@ -746,6 +785,7 @@ def _pose_digest(pose, full: bool) -> str:
     for pb in pose.bones:
         entry = [
             pb.name,
+            None if pb.name in animated else
             [round(v, 5) for row in pb.matrix_basis for v in row],
             [(k, _digest_value(v)) for k, v in sorted(
                 pb.items(), key=lambda kv: kv[0])],
@@ -807,7 +847,7 @@ def _object_sweep_vector(obj: bpy.types.Object) -> tuple:
         eye, obj.hide_viewport, obj.hide_render,
         _pcache_signature(obj),  # bake_note logic indexes [3] — keep it there
         _idprops_digest(obj),
-        _pose_digest(obj.pose, full=False) if obj.pose is not None else None,
+        _pose_digest(obj.pose, full=False, animated=_animated_bones(obj)) if obj.pose is not None else None,
         obj.name,  # renames fire no depsgraph event; name-keyed setters
                    # (@scene_camera) die on stale names without this
         # Cosmetic/instancing/visibility toggles whose depsgraph events are
@@ -971,7 +1011,7 @@ def build_snapshot(db: bpy.types.ID) -> dict:
             # blobs are bones-only light. The sweep watches a LIGHT variant
             # (transforms+idprops): bone-slider idprop edits fire no
             # depsgraph event at all (probed 5.2).
-            snapshot["~pose"] = _pose_digest(db.pose, full=True)
+            snapshot["~pose"] = _pose_digest(db.pose, full=True, animated=_animated_bones(db))
         try:
             # The eye toggle: per-view-layer state, not an RNA property —
             # rides as "@hide" and is applied via hide_set() on the replica.

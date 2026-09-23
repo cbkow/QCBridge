@@ -55,6 +55,10 @@ apply errors (`full-agent-after-p2.json`). The pointer rule gained one
 detail the fast lane exposed: a delta that names a just-shipped target must
 also *follow* that target's blob (`after`), or the fast lane outruns it.
 
+*After P3 (same day):* 123 actions, **118 cross**, median 251 ms (was ~350);
+the new keyed-rig scrub row is in (`anim_rig_scrub`). Results in
+`full-agent-after-p3.json`.
+
 **Still not crossing, and why:**
 
 | row | why |

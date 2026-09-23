@@ -68,6 +68,15 @@ def serialize(db: bpy.types.ID) -> bytes | None:
     types we don't resend (Scene: force-resync territory, M6)."""
     if collection_of(db) is None:
         return None
+    # An object in edit mode keeps its edits in the edit-mesh until it
+    # leaves the mode; libraries.write would ship the pre-edit datablock
+    # (SYNC-AUDIT D2). Flush the edit-mesh into the datablock first.
+    edit_obj = getattr(bpy.context, "edit_object", None)
+    if edit_obj is not None and edit_obj.data == db:
+        try:
+            edit_obj.update_from_editmode()
+        except RuntimeError:
+            pass
     path = Path(tempfile.gettempdir()) / f"qcb-t2-{db.session_uid}.blend"
     try:
         bpy.data.libraries.write(str(path), {db}, compress=True)
