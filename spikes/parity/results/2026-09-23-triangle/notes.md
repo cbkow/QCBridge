@@ -54,9 +54,39 @@ serves one viewer; the mux exits and restarts when the viewer leaves).
 Worth a line in the user doc; not a fault. The rung was the host's
 default (`hevc_10_420_100`), which the VPN carried at 4K.
 
+## The shared root — path mapping, cache root, linked library (evening)
+
+A test folder on a studio SMB share that both machines see: the Mac as a
+`/Volumes/<share>/<folder>` path, the Windows box as the UNC path and,
+in a second pass, as a mapped drive letter. One mapping row (mac root ↔
+win root), **entered on both ends**. The host project (saved under that
+root) held a relative image, an absolute image under the root, a stray
+absolute image outside every mapping, a linked collection from a library
+`.blend` under the root, and a cloth sheet whose point cache the host
+externalized into `cache_root` under the same root and baked (24 frames).
+
+| variant | replica after bootstrap + bake |
+|---|---|
+| replica row absent (first run) | `unmapped 4` — the absolute image, the stray, the library and the cache; Blender read the library as `C:\Volumes\…`, the Mac form turned into a drive path. The host panel's "unmapped paths — check path mappings" line is exactly the right alarm. |
+| replica row = UNC root | `unmapped 1` (the stray only), `frozen 0`, `errors 0`, `last_error ""`, the library reloaded at the mapped path |
+| replica row = mapped drive `M:` | same: `unmapped 1`, `frozen 0`, `errors 0`; the drive was mapped in the desktop session the replica runs in |
+
+The row lives on both machines by design — the host translates its own
+paths to the wire form with its table, the replica localizes the wire
+form with *its* table — and the replica's saved table had rows for other
+roots already, so this is a documentation point, not a code one: the
+user doc must say the same row goes on both machines. The mapping
+smoke's fifth check (`relative_image_mapped_to_replica_root`) has its
+first real evidence here: the relative image crossed through
+`project_dir`, the absolute one through the row.
+
+**Ticks:** cross-OS path mapping; the shared cache root over SMB as UNC
+and as a mapped drive; linked libraries by mapped path.
+
+Along the way: the replica agent supervises its Blender — killed by hand
+twice to reload preferences, it logged `Blender exited, relaunching` and
+brought it back; the host re-bootstrapped each time.
+
 ## Not yet
 
-Path mapping, the shared cache root and linked libraries need a root both
-machines see; none of the studio shares was reachable from both networks
-at the time, so a share on the Windows box is being set up for it. The
-reversed pairing, the AE leg and glass-to-glass numbers follow.
+The reversed pairing, the AE leg and glass-to-glass numbers follow.
