@@ -207,6 +207,25 @@ def use_agent(role: str) -> bool:
     return os.environ.get("QCB_AGENT", "") != "spawn" and agent_socket_info(role) is not None
 
 
+def transport_kind(role: str, pref: str = "") -> str:
+    """Which transport a session uses: "agent" or "zmq".
+
+    QCB_TRANSPORT in the environment wins (the smokes and an agent-launched
+    Blender set it). Then an explicit preference. Otherwise the default is
+    the agent whenever one is registered for this role on the machine
+    (agent.json, or the launch environment) — a plain double-click of
+    Blender must land in the mode the product ships with, not the frozen
+    fallback (2026-09-23: it did not, and the panel showed the 0.1.6
+    connection box). No agent → zmq, which still works end to end."""
+    env = os.environ.get("QCB_TRANSPORT", "").strip().lower()
+    if env in ("agent", "zmq"):
+        return env
+    pref = (pref or "").strip().lower()
+    if pref in ("agent", "zmq"):
+        return pref
+    return "agent" if use_agent(role.lower()) else "zmq"
+
+
 class _AgentLink(_FrameLink):
     """Frames over the agent's local TCP socket. The attach handshake is the
     first frame; the reply is an `attached` event. `proc` is set only when we

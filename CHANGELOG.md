@@ -13,6 +13,12 @@ with the coordinated release once Windows is verified. Everything below has
 run on macOS, both roles on one machine, with the suites in `smokes/`; the
 Windows pass is in progress.
 
+**Agent mode is the default whenever an agent is registered** on the
+machine for the session's role (2026-09-23): a plain launch of Blender lands
+in the shipped mode, and the panel shows the agent's connection. Without an
+agent the frozen zmq transport still runs end to end; `QCB_TRANSPORT`
+and the `transport` preference override either way.
+
 **The connection lives in an agent.** A small tray app (Rust) on each
 machine owns the QUIC session, so a Blender restart or a dropped link no
 longer means a lost connection. It finds replicas three ways — a direct

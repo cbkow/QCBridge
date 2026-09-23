@@ -339,3 +339,53 @@ def test_cold_payloads_round_trip_byte_identical(pair):
     got = []
     assert wait_for(lambda: got.extend(replica.poll_cold(16)) or len(got) >= 3, timeout=15.0)
     assert [p for _, p in got[:3]] == payloads
+
+
+# ---- the default transport (2026-09-23) --------------------------------
+
+def _registered(tmp_path, monkeypatch, role="host"):
+    # agent_socket_info reads agent.json under the platform config base.
+    home = tmp_path / "home"
+    (home / "Library" / "Application Support" / "QCBridge").mkdir(parents=True)
+    (home / ".config" / "QCBridge").mkdir(parents=True)
+    appdata = tmp_path / "appdata"; (appdata / "QCBridge").mkdir(parents=True)
+    import json as _json
+    info = _json.dumps({role: {"pid": 1, "port": 12345, "secret": "s"}})
+    for p in (home / "Library" / "Application Support" / "QCBridge" / "agent.json",
+              home / ".config" / "QCBridge" / "agent.json",
+              appdata / "QCBridge" / "agent.json"):
+        p.write_text(info)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.delenv("QCB_AGENT_PORT", raising=False)
+    monkeypatch.delenv("QCB_AGENT_SECRET", raising=False)
+    monkeypatch.delenv("QCB_TRANSPORT", raising=False)
+    monkeypatch.delenv("QCB_AGENT", raising=False)
+
+
+def test_transport_defaults_to_agent_when_one_is_registered(tmp_path, monkeypatch):
+    from ring1.transport_agent import transport_kind
+    _registered(tmp_path, monkeypatch, "host")
+    assert transport_kind("HOST") == "agent"          # role case does not matter
+    assert transport_kind("REPLICA") == "zmq"         # no replica agent here
+
+
+def test_transport_defaults_to_zmq_without_an_agent(tmp_path, monkeypatch):
+    from ring1.transport_agent import transport_kind
+    _registered(tmp_path, monkeypatch, "host")
+    (tmp_path / "home" / "Library" / "Application Support" / "QCBridge" / "agent.json").unlink()
+    (tmp_path / "home" / ".config" / "QCBridge" / "agent.json").unlink()
+    (tmp_path / "appdata" / "QCBridge" / "agent.json").unlink()
+    assert transport_kind("host") == "zmq"
+
+
+def test_transport_environment_and_preference_win(tmp_path, monkeypatch):
+    from ring1.transport_agent import transport_kind
+    _registered(tmp_path, monkeypatch, "host")
+    assert transport_kind("host", pref="zmq") == "zmq"      # explicit pref over the default
+    monkeypatch.setenv("QCB_TRANSPORT", "zmq")
+    assert transport_kind("host", pref="agent") == "zmq"    # env over pref
+    monkeypatch.setenv("QCB_TRANSPORT", "agent")
+    monkeypatch.setenv("QCB_AGENT", "spawn")
+    assert transport_kind("replica") == "agent"             # env wins even when spawning

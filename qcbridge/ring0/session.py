@@ -19,10 +19,14 @@ from . import host_handlers, host_hot, kiosk, overlay, pixel_path, replica_apply
 
 
 def _use_agent(prefs) -> bool:
-    """Transport switch: QCB_TRANSPORT=agent, or a `transport` pref. Both
-    ends must agree. Default stays zmq, which is frozen but supported."""
-    kind = os.environ.get("QCB_TRANSPORT") or getattr(prefs, "transport", "zmq")
-    return str(kind).lower() == "agent"
+    """Transport switch: QCB_TRANSPORT, then a `transport` pref, then the
+    agent whenever one is registered for this role on the machine, else
+    zmq (frozen but supported). Both ends must land on the same kind; the
+    hello says which. See ring1.transport_agent.transport_kind."""
+    from ..ring1 import transport_agent  # stdlib-only; no pyzmq behind it
+
+    role = str(getattr(prefs, "role", "HOST") or "HOST")
+    return transport_agent.transport_kind(role, getattr(prefs, "transport", "")) == "agent"
 
 
 def _make_transport(prefs, cfg: TransportConfig, role: str):
