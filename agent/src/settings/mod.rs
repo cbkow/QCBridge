@@ -732,7 +732,10 @@ impl eframe::App for App {
                 let mut rgba = Vec::with_capacity((w * h * 4) as usize);
                 for px in &image.pixels { rgba.extend_from_slice(&px.to_array()); }
                 if let Err(e) = write_png(&path, w, h, &rgba) { eprintln!("shot: {e}"); }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                // A close request is not enough on every platform; the
+                // picture is written, and a lingering window would go on
+                // acting on the agent. Leave now.
+                std::process::exit(0);
             }
         }
 

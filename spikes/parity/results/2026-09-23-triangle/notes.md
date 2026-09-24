@@ -193,6 +193,20 @@ cosmetic finding fixed after the run: the accept loop logged the
 endpoint's close as *session ended: listener closed* twice; the loop is
 now aborted before the endpoint closes.
 
+## 2026-09-24, evening — the shared folder named on each side, the row formed at pairing
+
+Both agents on the commit "shared folder as this machine sees it". Each
+agent was given its own spelling of the shared test folder through a
+control client and an empty mapping table; a host session with no rows
+of its own then paired. The host's log said *mapping row for the shared
+folder formed at pairing*, and both agents' tables held the same row
+(label `shared`, the Windows spelling the Windows side had named, the
+macOS spelling the Mac had named); the sync ran (seq 3). One stray: a
+screenshot window left running on the Windows desktop had rewritten
+that side's folder to its mapped-drive spelling — a real path on that
+box, so the row stayed consistent — which is why `--shot` now exits
+the process outright.
+
 ## Not yet
 
 Glass-to-glass numbers (Phase 4 item 3). The AE leg ran on 2026-09-24 and is
