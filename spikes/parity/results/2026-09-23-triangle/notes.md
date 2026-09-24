@@ -175,6 +175,24 @@ preferences carrying the one row and the cache root:
 So the row is entered once, on the host. A replica that still has rows of
 its own keeps them; the host's rows it lacks are appended.
 
+## 2026-09-24, evening — the Send/Receive switch, live, both ways
+
+Both agents on the commit "the Send/Receive switch is live". Driven from a
+control client on each box (the way the settings window will), no
+restarts, no second instances:
+
+| step | what the logs said |
+|---|---|
+| Mac host → replica (`set_config role`) | *listening … now replica* within the second; the beacon answers on 4246; `agent.json` re-keyed to `replica` |
+| Windows replica → host, peer = the Mac's tunnel address | *pinned replica certificate … now host*; the Mac: *host connected* in the same second (Blender supervision off there for the test) |
+| Windows host → replica | *listening … now replica* |
+| Mac replica → host | *now host*; Windows: *host connected*, *Blender launching* five seconds after its switch |
+
+Both `agent.toml`s ended as they began (role, Blender path). One
+cosmetic finding fixed after the run: the accept loop logged the
+endpoint's close as *session ended: listener closed* twice; the loop is
+now aborted before the endpoint closes.
+
 ## Not yet
 
 Glass-to-glass numbers (Phase 4 item 3). The AE leg ran on 2026-09-24 and is

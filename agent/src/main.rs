@@ -241,15 +241,16 @@ fn stop_role(agent: &Agent, rt: RoleRuntime, old_role: &str) {
     if let Some(b) = &rt.beacon {
         b.set_mode("off");
     }
-    if let Some(ep) = &rt.endpoint {
-        ep.close(0u32.into(), b"role change");
-    }
     agent.ctx.set_role(agent.ctx.is_host(), Arc::new(session::NoObserver));
-    // Give the beacon its "off" turn (bye + phonebook removal) and the
-    // sessions their close before the tasks are cut.
+    // Give the beacon its "off" turn (bye + phonebook removal) before the
+    // tasks are cut; the accept loop goes before its endpoint closes, or
+    // it logs the close as a session error.
     std::thread::sleep(std::time::Duration::from_millis(150));
     for t in &rt.tasks {
         t.abort();
+    }
+    if let Some(ep) = &rt.endpoint {
+        ep.close(0u32.into(), b"role change");
     }
     drop(rt);
     config::remove_socket_info(&agent.base, old_role);
