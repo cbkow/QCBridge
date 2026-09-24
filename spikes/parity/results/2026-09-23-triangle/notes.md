@@ -135,4 +135,7 @@ cannot bind.
 
 ## Not yet
 
-The AE leg and glass-to-glass numbers follow.
+Glass-to-glass numbers (Phase 4 item 3). The AE leg ran on 2026-09-24 and is
+written up on the QCView side (QCBridgeAE `lab/results/2026-09-23-triangle/`):
+the Windows replica's stream on A and AE's Transmit ring on B, both live in
+QCView on Windows, with the Mac hosting across the VPN.
