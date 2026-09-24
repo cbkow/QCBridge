@@ -220,7 +220,7 @@ lesson in QCBridge's terms: the user never invents or copies a secret.
    fingerprint line on both ends. *Done 2026-09-24.*
 3. Mappings and cache root move to the agent config and the `config`
    event; the addon reads them from there; the replica receives the
-   host's rows at pairing.
+   host's rows at pairing. *Done 2026-09-24.*
 4. The settings window (egui) with: identity, network, phonebook, token,
    Blender path, mappings, cache root, and the peers list with Pair /
    Forget.

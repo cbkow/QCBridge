@@ -156,6 +156,25 @@ the empty value used to be hidden by the token arriving in an environment
 variable. Both ends now resolve the secret at the moment of use. Nothing
 else changed on the wire.
 
+## 2026-09-24, later — the host's rows reach the replica in the hello
+
+Both agents on the mapping commit ("the path-mapping table and the cache
+root live in the agent"). The Windows replica's own table was emptied
+(its Blender preferences had three rows; now none; its agent has none),
+so its only source of rows is the host. The shared-root scene from the
+evening of the 23rd, driven by the same script, the Mac host's
+preferences carrying the one row and the cache root:
+
+| | |
+|---|---|
+| first session against a Mac agent with no table | the addon logged *moved path_mappings, cache_root into the agent*; the Mac's `agent.toml` now holds the row and the root |
+| replica, no row of its own | `unmapped 1` (the stray only), `frozen 0`, `errors 0`, `last_error ""` — the same as with the row entered there (23rd: absent row gave `unmapped 4`) |
+| host bake into the shared cache root | externalized before the bake, baked, 24 files |
+| sync | seq 3, gaps 0, bootstraps 2 |
+
+So the row is entered once, on the host. A replica that still has rows of
+its own keeps them; the host's rows it lacks are appended.
+
 ## Not yet
 
 Glass-to-glass numbers (Phase 4 item 3). The AE leg ran on 2026-09-24 and is

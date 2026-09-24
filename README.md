@@ -9,7 +9,7 @@ Viewing works two ways. The built-in stream sends the replica's viewport over SR
 A few things worth knowing about:
 
 - **Shot Mode** locks the replica to the camera frame — fitted, matted in black, holding steady while you orbit around your scene freely. That framing matches your render output exactly, which is what makes clean A/B wipes possible in QCView.
-- **Path mapping** translates file paths between platforms (a table of Windows ↔ macOS roots in preferences), so a Mac host and a Windows replica can share one project on network storage.
+- **Path mapping** translates file paths between platforms (a table of Windows ↔ macOS roots, kept by the agent and sent to the replica at pairing, so it is entered once, on the host), so a Mac host and a Windows replica can share one project on network storage.
 - The replica runs in a **kiosk mode** — a clean, chrome-free fullscreen viewport — and manages its own lifecycle: it drops to an idle viewport when you end a session, and picks the next one up without anyone touching that machine.
 - Settings survive updates and reinstalls; ffmpeg is provided by QCView 2.2.4 or later, and status is always visible — burned into the stream itself and reported on the host's panel.
 
