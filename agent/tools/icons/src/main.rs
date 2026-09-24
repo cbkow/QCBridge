@@ -1,15 +1,16 @@
 //! Renders the QCBridge icons from the QCView glyph (the "Q" magnifier
-//! cutout, `qcviewcutout.svg` in QCView-Player) in QCBridge's own colour:
+//! cutout, `qcviewcutout.svg` in QCView-Player), kept simple: a mid grey
+//! that reads on a light or a dark menu bar (decided 2026-09-24).
 //!
-//! - tray icons: the glyph alone with a status dot in the lower-right
-//!   corner (green = paired, amber = waiting, red = off/error), plus one
-//!   without a dot; 32 and 64 px;
+//! - tray icons: the glyph alone with a status dot in the lower-LEFT
+//!   corner, away from the magnifier's handle (green = paired, amber =
+//!   waiting, red = off/error), plus one without a dot; 32 and 64 px;
 //! - the window/app icon: the glyph on the dark rounded square QCView
 //!   uses, 512 px and the standard sizes; a Windows .ico and, on macOS,
 //!   an iconset folder for `iconutil`;
 //! - a contact sheet of colour candidates when asked (`--sheet`).
 //!
-//! usage: qcb-icons <cutout.svg> <out dir> [--color RRGGBB] [--sheet]
+//! usage: qcb-icons <cutout.svg> <out dir> [--color RRGGBB] [--app-color RRGGBB] [--sheet]
 
 use std::path::{Path, PathBuf};
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
@@ -86,10 +87,11 @@ fn tray_icon(svg: &str, size: u32, color: &str, dot: Option<(u8, u8, u8)>) -> Pi
     over(&mut pm, &g, 0, 0);
     if let Some(rgb) = dot {
         let r = size as f32 * 0.17;
-        let c = size as f32 - r - 1.0;
+        let cx = r + 1.0; // lower-left: the handle is at lower-right
+        let cy = size as f32 - r - 1.0;
         // A dark ring so the dot reads on the glyph and on any bar.
-        circle(&mut pm, c, c, r + size as f32 * 0.05, DARK_BG);
-        circle(&mut pm, c, c, r, rgb);
+        circle(&mut pm, cx, cy, r + size as f32 * 0.05, DARK_BG);
+        circle(&mut pm, cx, cy, r, rgb);
     }
     pm
 }
@@ -136,21 +138,40 @@ fn main() {
     let svg = std::fs::read_to_string(&args[1]).expect("read svg");
     let out = PathBuf::from(&args[2]);
     std::fs::create_dir_all(&out).unwrap();
-    let color = args.iter().position(|a| a == "--color").and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| "8b7cf6".into());
+    // Tray: mid grey, visible on light and dark bars. App icon: near
+    // white on the dark square.
+    let color = args.iter().position(|a| a == "--color").and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| "a3a3a3".into());
+    let app_color = args.iter().position(|a| a == "--app-color").and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| "ececec".into());
     let sheet = args.iter().any(|a| a == "--sheet");
 
     if sheet {
         // Candidates side by side: app icon at 96, tray at 32 with the
         // three dots, and the QCView yellow first for the comparison.
-        let cands = [("e8c21f", "QCView yellow"), ("8b7cf6", "violet"), ("2dd4bf", "teal"), ("ff7a45", "orange"), ("4f8ef7", "blue")];
-        let cell = 140u32;
-        let mut pm = rounded_square(cell * cands.len() as u32, 0.0, (0x2a, 0x2a, 0x2a));
-        for (i, (c, _)) in cands.iter().enumerate() {
+        // The grey tray glyph on a dark bar and on a light bar, the app
+        // icon beside; then the QCView yellow for the comparison.
+        let cell = 150u32;
+        let mut pm = Pixmap::new(cell * 3, 160).unwrap();
+        let dark = rounded_square(cell * 3, 0.0, (0x2a, 0x2a, 0x2a));
+        over(&mut pm, &dark, 0, 0);
+        let light = rounded_square(cell * 3, 0.0, (0xe9, 0xe9, 0xe9));
+        let mut light_band = Pixmap::new(cell * 3, 48).unwrap();
+        over(&mut light_band, &light, 0, 0);
+        over(&mut pm, &light_band, 0, 112);
+        for (i, c) in [&color, &app_color, &"e8c21f".to_string()].iter().enumerate() {
             let x = (i as u32 * cell) as i32;
-            over(&mut pm, &app_icon(&svg, 96, c), x + 22, 10);
-            over(&mut pm, &tray_icon(&svg, 32, c, Some((0x3d, 0xdc, 0x84))), x + 14, 112);
-            over(&mut pm, &tray_icon(&svg, 32, c, Some((0xf5, 0xa6, 0x23))), x + 54, 112);
-            over(&mut pm, &tray_icon(&svg, 32, c, Some((0xe5, 0x48, 0x48))), x + 94, 112);
+            over(&mut pm, &app_icon(&svg, 96, c), x + 27, 8);
+            for (j, dot) in [(0x3d, 0xdc, 0x84), (0xf5, 0xa6, 0x23), (0xe5, 0x48, 0x48)].iter().enumerate() {
+                over(&mut pm, &tray_icon(&svg, 22, c, Some(*dot)), x + 14 + j as i32 * 44, 120);
+            }
+        }
+        for (i, c) in [&color, &app_color, &"e8c21f".to_string()].iter().enumerate() {
+            let x = (i as u32 * cell) as i32;
+            // The dark bar row, above the light one.
+            for (j, dot) in [(0x3d, 0xdc, 0x84), (0xf5, 0xa6, 0x23), (0xe5, 0x48, 0x48)].iter().enumerate() {
+                let mut band = tray_icon(&svg, 22, c, Some(*dot));
+                let _ = &mut band;
+                over(&mut pm, &band, x + 14 + j as i32 * 44, 84);
+            }
         }
         save(&pm, &out.join("colour-sheet.png"));
         return;
@@ -169,7 +190,7 @@ fn main() {
         }
     }
     // App / window icon.
-    let big = app_icon(&svg, 1024, &color);
+    let big = app_icon(&svg, 1024, &app_color);
     save(&big, &out.join("app-1024.png"));
     let mut ico_images = Vec::new();
     let iconset = out.join("qcbridge.iconset");

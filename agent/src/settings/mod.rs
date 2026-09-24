@@ -23,9 +23,11 @@ use std::time::{Duration, Instant};
 /// Open the window for the agent whose config is `cfg_path`.
 pub fn run(cfg_path: PathBuf) -> Result<()> {
     let shot = std::env::args().skip_while(|a| a != "--shot").nth(1).map(PathBuf::from);
+    let (rgba, w, h) = crate::icons::rgba(crate::icons::APP_256);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("QCBridge Agent")
+            .with_icon(std::sync::Arc::new(egui::IconData { rgba, width: w, height: h }))
             .with_inner_size([900.0, 800.0])
             .with_min_inner_size([600.0, 480.0]),
         centered: true,

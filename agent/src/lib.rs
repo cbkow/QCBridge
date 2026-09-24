@@ -522,6 +522,7 @@ mod tests {
 pub mod blender;
 pub mod discovery;
 pub mod config;
+pub mod icons;
 pub mod link;
 pub mod mounts;
 pub mod platform;

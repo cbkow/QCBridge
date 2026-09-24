@@ -740,19 +740,8 @@ mod tray {
         if fp.is_empty() { "fingerprint: (host role)".to_string() } else { format!("fingerprint {}…", &fp[..16]) }
     }
 
-    fn icon() -> Icon {
-        // A filled circle; the real bundle will ship a proper asset.
-        let (w, h) = (32u32, 32u32);
-        let mut rgba = vec![0u8; (w * h * 4) as usize];
-        for y in 0..h {
-            for x in 0..w {
-                let dx = x as f32 - 15.5;
-                let dy = y as f32 - 15.5;
-                let inside = (dx * dx + dy * dy).sqrt() < 12.0;
-                let i = ((y * w + x) * 4) as usize;
-                rgba[i..i + 4].copy_from_slice(if inside { &[40, 200, 120, 255] } else { &[0, 0, 0, 0] });
-            }
-        }
+    fn icon(state: qcbridge_agent::icons::TrayState) -> Icon {
+        let (rgba, w, h) = qcbridge_agent::icons::rgba(state.png());
         Icon::from_rgba(rgba, w, h).expect("icon")
     }
 
@@ -808,6 +797,7 @@ mod tray {
         let runtime = std::sync::Mutex::new(Some(runtime));
         let rx = MenuEvent::receiver();
         let mut last_status = String::new();
+        let mut tray_state: Option<qcbridge_agent::icons::TrayState> = None;
         let mut last_info = String::new();
         let mut last_token = String::new();
         let mut last_fp = fp_text(&agent);
@@ -821,7 +811,7 @@ mod tray {
                     TrayIconBuilder::new()
                         .with_menu(Box::new(menu.clone()))
                         .with_tooltip("QCBridge Agent")
-                        .with_icon(icon())
+                        .with_icon(icon(qcbridge_agent::icons::TrayState::Waiting))
                         .build()
                         .expect("tray icon"),
                 );
@@ -830,6 +820,12 @@ mod tray {
             if s != last_status {
                 status_item.set_text(&s);
                 last_status = s;
+            }
+            // The dot follows the pairing: green up, amber waiting, red off.
+            let want = qcbridge_agent::icons::TrayState::from_status(agent.role.lock().unwrap().peer_up(), &last_status);
+            if tray_state != Some(want) {
+                if let Some(t) = tray.as_ref() { let _ = t.set_icon(Some(icon(want))); }
+                tray_state = Some(want);
             }
             // These were built once and went stale; a set_config from the
             // addon can change any of them under us, so refresh on the tick.
