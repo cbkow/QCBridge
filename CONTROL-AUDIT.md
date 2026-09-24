@@ -220,3 +220,24 @@ lesson in QCBridge's terms: the user never invents or copies a secret.
 5. Bundle + autostart + first-enable install.
 6. Docs: both-ends settings, what the phonebook exposes, one viewer per
    stream, install steps.
+
+## 8. Decisions (2026-09-24, with the owner)
+
+- **One agent per machine, with a Send scene / Receive scene switch**, live
+  without a restart. Send is the workstation whose Blender is the source
+  of truth: it dials, shows the nodes list, never announces. Receive is the
+  render box: it listens, announces when findable, launches Blender for
+  whoever pairs, writes the phonebook entry. Machines rarely change sides.
+- **The settings window is the tray's UI** (Rust, native window): This
+  machine, Pairing, Storage, Stream + diagnostics. The nodes list appears
+  both in the tray menu and in the window. Blender's preferences become
+  one button, "Open agent settings", with the zmq fallback under Advanced.
+- **Every path field gets a folder picker**: phonebook, cache root, and
+  each mapping row. The picker fills this machine's column; when the
+  folder is a network mount the agent proposes the other column (UNC or
+  `/Volumes` form) from the mount table for the user to accept or edit.
+- **Token in the window for this release; pairing code next.**
+- **Order stands:** Windows agent hygiene first, then token to the keychain
+  and out of the addon, then mappings and cache root into the agent, then
+  the window, then bundle and autostart, then docs.
+
