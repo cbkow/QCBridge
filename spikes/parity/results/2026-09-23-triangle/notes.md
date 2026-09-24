@@ -87,6 +87,26 @@ Along the way: the replica agent supervises its Blender — killed by hand
 twice to reload preferences, it logged `Blender exited, relaunching` and
 brought it back; the host re-bootstrapped each time.
 
+## The phonebook (2026-09-24 morning)
+
+`phonebook` on both agents pointed at a folder under the same shared test
+root — the Mac as `/Volumes/…/qcb-lab/phonebook`, the Windows replica as
+the UNC path (a TOML literal string, single quotes, or the backslashes
+are eaten). The replica writes `qcbridge/<name>.json` there every 10 s by
+temp-then-rename; over an hour of refreshes on the SMB share the agent
+logged no write failure, with the Mac scanning the same file.
+
+| step | result |
+|---|---|
+| host `discover` with no address (LAN sweep + phonebook), across the VPN | one peer, `sources ["phonebook"]` — multicast cannot cross the tunnel, so the phonebook is the whole answer |
+| host `discover` with the replica's address | the same peer, `sources ["probe"]` |
+| **zero-typing pairing:** host agent started with `peer = ""` and no fingerprint; session `discover` → pick the one entry → `set_config {peer, fingerprint}` | `connecting` → `connected` 8 s after the pick; the agent wrote the peer and the pinned fingerprint into its `agent.toml`; the replica bootstrapped |
+| replica agent killed without a goodbye; scan 74 s later | entry still on disk, dropped by age: `discover` returns nothing from the phonebook and nothing from the probe |
+
+**Ticks:** the phonebook on a share (UNC on the writer, the Mac path on
+the reader, stale-drop). The mapped-drive form of the writer path was not
+tried separately; it is the same path the mapping row already proved.
+
 ## Not yet
 
 The reversed pairing, the AE leg and glass-to-glass numbers follow.
