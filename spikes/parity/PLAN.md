@@ -215,8 +215,8 @@ upstream in 0.11.18, which is what Cargo now resolves.
 - **Cross-machine tests:** this Mac and a Windows Claude session share the
   repo on branch `spike/parity`. chris relays messages between them. Both may
   push to `spike/parity` only.
-- **Addresses:** Windows 192.168.40.199, Mac 192.168.80.2 (UDP VPN, Mac
-  wired).
+- **Addresses:** the two tunnel addresses are private and live outside
+  the repo (UDP VPN, Mac wired).
 - **Ports:** 19990+ for tests; chris's live sessions use the defaults.
 - **Clock correction for cross-machine synthetic runs:** sntp and w32tm print
   server − local, so true = raw − (apple − sender) + (apple − reader). Blender
