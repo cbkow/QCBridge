@@ -442,6 +442,7 @@ class HostTransportAgent:
         self.video_port = 0          # localhost TCP port serving Annex-B HEVC
         self.stats: dict = {}
         self.agent_version = ""      # set in agent mode
+        self.agent_exe = ""
         self.agent_mode = False
         # Mirrored from the agent: it owns these, we display them.
         self.agent_config: dict = {}
@@ -589,6 +590,7 @@ class HostTransportAgent:
         name = event.get("event")
         if name == "attached":  # agent mode: current state at attach time
             self.agent_version = event.get("version", "")
+            self.agent_exe = event.get("exe", "")  # the settings window is this binary with --settings
             self.video_port = int(event.get("video_port") or 0)
             self._link_up = bool(event.get("peer_up"))
             self.peer_fingerprint = event.get("peer_fingerprint") or ""
@@ -712,6 +714,7 @@ class ReplicaTransportAgent:
         self._cmd_ids = itertools.count(1000)
         self._cmd_replies: dict[int, dict] = {}
         self.agent_version = ""
+        self.agent_exe = ""
         self.agent_mode = False
         self.quit_requested = False
 
@@ -804,6 +807,7 @@ class ReplicaTransportAgent:
                 self._port = int(event.get("port") or 0)
                 self.fingerprint = event.get("fingerprint") or ""
                 self.agent_version = event.get("version", "")
+                self.agent_exe = event.get("exe", "")
                 self.video_state = event.get("video_state") or self.video_state
                 self.agent_config = dict(event.get("config") or {})
                 self._ready.set()

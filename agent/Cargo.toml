@@ -55,6 +55,12 @@ zstd = "0.13"
 tray-icon = "0.20"
 muda = "0.16"
 tao = "0.31"
+# The settings window (`--settings`): a separate process that attaches to
+# the agent as a control client, so the tray's tao loop and egui's winit
+# loop never share a thread. glow, not wgpu: smaller, and this is a form.
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
+# Native folder and file pickers for every path field.
+rfd = "0.17"
 
 # gethostname and kill(pid, 0), for the beacon's machine name and the
 # single-instance guard. Already in the lock via quinn; adds no packages.

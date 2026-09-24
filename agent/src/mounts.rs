@@ -12,8 +12,6 @@
 //! Parsing is pure and unit-tested on synthetic text; only `table()` talks
 //! to the OS.
 
-use std::path::Path;
-
 /// One network mount: the UNC root and where it is on this machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {

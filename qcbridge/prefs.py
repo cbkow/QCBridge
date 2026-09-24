@@ -417,6 +417,32 @@ class QCB_OT_agent_set_token(Operator):
         return {"FINISHED"}
 
 
+class QCB_OT_open_agent_settings(Operator):
+    bl_idname = "qcbridge.open_agent_settings"
+    bl_label = "Open Agent Settings"
+    bl_description = (
+        "Open the QCBridge Agent's settings window: role, network, token, "
+        "Blender path, path mappings, cache root, and the replicas it can see"
+    )
+
+    @classmethod
+    def poll(cls, context):
+        t = _agent_transport()
+        return t is not None and bool(getattr(t, "agent_exe", ""))
+
+    def execute(self, context):
+        import subprocess
+
+        t = _agent_transport()
+        exe = getattr(t, "agent_exe", "")
+        try:
+            subprocess.Popen([exe, "--settings"])
+        except OSError as exc:
+            self.report({"ERROR"}, f"could not start the settings window: {exc}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
 class QCB_OT_agent_save_paths(Operator):
     bl_idname = "qcbridge.agent_save_paths"
     bl_label = "Save to Agent"
@@ -575,7 +601,9 @@ class QCBridgePreferences(AddonPreferences):
             # The agent owns the connection. What it reports is shown while a
             # session is attached; the fields below are overrides and the
             # zmq fallback, not the source of truth.
-            box.label(text="Connection — managed by the QCBridge Agent", icon="LINKED")
+            row = box.row()
+            row.label(text="Connection — managed by the QCBridge Agent", icon="LINKED")
+            row.operator("qcbridge.open_agent_settings", icon="PREFERENCES")
             t = _agent_transport()
             ac = getattr(t, "agent_config", None) or {}
             if ac:
@@ -739,6 +767,7 @@ _classes = (
     QCB_OT_open_qcview,
     QCB_OT_agent_set_token,
     QCB_OT_agent_save_paths,
+    QCB_OT_open_agent_settings,
     QCB_OT_copy_stream_url,
     QCB_OT_discover,
     QCB_OT_pick_peer,

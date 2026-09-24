@@ -34,7 +34,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const USAGE: &str = "\
 qcbridge-agent [--config PATH] [--no-tray] [--role host|replica] [--listen IP:PORT]
                [--peer IP:PORT] [--token T] [--local-port N] [--exit-with-addon]
-               [--version]";
+               [--settings] [--version]";
 
 /// Host-role observer: no Blender to manage. Pins the replica certificate
 /// on first successful connect (trust on first use) and tells the addon.
@@ -294,6 +294,8 @@ fn attach_reply(agent: &Agent) -> Value {
         "port": agent.cfg.with(|c| c.listen.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(0)),
         "fingerprint": agent.role.lock().unwrap().replica_fingerprint,
         "peer_up": agent.role.lock().unwrap().peer_up(),
+        "status": agent.status.lock().unwrap().clone(),
+        "addon_attached": agent.link.attached.load(Relaxed),
         // Where this binary is: the addon opens the settings window from it.
         "exe": std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
         "video_port": agent.cfg.with(|c| if c.role == "host" { c.video_port } else { 0 }),
@@ -354,6 +356,17 @@ fn main() {
     let args = qcbridge_agent::Args::parse(USAGE);
     if args.flag("version") {
         println!("qcbridge-agent {VERSION}\nsource: {SOURCE_URL}\nlicense: GPL-3.0-or-later");
+        return;
+    }
+    if args.flag("settings") {
+        // The window is its own process: it attaches to the running agent
+        // as a control client, so no event loop is shared with the tray.
+        let cfg_path: std::path::PathBuf = args.get("config").map(Into::into).unwrap_or_else(config::config_path);
+        if let Err(e) = qcbridge_agent::settings::run(cfg_path) {
+            log!("[settings] {e:#}");
+            platform::fatal_dialog("QCBridge Agent settings", &format!("{e:#}"));
+            std::process::exit(1);
+        }
         return;
     }
     if let Err(e) = run(&args) {
@@ -500,6 +513,30 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
             .spawn(move || serve_local(local, secret, inb, link, on_attach, on_detach, on_cmd))?;
     }
     log!("[agent] addon socket 127.0.0.1:{local_port}");
+
+    // Status changes go out as events, so the settings window (a control
+    // client) shows what the tray shows without polling the agent.
+    {
+        let a = agent.clone();
+        std::thread::Builder::new().name("status-ticker".into()).spawn(move || {
+            let mut last = (String::new(), false, false);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if a.link.control_clients() == 0 {
+                    continue;
+                }
+                let now = (
+                    a.status.lock().unwrap().clone(),
+                    a.link.attached.load(Relaxed),
+                    a.role.lock().unwrap().peer_up(),
+                );
+                if now != last {
+                    a.link.event_try(json!({"event": "status", "status": now.0, "addon_attached": now.1, "peer_up": now.2}));
+                    last = now;
+                }
+            }
+        })?;
+    }
 
     if cfg.tray {
         tray::run(agent, runtime)
@@ -687,6 +724,17 @@ mod tray {
         })
     }
 
+    /// The settings window is a second process of this binary.
+    pub(super) fn open_settings_window(cfg_path: &std::path::Path) {
+        if let Ok(exe) = std::env::current_exe() {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("--settings").arg("--config").arg(cfg_path);
+            if let Err(e) = cmd.spawn() {
+                log!("[agent] could not open the settings window: {e}");
+            }
+        }
+    }
+
     fn fp_text(agent: &Agent) -> String {
         let fp = agent.role.lock().unwrap().replica_fingerprint.clone();
         if fp.is_empty() { "fingerprint: (host role)".to_string() } else { format!("fingerprint {}…", &fp[..16]) }
@@ -720,6 +768,7 @@ mod tray {
         let token_item = MenuItem::new(token_text(&agent.cfg), false, None);
         let start_item = MenuItem::new("Launch Blender now", !agent.cfg.is_host(), None);
         let stop_item = MenuItem::new("Close Blender", !agent.cfg.is_host(), None);
+        let settings_item = MenuItem::new("Settings…", true, None);
         let config_item = MenuItem::new("Open config folder", true, None);
         let quit_item = MenuItem::new("Quit QCBridge Agent", true, None);
 
@@ -745,7 +794,7 @@ mod tray {
             &status_item, &info_item, &fp_item, &token_item, &PredefinedMenuItem::separator(),
             &network, &PredefinedMenuItem::separator(),
             &start_item, &stop_item, &PredefinedMenuItem::separator(),
-            &config_item, &quit_item,
+            &settings_item, &config_item, &quit_item,
         ])?;
         let info_text = {
             let cfg = agent.cfg.clone();
@@ -848,6 +897,8 @@ mod tray {
                     if let Some(l) = &agent.role.lock().unwrap().lifecycle { let _ = l.tx.send(Event::ManualStart); }
                 } else if ev.id == stop_item.id() {
                     if let Some(l) = &agent.role.lock().unwrap().lifecycle { let _ = l.tx.send(Event::ManualStop); }
+                } else if ev.id == settings_item.id() {
+                    open_settings_window(&agent.cfg_path);
                 } else if ev.id == config_item.id() {
                     let dir = agent.base.clone();
                     #[cfg(target_os = "macos")]
