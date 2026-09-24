@@ -226,7 +226,9 @@ lesson in QCBridge's terms: the user never invents or copies a secret.
    Forget. *Done 2026-09-24 (`qcbridge-agent --settings`, a separate
    process attached as a control client; the live Send/Receive switch
    with it).*
-5. Bundle + autostart + first-enable install.
+5. Bundle + first-enable install. *Autostart dropped 2026-09-24 (owner's
+   call): the agent is started by hand, from Blender, or from the tray;
+   `agent/windows/autostart.ps1` stays as an option, not a step.*
 6. Docs: both-ends settings, what the phonebook exposes, one viewer per
    stream, install steps.
 
