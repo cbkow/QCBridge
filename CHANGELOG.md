@@ -66,10 +66,12 @@ Send scene / Receive scene switch (which takes effect at once — no
 restart, one agent per machine), the Blender to run, the token with its
 fingerprint, the receiver to dial with a Find receivers list and a Pair
 button, the pinned certificate, the network mode and the phonebook
-folder, the cache root and the mapping table with a folder picker on
-every path — on a network share the picker proposes the other
-platform's form of the folder from the mount table — the stream cap
-and scale, and the diagnostics. The window is its own process attached
+folder, the shared storage root — one folder both machines see, in its
+Windows and macOS forms, with the picker proposing the other form from
+the mount table; simulation caches and the receiver phonebook are its
+`cache` and `phonebook` subfolders, made for you, and every subfolder
+maps on its own (further roots and custom folders under Advanced) —
+the stream cap and scale, and the diagnostics. The window is its own process attached
 to the agent beside Blender, so nothing it does disturbs a session.
 
 **Faster, and honest about it.** An edit reaches the replica in about

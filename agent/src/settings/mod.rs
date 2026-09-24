@@ -26,7 +26,7 @@ pub fn run(cfg_path: PathBuf) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("QCBridge Agent")
-            .with_inner_size([780.0, 760.0])
+            .with_inner_size([900.0, 800.0])
             .with_min_inner_size([600.0, 480.0]),
         centered: true,
         ..Default::default()
@@ -471,134 +471,210 @@ impl App {
                 ui.end_row();
             }
 
-            ui.label("Phonebook folder");
-            ui.horizontal(|ui| {
-                ui.set_max_width(ui.available_width());
-                self.text_field_w(ui, "phonebook", |d| &mut d.phonebook, ui.available_width() - 100.0)
-                    .on_hover_text("A folder on shared storage both machines see; each receiver writes its card there, senders read them. Empty = off.");
-                if ui.button("Browse…").clicked() {
-                    if let Some(p) = self.pick_folder(&self.draft.phonebook.clone()) {
-                        self.draft.phonebook = p.clone();
-                        self.send(json!({"phonebook": p}));
-                    }
-                }
-            });
-            ui.end_row();
         });
     }
 
+    /// The shared root is the first mapping row. Caches and the phonebook
+    /// are its `cache` and `phonebook` subfolders, in this machine's form.
+    fn shared_root(&self) -> (String, String) {
+        self.draft.rows.first().map(|r| (r.win.clone(), r.mac.clone())).unwrap_or_default()
+    }
+
+    fn local_form(&self, win: &str, mac: &str) -> String {
+        if self.this_side_is_win() { win.to_string() } else { mac.to_string() }
+    }
+
+    fn derived(&self, win: &str, mac: &str) -> (String, String) {
+        let root = self.local_form(win, mac);
+        let root = root.trim_end_matches(['/', '\\']);
+        if root.is_empty() {
+            return (String::new(), String::new());
+        }
+        let sep = if self.this_side_is_win() { '\\' } else { '/' };
+        (format!("{root}{sep}cache"), format!("{root}{sep}phonebook"))
+    }
+
+    /// Commit the shared root: row 0 of the table, plus the derived cache
+    /// root and phonebook, and the two folders created if they can be.
+    fn commit_shared_root(&mut self, win: String, mac: String) {
+        if self.draft.rows.is_empty() {
+            self.draft.rows.push(Row { enabled: true, label: "shared".into(), ..Default::default() });
+        }
+        self.draft.rows[0].win = win.clone();
+        self.draft.rows[0].mac = mac.clone();
+        if self.draft.rows[0].label.is_empty() { self.draft.rows[0].label = "shared".into(); }
+        let (cache, book) = self.derived(&win, &mac);
+        for d in [&cache, &book] {
+            if !d.is_empty() { let _ = std::fs::create_dir_all(d); }
+        }
+        let rows: Vec<Value> = self.draft.rows.iter().filter(|r| !(r.win.is_empty() && r.mac.is_empty())).map(Row::to_json).collect();
+        self.draft.cache_root = cache.clone();
+        self.draft.phonebook = book.clone();
+        self.draft.rows_dirty = false;
+        self.send(json!({"path_mappings": rows, "cache_root": cache, "phonebook": book}));
+    }
+
     fn section_storage(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Storage");
-        egui::Grid::new("storage").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label("Cache root");
-            ui.horizontal(|ui| {
-                ui.set_max_width(ui.available_width());
-                self.text_field_w(ui, "cache_root", |d| &mut d.cache_root, ui.available_width() - 100.0)
-                    .on_hover_text("Where the sender writes simulation caches so the receiver reads the same frames; on shared storage, under a mapped root. Empty = off.");
+        ui.heading("Shared storage");
+        ui.label(RichText::new("One folder both machines see. Simulation caches go in its `cache` subfolder and receivers list themselves in `phonebook`; every subfolder maps on its own.").weak());
+        ui.add_space(4.0);
+        let (mut win, mut mac) = self.shared_root();
+        let this_is_win = self.this_side_is_win();
+        let mut commit = false;
+        let field_w = ui.available_width() - 120.0 - 100.0;
+        egui::Grid::new("shared").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label("Windows form");
+            let r = ui.add(egui::TextEdit::singleline(&mut win).desired_width(field_w.max(200.0)).hint_text(r"\\server\share\folder or M:\folder"));
+            if r.lost_focus() || (r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) { commit = true; }
+            if this_is_win {
+                if ui.button("Browse…").clicked() {
+                    if let Some(p) = self.pick_folder(&win) {
+                        win = p.clone();
+                        if let Some((_, other)) = mounts::other_form(&p, &self.mounts) { if mac.is_empty() { mac = other; } }
+                        commit = true;
+                    }
+                }
+            } else { ui.label(""); }
+            ui.end_row();
+
+            ui.label("macOS form");
+            let r = ui.add(egui::TextEdit::singleline(&mut mac).desired_width(field_w.max(200.0)).hint_text("/Volumes/share/folder"));
+            if r.lost_focus() || (r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) { commit = true; }
+            if !this_is_win {
+                if ui.button("Browse…").clicked() {
+                    if let Some(p) = self.pick_folder(&mac) {
+                        mac = p.clone();
+                        if let Some((_, other)) = mounts::other_form(&p, &self.mounts) { if win.is_empty() { win = other; } }
+                        commit = true;
+                    }
+                }
+            } else { ui.label(""); }
+            ui.end_row();
+
+            let (cache, book) = self.derived(&win, &mac);
+            ui.label(RichText::new("caches").weak());
+            ui.label(RichText::new(if cache.is_empty() { "—".to_string() } else { cache }).monospace().weak());
+            ui.label("");
+            ui.end_row();
+            ui.label(RichText::new("phonebook").weak());
+            ui.label(RichText::new(if book.is_empty() { "—".to_string() } else { book }).monospace().weak());
+            ui.label("");
+            ui.end_row();
+        });
+        let (cur_win, cur_mac) = self.shared_root();
+        if commit && (win != cur_win || mac != cur_mac) {
+            self.commit_shared_root(win, mac);
+        }
+
+        // Anything beyond one root: more rows, or a cache root and phonebook
+        // that are not the shared root's subfolders.
+        let (dc, db) = { let (w, m) = self.shared_root(); self.derived(&w, &m) };
+        let custom = (!self.draft.cache_root.is_empty() && self.draft.cache_root != dc)
+            || (!self.draft.phonebook.is_empty() && self.draft.phonebook != db)
+            || self.draft.rows.len() > 1;
+        let title = if custom { "Advanced (in use)" } else { "Advanced" };
+        egui::CollapsingHeader::new(title).default_open(custom).show(ui, |ui| {
+            let w = ui.available_width() - 130.0 - 100.0;
+            egui::Grid::new("storage-adv").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("Cache root");
+                self.text_field_w(ui, "cache_root", |d| &mut d.cache_root, w)
+                    .on_hover_text("Where the sender writes simulation caches. Normally the shared root's `cache` subfolder.");
                 if ui.button("Browse…").clicked() {
                     if let Some(p) = self.pick_folder(&self.draft.cache_root.clone()) {
                         self.draft.cache_root = p.clone();
                         self.send(json!({"cache_root": p}));
                     }
                 }
+                ui.end_row();
+                ui.label("Phonebook folder");
+                self.text_field_w(ui, "phonebook", |d| &mut d.phonebook, w)
+                    .on_hover_text("Where receivers list themselves. Normally the shared root's `phonebook` subfolder. Empty = off.");
+                if ui.button("Browse…").clicked() {
+                    if let Some(p) = self.pick_folder(&self.draft.phonebook.clone()) {
+                        self.draft.phonebook = p.clone();
+                        self.send(json!({"phonebook": p}));
+                    }
+                }
+                ui.end_row();
             });
-            ui.end_row();
-        });
 
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Path mappings").strong());
-            ui.label(RichText::new("— one row per storage root the two machines share. The sender's rows reach the receiver at pairing.").weak());
-        });
-        let this_is_win = self.this_side_is_win();
-        let mut remove: Option<usize> = None;
-        let n = self.draft.rows.len();
-        egui::Grid::new("rows").num_columns(6).spacing([8.0, 6.0]).striped(true).show(ui, |ui| {
-            ui.label("");
-            ui.label(RichText::new("Label").weak());
-            ui.label(RichText::new("Windows root").weak());
-            ui.label("");
-            ui.label(RichText::new("macOS root").weak());
-            ui.label("");
-            ui.end_row();
+            ui.add_space(6.0);
+            ui.label(RichText::new("More roots — one entry per further storage root the two machines share. Row 1 is the shared root above.").weak());
+            let mut remove: Option<usize> = None;
+            let n = self.draft.rows.len();
+            let path_w = ui.available_width() - 130.0 - 60.0;
             for i in 0..n {
-                let mut picked: Option<(bool, String)> = None; // (win column?, path)
-                {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
                     let row = &mut self.draft.rows[i];
                     if ui.checkbox(&mut row.enabled, "").changed() { self.draft.rows_dirty = true; }
                     let row = &mut self.draft.rows[i];
-                    if ui.add(egui::TextEdit::singleline(&mut row.label).desired_width(90.0)).changed() { self.draft.rows_dirty = true; }
+                    ui.label(RichText::new(format!("{}.", i + 1)).weak());
+                    if ui.add(egui::TextEdit::singleline(&mut row.label).desired_width(120.0).hint_text("label")).changed() { self.draft.rows_dirty = true; }
+                    if i > 0 && ui.small_button("✕").on_hover_text("Remove this root").clicked() { remove = Some(i); }
+                });
+                let mut picked: Option<bool> = None; // Some(true) = win column
+                egui::Grid::new(format!("row{i}")).num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
+                    ui.label(RichText::new("Windows").weak());
                     let row = &mut self.draft.rows[i];
-                    if ui.add(egui::TextEdit::singleline(&mut row.win).desired_width(200.0)).changed() { self.draft.rows_dirty = true; }
-                    if this_is_win && ui.small_button("…").on_hover_text("Choose the folder on this machine").clicked() {
-                        picked = Some((true, String::new()));
-                    } else if !this_is_win { ui.label(""); }
+                    if ui.add(egui::TextEdit::singleline(&mut row.win).desired_width(path_w.max(200.0))).changed() { self.draft.rows_dirty = true; }
+                    if this_is_win { if ui.small_button("…").clicked() { picked = Some(true); } } else { ui.label(""); }
+                    ui.end_row();
+                    ui.label(RichText::new("macOS").weak());
                     let row = &mut self.draft.rows[i];
-                    if ui.add(egui::TextEdit::singleline(&mut row.mac).desired_width(200.0)).changed() { self.draft.rows_dirty = true; }
-                    ui.horizontal(|ui| {
-                        if !this_is_win && ui.small_button("…").on_hover_text("Choose the folder on this machine").clicked() {
-                            picked = Some((false, String::new()));
-                        }
-                        if ui.small_button("✕").on_hover_text("Remove this row").clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                }
-                ui.end_row();
-                if let Some((for_win, _)) = picked {
+                    if ui.add(egui::TextEdit::singleline(&mut row.mac).desired_width(path_w.max(200.0))).changed() { self.draft.rows_dirty = true; }
+                    if !this_is_win { if ui.small_button("…").clicked() { picked = Some(false); } } else { ui.label(""); }
+                    ui.end_row();
+                });
+                if let Some(for_win) = picked {
                     let start = if for_win { self.draft.rows[i].win.clone() } else { self.draft.rows[i].mac.clone() };
                     if let Some(p) = self.pick_folder(&start) {
+                        let other = mounts::other_form(&p, &self.mounts).map(|(_, o)| o);
                         let row = &mut self.draft.rows[i];
-                        if for_win { row.win = p.clone() } else { row.mac = p.clone() }
-                        self.draft.rows_dirty = true;
-                        // On a network mount, propose the other platform's
-                        // form; fill it when empty, else offer it.
-                        if let Some((_, other)) = mounts::other_form(&p, &self.mounts) {
+                        if for_win { row.win = p } else { row.mac = p }
+                        if let Some(o) = other {
                             let target = if for_win { &mut row.mac } else { &mut row.win };
-                            if target.is_empty() { *target = other; } else { row.hint = Some((!for_win, other)); }
+                            if target.is_empty() { *target = o; } else { row.hint = Some((!for_win, o)); }
                         }
+                        self.draft.rows_dirty = true;
                     }
                 }
                 if let Some((hint_is_win, text)) = self.draft.rows[i].hint.clone() {
-                    ui.label("");
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("proposed {} root: {text}", if hint_is_win { "Windows" } else { "macOS" })).weak());
+                        ui.label(RichText::new(format!("proposed {} form: {text}", if hint_is_win { "Windows" } else { "macOS" })).weak());
                         if ui.small_button("Use it").clicked() {
                             let row = &mut self.draft.rows[i];
                             if hint_is_win { row.win = text.clone() } else { row.mac = text.clone() }
                             row.hint = None;
                             self.draft.rows_dirty = true;
                         }
-                        if ui.small_button("Dismiss").clicked() {
-                            self.draft.rows[i].hint = None;
-                        }
+                        if ui.small_button("Dismiss").clicked() { self.draft.rows[i].hint = None; }
                     });
-                    ui.label(""); ui.label(""); ui.label(""); ui.label("");
-                    ui.end_row();
                 }
             }
-        });
-        if let Some(i) = remove {
-            self.draft.rows.remove(i);
-            self.draft.rows_dirty = true;
-        }
-        ui.horizontal(|ui| {
-            if ui.button("Add row").clicked() {
-                self.draft.rows.push(Row { enabled: true, ..Default::default() });
+            if let Some(i) = remove {
+                self.draft.rows.remove(i);
                 self.draft.rows_dirty = true;
             }
-            if ui.add_enabled(self.draft.rows_dirty, egui::Button::new("Apply mappings")).clicked() {
-                let rows: Vec<Value> = self.draft.rows.iter().filter(|r| !(r.win.is_empty() && r.mac.is_empty())).map(Row::to_json).collect();
-                self.send(json!({"path_mappings": rows}));
-                self.draft.rows_dirty = false;
-            }
-            if self.draft.rows_dirty && ui.button("Revert").clicked() {
-                let remote = self.remote.clone();
-                self.take_config(remote, true);
-            }
-            if self.draft.rows_dirty {
-                ui.label(RichText::new("unsaved edits").color(Color32::from_rgb(200, 120, 0)));
-            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Add root").clicked() {
+                    self.draft.rows.push(Row { enabled: true, ..Default::default() });
+                    self.draft.rows_dirty = true;
+                }
+                if ui.add_enabled(self.draft.rows_dirty, egui::Button::new("Apply roots")).clicked() {
+                    let rows: Vec<Value> = self.draft.rows.iter().filter(|r| !(r.win.is_empty() && r.mac.is_empty())).map(Row::to_json).collect();
+                    self.send(json!({"path_mappings": rows}));
+                    self.draft.rows_dirty = false;
+                }
+                if self.draft.rows_dirty && ui.button("Revert").clicked() {
+                    let remote = self.remote.clone();
+                    self.take_config(remote, true);
+                }
+                if self.draft.rows_dirty {
+                    ui.label(RichText::new("unsaved edits").color(Color32::from_rgb(200, 120, 0)));
+                }
+            });
         });
     }
 
