@@ -47,7 +47,9 @@ work and says so at its top. Running it from a checkout: build the agent
 starts it at logon). The agent writes `agent.log`, `blender.log` and
 `capture.log` beside its `agent.toml`; the session token is not in that
 file but in the OS keychain (`token_store` picks a file instead), set
-from the panel or the agent's `set_config`. With an agent running for the
+from the agent's settings window (tray → Settings…, or the button in
+Blender's preferences), which also holds the Send/Receive switch, the
+receiver to pair with, the path mappings and the cache root. With an agent running for the
 session's role, the addon uses it by default; `QCB_TRANSPORT=agent
 QCB_AGENT=spawn` has each Blender start a private one instead (the
 smokes' way). Without an agent the zmq transport from 0.1.6 still runs as

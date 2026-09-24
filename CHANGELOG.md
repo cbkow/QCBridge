@@ -59,6 +59,19 @@ Blender's preferences moves into the agent on the first session, and
 the preferences show the agent's table from then on, with a Save to
 Agent button for edits until the agent's own window arrives.
 
+**A settings window.** The agent's tray has a Settings… item, and
+Blender's preferences an Open Agent Settings button, both opening one
+native window for everything the agent owns: the machine's name, the
+Send scene / Receive scene switch (which takes effect at once — no
+restart, one agent per machine), the Blender to run, the token with its
+fingerprint, the receiver to dial with a Find receivers list and a Pair
+button, the pinned certificate, the network mode and the phonebook
+folder, the cache root and the mapping table with a folder picker on
+every path — on a network share the picker proposes the other
+platform's form of the folder from the mount table — the stream cap
+and scale, and the diagnostics. The window is its own process attached
+to the agent beside Blender, so nothing it does disturbs a session.
+
 **Faster, and honest about it.** An edit reaches the replica in about
 105 ms (it was ~185), a visibility toggle or rename in about 200 ms (it
 was ~500), and a small edit no longer waits behind a large mesh: deltas

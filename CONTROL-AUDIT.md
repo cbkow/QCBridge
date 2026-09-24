@@ -223,7 +223,9 @@ lesson in QCBridge's terms: the user never invents or copies a secret.
    host's rows at pairing. *Done 2026-09-24.*
 4. The settings window (egui) with: identity, network, phonebook, token,
    Blender path, mappings, cache root, and the peers list with Pair /
-   Forget.
+   Forget. *Done 2026-09-24 (`qcbridge-agent --settings`, a separate
+   process attached as a control client; the live Send/Receive switch
+   with it).*
 5. Bundle + autostart + first-enable install.
 6. Docs: both-ends settings, what the phonebook exposes, one viewer per
    stream, install steps.

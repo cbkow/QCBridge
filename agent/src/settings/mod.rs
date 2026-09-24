@@ -264,7 +264,12 @@ impl App {
     /// A text field that commits on Enter or focus loss when it differs
     /// from what the agent holds.
     fn text_field(&mut self, ui: &mut egui::Ui, key: &str, get: fn(&mut Draft) -> &mut String) -> egui::Response {
-        let resp = ui.add(egui::TextEdit::singleline(get(&mut self.draft)).desired_width(f32::INFINITY));
+        let w = ui.available_width() - 12.0;
+        self.text_field_w(ui, key, get, w)
+    }
+
+    fn text_field_w(&mut self, ui: &mut egui::Ui, key: &str, get: fn(&mut Draft) -> &mut String, width: f32) -> egui::Response {
+        let resp = ui.add(egui::TextEdit::singleline(get(&mut self.draft)).desired_width(width.max(120.0)));
         let committed = resp.lost_focus() || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
         if committed {
             let value = get(&mut self.draft).clone();
@@ -324,7 +329,7 @@ impl App {
             if !self.is_host() {
                 ui.label("Blender");
                 ui.horizontal(|ui| {
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.draft.blender_path).desired_width(f32::INFINITY - 80.0));
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.draft.blender_path).desired_width((ui.available_width() - 90.0).max(120.0)));
                     let committed = r.lost_focus() || (r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                     if committed && self.draft.blender_path != self.remote_str("blender_path") {
                         let v = self.draft.blender_path.clone();
@@ -390,7 +395,7 @@ impl App {
                 ui.label("Receiver");
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        self.text_field(ui, "peer", |d| &mut d.peer).on_hover_text("address:port of the receiving machine's agent (its listen port, 19990 by default)");
+                        self.text_field_w(ui, "peer", |d| &mut d.peer, 260.0).on_hover_text("address:port of the receiving machine's agent (its listen port, 19990 by default)");
                         if ui.button("Find receivers").clicked() {
                             if let Some(c) = &self.client {
                                 let addr = self.draft.peer.split(':').next().unwrap_or("").trim().to_string();
@@ -468,7 +473,8 @@ impl App {
 
             ui.label("Phonebook folder");
             ui.horizontal(|ui| {
-                self.text_field(ui, "phonebook", |d| &mut d.phonebook)
+                ui.set_max_width(ui.available_width());
+                self.text_field_w(ui, "phonebook", |d| &mut d.phonebook, ui.available_width() - 100.0)
                     .on_hover_text("A folder on shared storage both machines see; each receiver writes its card there, senders read them. Empty = off.");
                 if ui.button("Browse…").clicked() {
                     if let Some(p) = self.pick_folder(&self.draft.phonebook.clone()) {
@@ -486,7 +492,8 @@ impl App {
         egui::Grid::new("storage").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label("Cache root");
             ui.horizontal(|ui| {
-                self.text_field(ui, "cache_root", |d| &mut d.cache_root)
+                ui.set_max_width(ui.available_width());
+                self.text_field_w(ui, "cache_root", |d| &mut d.cache_root, ui.available_width() - 100.0)
                     .on_hover_text("Where the sender writes simulation caches so the receiver reads the same frames; on shared storage, under a mapped root. Empty = off.");
                 if ui.button("Browse…").clicked() {
                     if let Some(p) = self.pick_folder(&self.draft.cache_root.clone()) {
