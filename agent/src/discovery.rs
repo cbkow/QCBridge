@@ -167,12 +167,12 @@ async fn run(cfg: SharedConfig, id: Arc<Identity>, mut mode_rx: watch::Receiver<
         let sock = match bind_udp(PORT, discoverable) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[discovery] cannot bind udp/{PORT}: {e}");
+                crate::log!("[discovery] cannot bind udp/{PORT}: {e}");
                 if mode_rx.changed().await.is_err() { return; }
                 continue;
             }
         };
-        eprintln!("[discovery] {} on udp/{PORT}", if discoverable { "answering and announcing" } else { "answering direct probes" });
+        crate::log!("[discovery] {} on udp/{PORT}", if discoverable { "answering and announcing" } else { "answering direct probes" });
         phonebook_write(&cfg, &id);
         let mut announce = tokio::time::interval(ANNOUNCE_EVERY);
         let mut buf = [0u8; 2048];
@@ -305,7 +305,7 @@ pub fn phonebook_write_at(dir: &Path, b: &Beacon) -> std::io::Result<()> {
 fn phonebook_write(cfg: &SharedConfig, id: &Identity) {
     if let Some(dir) = phonebook_dir(cfg) {
         if let Err(e) = phonebook_write_at(&dir, &beacon_for(cfg, id)) {
-            eprintln!("[discovery] phonebook write failed: {e}");
+            crate::log!("[discovery] phonebook write failed: {e}");
         }
     }
 }

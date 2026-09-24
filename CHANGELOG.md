@@ -28,6 +28,17 @@ takes settings at runtime from a tray menu. Blender's own preferences panel
 mirrors the agent's settings rather than owning a second copy. The zmq
 transport from 0.1.6 stays as a fallback.
 
+**Quiet on Windows, and it takes its children with it.** The agent is a
+windowless program there: no console to close by mistake (that ended the
+first logon-task runs), a message box when it cannot start, and its
+diagnostics in `agent.log` beside `agent.toml`, Blender's output in
+`blender.log` next to it, and a capture helper the agent itself runs in
+`capture.log`.
+Killing the agent, however it happens, now kills the Blender, helper and
+ffmpeg it started, so the next agent never finds its ports taken. One
+agent per role and directory, exactly. Autostart is a Run-key value
+(`agent/windows/autostart.ps1`) instead of a scheduled task.
+
 **Faster, and honest about it.** An edit reaches the replica in about
 105 ms (it was ~185), a visibility toggle or rename in about 200 ms (it
 was ~500), and a small edit no longer waits behind a large mesh: deltas

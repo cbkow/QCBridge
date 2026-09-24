@@ -248,9 +248,9 @@ fn reader_loop(mut r: impl Read, inb: &Inbound, link: &Link, on_cmd: &(dyn Fn(&V
             }
             T_CMD => match serde_json::from_slice::<Value>(&body) {
                 Ok(cmd) => on_cmd(&cmd),
-                Err(e) => eprintln!("[link] bad CMD json: {e}"),
+                Err(e) => crate::log!("[link] bad CMD json: {e}"),
             },
-            other => eprintln!("[link] unknown frame type {other:#x}"),
+            other => crate::log!("[link] unknown frame type {other:#x}"),
         }
     }
 }

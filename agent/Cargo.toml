@@ -61,11 +61,16 @@ tao = "0.31"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# OpenProcess + WaitForSingleObject for the single-instance guard's
-# pid_alive. 0.61 is the copy tokio and tray-icon already bring in; adds no
-# packages.
+# OpenProcess + WaitForSingleObject for the pid check, CreateMutexW for the
+# exact single-instance guard, the job object that takes the children down
+# with the agent, AttachConsole for --version from a terminal, and the
+# message box a start failure shows (there is no console to print to).
+# 0.61 is the copy tokio and tray-icon already bring in; adds no packages.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation", "Win32_Security", "Win32_System_Threading",
+    "Win32_System_JobObjects", "Win32_System_Console", "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 debug = 1

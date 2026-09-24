@@ -72,8 +72,115 @@ impl Args {
     }
 }
 
-pub fn log(tag: &str, msg: impl AsRef<str>) {
-    eprintln!("[{tag}] {}", msg.as_ref());
+// ---------------------------------------------------------------- log ----
+
+/// Every diagnostic line the agent writes. Before `logging::init` it goes to
+/// stderr only, which is where it always went; after init it also goes to
+/// `agent.log` beside the config. On Windows the release binary has no
+/// console, so the file is the only place a user can read what happened.
+#[macro_export]
+macro_rules! log {
+    ($($arg:tt)*) => { $crate::logging::line(format_args!($($arg)*)) };
+}
+
+pub mod logging {
+    use std::fs::{File, OpenOptions};
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// One generation is kept: past this size the file becomes `.1` and a
+    /// fresh one starts. Enough for weeks of a replica's status lines.
+    const ROTATE_AT: u64 = 4 * 1024 * 1024;
+
+    struct Sink {
+        path: PathBuf,
+        file: Option<File>,
+        lines_since_check: u32,
+    }
+
+    static SINK: OnceLock<Mutex<Sink>> = OnceLock::new();
+
+    fn open(path: &Path) -> Option<File> {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        OpenOptions::new().create(true).append(true).open(path).ok()
+    }
+
+    fn rotate_if_large(path: &Path) {
+        if std::fs::metadata(path).map(|m| m.len() > ROTATE_AT).unwrap_or(false) {
+            let old = path.with_extension("log.1");
+            let _ = std::fs::remove_file(&old);
+            let _ = std::fs::rename(path, &old);
+        }
+    }
+
+    /// Start writing to `path` as well as stderr. Called once, as soon as
+    /// the config directory is known; a second call is ignored.
+    pub fn init(path: &Path) {
+        rotate_if_large(path);
+        let sink = Sink { path: path.to_path_buf(), file: open(path), lines_since_check: 0 };
+        let _ = SINK.set(Mutex::new(sink));
+    }
+
+    /// The file being written, if init has run and the open succeeded.
+    pub fn path() -> Option<PathBuf> {
+        SINK.get().and_then(|m| m.lock().ok()).and_then(|s| s.file.as_ref().map(|_| s.path.clone()))
+    }
+
+    /// `YYYY-MM-DD HH:MM:SS` in UTC, from the civil-from-days algorithm; no
+    /// date crate for one timestamp.
+    fn stamp() -> String {
+        let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let (days, rem) = (secs / 86_400, secs % 86_400);
+        let z = days as i64 + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}Z", rem / 3600, (rem / 60) % 60, rem % 60)
+    }
+
+    pub fn line(args: std::fmt::Arguments) {
+        let text = format!("{args}");
+        // stderr may be closed or absent (no console on Windows); a failed
+        // write there is not an event.
+        let _ = writeln!(std::io::stderr().lock(), "{text}");
+        let Some(m) = SINK.get() else { return };
+        let Ok(mut s) = m.lock() else { return };
+        if s.file.is_none() {
+            return;
+        }
+        s.lines_since_check += 1;
+        if s.lines_since_check >= 256 {
+            s.lines_since_check = 0;
+            let path = s.path.clone();
+            s.file = None; // closed before the rename, which Windows needs
+            rotate_if_large(&path);
+            s.file = open(&path);
+        }
+        if let Some(f) = s.file.as_mut() {
+            let _ = writeln!(f, "{} {text}", stamp());
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn stamp_is_a_utc_timestamp() {
+            let s = super::stamp();
+            assert_eq!(s.len(), 20, "{s}");
+            assert!(s.starts_with("20"), "{s}");
+            assert_eq!(&s[10..11], " ");
+            assert!(s.ends_with('Z'));
+        }
+    }
 }
 
 // ------------------------------------------------------------- Annex-B ----
@@ -415,5 +522,6 @@ pub mod blender;
 pub mod discovery;
 pub mod config;
 pub mod link;
+pub mod platform;
 pub mod session;
 pub mod video;

@@ -43,7 +43,9 @@ How it fits together, as it is now: `SYNC-AUDIT.md` (§2 for the
 transport), `COVERAGE.md`, `CACHES.md`, and `smokes/README.md` for the
 suites that prove it. `ARCHITECTURE.md` describes the design before this
 work and says so at its top. Running it from a checkout: build the agent
-(`cargo build --release` in `agent/`). With an agent running for the
+(`cargo build --release` in `agent/`; on Windows `agent\windows\autostart.ps1`
+starts it at logon). The agent writes `agent.log`, `blender.log` and
+`capture.log` beside its `agent.toml`. With an agent running for the
 session's role, the addon uses it by default; `QCB_TRANSPORT=agent
 QCB_AGENT=spawn` has each Blender start a private one instead (the
 smokes' way). Without an agent the zmq transport from 0.1.6 still runs as

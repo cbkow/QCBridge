@@ -480,7 +480,7 @@ pub async fn host_loop(ctx: Arc<Ctx>, control: Arc<HostControl>) {
                 let reason = r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default();
                 if reason != last_reason {
                     if !reason.is_empty() {
-                        eprintln!("[agent] connect to {}: {reason}", target.addr);
+                        crate::log!("[agent] connect to {}: {reason}", target.addr);
                     }
                     last_reason = reason;
                 }

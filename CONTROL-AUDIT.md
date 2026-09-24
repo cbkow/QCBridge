@@ -84,8 +84,10 @@ The agent installs, updates and starts separately from the extension, and
 the addon's version warning exists because of that.
 
 **Finding 6.** There is no installer for the agent on either platform, no
-autostart on macOS, and the Windows logon task has the console-exit bug
-(tracker). A user today cannot install QCBridge without a terminal.
+autostart on macOS, and the Windows logon task had the console-exit bug
+(tracker; fixed 2026-09-24 — windowless agent, `agent.log`, job object,
+Run-key autostart). A user today cannot install QCBridge without a
+terminal.
 
 ## 2. What the sister products do
 
@@ -196,8 +198,9 @@ lesson in QCBridge's terms: the user never invents or copies a secret.
   under `qcbridge/bin/<platform>/`; the manifest's platform list already
   splits the builds. First enable copies the agent to the app-support
   dir, writes a default `agent.toml`, and registers autostart: a
-  launchd agent on macOS, the logon task on Windows (once its console
-  exit is fixed), both per-user, no elevation.
+  launchd agent on macOS, the Run-key value on Windows
+  (`agent/windows/autostart.ps1`, which replaced the logon task on
+  2026-09-24), both per-user, no elevation.
 - The firewall rule on Windows was not needed for the probe or the QUIC
   attach in the paired runs (the process is allowed when it binds); keep
   the script for the cases where policy blocks it, and say so in the doc.
@@ -208,7 +211,7 @@ lesson in QCBridge's terms: the user never invents or copies a secret.
 ## 7. Order
 
 1. Agent hygiene on Windows (console, log file, job object) — blocks any
-   install.
+   install. *Done 2026-09-24 (agent commit "Windows hygiene").*
 2. Token to the keychain; token out of the addon and the mirror; the
    fingerprint line on both ends.
 3. Mappings and cache root move to the agent config and the `config`

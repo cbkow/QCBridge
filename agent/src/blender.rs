@@ -7,6 +7,7 @@ use crate::config::SharedConfig;
 use crate::link::Link;
 use crate::session::PeerObserver;
 use serde_json::json;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
@@ -58,6 +59,8 @@ pub struct Lifecycle {
     link: Arc<Link>,
     local_port: u16,
     secret: String,
+    /// Where blender.log goes: the agent's config directory.
+    log_dir: PathBuf,
     child: Mutex<Option<Child>>,
     pub peer_up: AtomicBool,
     pub tx: mpsc::UnboundedSender<Event>,
@@ -79,11 +82,11 @@ impl PeerObserver for Lifecycle {
 }
 
 impl Lifecycle {
-    pub fn new(cfg: SharedConfig, link: Arc<Link>, local_port: u16, secret: String, status: Arc<Mutex<String>>)
+    pub fn new(cfg: SharedConfig, link: Arc<Link>, local_port: u16, secret: String, log_dir: PathBuf, status: Arc<Mutex<String>>)
         -> (Arc<Self>, mpsc::UnboundedReceiver<Event>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let me = Arc::new(Self {
-            cfg, link, local_port, secret,
+            cfg, link, local_port, secret, log_dir,
             child: Mutex::new(None),
             peer_up: AtomicBool::new(false),
             tx, status,
@@ -97,7 +100,7 @@ impl Lifecycle {
 
     fn set_status(&self, s: &str) {
         *self.status.lock().unwrap() = s.to_string();
-        eprintln!("[lifecycle] {s}");
+        crate::log!("[lifecycle] {s}");
     }
 
     fn spawn_blender(self: &Arc<Self>) {
@@ -117,6 +120,17 @@ impl Lifecycle {
             self.set_status("connected (Blender supervision off)");
             return;
         }
+        // Blender's console output goes to blender.log beside agent.toml,
+        // one file per launch, instead of the agent's stderr — which on
+        // Windows no longer exists. No console window of its own either.
+        let log_path = self.log_dir.join("blender.log");
+        let (out, err) = match std::fs::File::create(&log_path).and_then(|f| Ok((f.try_clone()?, f))) {
+            Ok(pair) => (Stdio::from(pair.0), Stdio::from(pair.1)),
+            Err(e) => {
+                crate::log!("[lifecycle] cannot open {}: {e}; Blender output is dropped", log_path.display());
+                (Stdio::null(), Stdio::null())
+            }
+        };
         let mut cmd = Command::new(&path);
         cmd.args(&args)
             .arg("--python-expr")
@@ -127,8 +141,9 @@ impl Lifecycle {
             .env("QCB_AGENT_KIOSK", if kiosk { "1" } else { "0" })
             .env("QCB_TRANSPORT", "agent")
             .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stdout(out)
+            .stderr(err);
+        crate::platform::no_window(&mut cmd);
         match cmd.spawn() {
             Ok(child) => {
                 self.set_status("Blender launching");
