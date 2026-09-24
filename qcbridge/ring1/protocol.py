@@ -136,11 +136,15 @@ def token_fingerprint(token: str) -> str:
 
 def make_hello(
     token: str, epoch: str, blender_version: str, addon_version: str = "",
-    seq: int = 0, seq_fast: int = 0,
+    seq: int = 0, seq_fast: int = 0, mappings: list | None = None,
 ) -> dict:
     return {
         "kind": "hello",
         "token": token,
+        # The host's path-mapping rows (wire dicts), so the replica can
+        # localize with the host's table alone (2026-09-24). Absent from an
+        # older host: the replica uses only its own rows, as before.
+        "mappings": list(mappings or []),
         "epoch": epoch,
         # Where the host's lane counters stand, so the replica primes its
         # trackers: a lost first message after a re-handshake is still a gap.

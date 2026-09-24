@@ -142,3 +142,9 @@ def test_derived_secrets_match_the_agent():
     )
     assert protocol.srt_passphrase("devtoken") == "22ac324cdd19e313f70edd1316823d94"
     assert protocol.token_fingerprint("") == "" and protocol.hello_secret("") == ""
+
+
+def test_hello_carries_the_mapping_rows():
+    h = protocol.make_hello("s", "e", "5.2", mappings=[{"win": "M:\\J", "mac": "/Volumes/J", "enabled": True, "label": ""}])
+    assert h["mappings"][0]["mac"] == "/Volumes/J"
+    assert protocol.make_hello("s", "e", "5.2")["mappings"] == []

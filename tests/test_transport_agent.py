@@ -299,6 +299,23 @@ def test_the_mirror_carries_derived_secrets_not_the_token(pair, tmp_path):
     assert (host_dir / "host.token").read_text(encoding="utf-8").strip() == "newtok"
 
 
+def test_mappings_and_cache_root_live_in_the_agent(pair):
+    """Since 2026-09-24 the agent owns the path-mapping table and the cache
+    root: set_config takes a table of rows, the config event mirrors it, a
+    malformed table is rejected whole."""
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    assert host.agent_config["path_mappings"] == [] and host.agent_config["cache_root"] == ""
+    rows = [{"win": "M:\\Jobs", "mac": "/Volumes/Jobs", "enabled": True, "label": "jobs"}]
+    reply = wait_reply(host, host.set_config(path_mappings=rows, cache_root="/Volumes/Jobs/cache"))
+    assert reply and sorted(reply["changed"]) == ["cache_root", "path_mappings"], reply
+    assert host.agent_config["path_mappings"] == rows
+    assert host.agent_config["cache_root"] == "/Volumes/Jobs/cache"
+    reply = wait_reply(host, host.set_config(path_mappings=[{"win": 1}]))
+    assert reply and reply["rejected"] == ["path_mappings"], reply
+    assert host.agent_config["path_mappings"] == rows
+
+
 def test_discover_by_direct_probe_finds_the_replica(pair):
     """The VPN path: a unicast probe to an address returns the replica's
     beacon — name, listen port, certificate fingerprint, paired state — with

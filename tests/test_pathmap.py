@@ -169,3 +169,30 @@ def test_localize_any_translates_a_mac_host_path_for_a_replica(monkeypatch):
     assert pathmap.localize_any("Z:\\proj\\tex\\a.png", rows) == "/Volumes/share/proj/tex/a.png"
     # nothing matches: unchanged, for the caller to judge by existence
     assert pathmap.localize_any("/Users/someone/else.png", rows) == "/Users/someone/else.png"
+
+
+def test_wire_round_trip_and_malformed_rows_skipped():
+    from ring1 import pathmap
+
+    rows = [pathmap.PathMapping(win=r"M:\\Jobs", mac="/Volumes/Jobs", enabled=False, label="jobs")]
+    wire = pathmap.rows_to_wire(rows)
+    assert wire == [{"win": r"M:\\Jobs", "mac": "/Volumes/Jobs", "enabled": False, "label": "jobs"}]
+    back = pathmap.rows_from_wire(wire + [{"win": 1, "mac": "x"}, "junk", {"win": "W:\\", "mac": "/w"}])
+    assert back[0] == rows[0]
+    assert len(back) == 2 and back[1].enabled and back[1].label == ""
+    assert pathmap.rows_from_wire(None) == []
+
+
+def test_merge_keeps_own_rows_first_and_does_not_double_a_shared_row():
+    from ring1 import pathmap
+
+    own = [pathmap.PathMapping(win=r"\\\\srv\\share", mac="/Volumes/share")]
+    received = [
+        pathmap.PathMapping(win=r"\\\\SRV\\share\\", mac="/Volumes/share/", label="from host"),
+        pathmap.PathMapping(win=r"M:\\Jobs", mac="/Volumes/Jobs"),
+    ]
+    merged = pathmap.merge_tables(own, received)
+    assert merged[0] is own[0]
+    assert [m.mac for m in merged] == ["/Volumes/share", "/Volumes/Jobs"]
+    # A replica with no table of its own localizes with the host's rows.
+    assert pathmap.merge_tables([], received) == received

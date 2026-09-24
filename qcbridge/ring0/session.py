@@ -253,6 +253,13 @@ def _start_host(prefs) -> None:
     state["note"] = address_error or "connecting"
     if agent and hasattr(transport, "wait_attached"):
         transport.wait_attached(3.0)  # agent_config — secrets, peer — arrives with `attached`
+        _push_paths_to_agent(prefs, transport)
+        _mirror_paths_from_agent(prefs, transport)
+    # Read once for this session: the sync's canonicalizer and the hello
+    # must agree on the same rows. (An agent that had none takes the
+    # addon's, pushed just above.)
+    mappings = _effective_mappings(prefs, transport)
+    cache_root = _effective_cache_root(prefs, transport)
 
     # Fire-and-poll — this timer runs on Blender's main thread, and a dead
     # peer must never freeze the UI (it did: a blocking 3 s request per
@@ -276,6 +283,7 @@ def _start_host(prefs) -> None:
                 addon_version=_addon_version(),
                 seq=sync.seq if sync else 0,
                 seq_fast=getattr(sync, "seq_fast", 0) if sync else 0,
+                mappings=pathmap.rows_to_wire(mappings),
             )
             pending["req"] = transport.request_nowait(hello)
             pending["sent_at"] = now
@@ -350,6 +358,7 @@ def _start_host(prefs) -> None:
         if not pending["armed"] and liveness.replica_restarted(status, state["peer_epoch"]):
             _arm_handshake("replica restarted — re-syncing", new_epoch=True)
             return 0.25
+        _mirror_paths_from_agent(prefs, transport)  # a tray/window edit shows up in the panel
         sync = state.get("sync")
         if sync is not None and not pending["armed"] and state["resync_policy"].should_resync(
             status, _time.monotonic()
@@ -364,8 +373,8 @@ def _start_host(prefs) -> None:
     state["sync"] = host_handlers.start(
         transport,
         paused_fn=lambda: state["paused"],
-        mappings=_prefs_mappings(prefs),
-        cache_root=getattr(prefs, "cache_root", "") or "",
+        mappings=mappings,
+        cache_root=cache_root,
     )
 
 
@@ -385,6 +394,7 @@ def _start_replica(prefs) -> None:
     pixel_path.set_external()
     fallback_token = prefs.token  # main thread; the handler must not touch bpy
     epoch = state["epoch"]
+    own_rows = {"rows": []}  # filled after attach (below); read by the handler
 
     # Captured now (main thread) so the IO-thread handler touches no bpy.
     # No passphrase here: both ends derive it from the shared token, so the
@@ -402,6 +412,11 @@ def _start_replica(prefs) -> None:
             hello_secret, _ = _secrets(None, transport, fallback_token)
             ok, reason = protocol.check_hello(msg, hello_secret)
             if ok:
+                # The host's table rides in the hello: this machine's rows
+                # first, the host's rows it lacks after them.
+                received = pathmap.rows_from_wire(msg.get("mappings"))
+                replica_apply.set_mappings(pathmap.merge_tables(own_rows["rows"], received))
+                state["host_mappings"] = len(received)
                 if state["peer_epoch"] != msg.get("epoch"):
                     replica_apply.notify_new_session(msg.get("seq", 0), msg.get("seq_fast", 0))
                 state["peer_epoch"] = msg.get("epoch")
@@ -451,10 +466,13 @@ def _start_replica(prefs) -> None:
             "ffmpeg": state.get("ffmpeg_note", ""),
         }
     )
-    transport.start()
+    transport.start()  # agent mode: returns once attached, so the mirror is in
     state["transport"] = transport
     state["note"] = "listening"
-    replica_apply.start(transport, _prefs_mappings(prefs))
+    _push_paths_to_agent(prefs, transport)
+    _mirror_paths_from_agent(prefs, transport)
+    own_rows["rows"] = _effective_mappings(prefs, transport)
+    replica_apply.start(transport, own_rows["rows"])
     overlay.enable(_replica_overlay_text)
     if getattr(prefs, "replica_kiosk", False):
         kiosk.enter()
@@ -515,6 +533,66 @@ def _prefs_mappings(prefs) -> list[pathmap.PathMapping]:
         pathmap.PathMapping(win=m.win, mac=m.mac, enabled=m.enabled, label=m.label)
         for m in prefs.path_mappings
     ]
+
+
+def _effective_mappings(prefs, transport) -> list[pathmap.PathMapping]:
+    """The table in force. In agent mode the agent owns it (2026-09-24) and
+    mirrors it at attach; the addon's own rows serve zmq mode, and an agent
+    that holds none yet (they are pushed up at session start, below)."""
+    cfg = getattr(transport, "agent_config", None) or {}
+    if getattr(transport, "agent_mode", False) and cfg.get("path_mappings"):
+        return pathmap.rows_from_wire(cfg["path_mappings"])
+    return _prefs_mappings(prefs)
+
+
+def _effective_cache_root(prefs, transport) -> str:
+    cfg = getattr(transport, "agent_config", None) or {}
+    if getattr(transport, "agent_mode", False) and cfg.get("cache_root"):
+        return str(cfg["cache_root"])
+    return getattr(prefs, "cache_root", "") or ""
+
+
+def _push_paths_to_agent(prefs, transport) -> None:
+    """First session against an agent that holds no table: the addon's
+    rows and cache root move up, once, so an existing setup keeps working
+    and the agent is the owner from then on."""
+    cfg = getattr(transport, "agent_config", None) or {}
+    if not getattr(transport, "agent_mode", False) or not cfg:
+        return
+    fields = {}
+    if not cfg.get("path_mappings") and len(prefs.path_mappings):
+        fields["path_mappings"] = pathmap.rows_to_wire(_prefs_mappings(prefs))
+    if not cfg.get("cache_root") and (getattr(prefs, "cache_root", "") or ""):
+        fields["cache_root"] = prefs.cache_root
+    if fields:
+        transport.set_config(**fields)
+        print(f"qcbridge: moved {', '.join(fields)} into the agent", flush=True)
+
+
+def _mirror_paths_from_agent(prefs, transport) -> None:
+    """Main thread only. The preferences show the agent's table and cache
+    root so the panel reads what is in force; edits go back through
+    qcbridge.agent_save_paths."""
+    cfg = getattr(transport, "agent_config", None) or {}
+    if not getattr(transport, "agent_mode", False) or not cfg:
+        return
+    if state.get("mirrored_paths_from") is cfg:
+        return
+    state["mirrored_paths_from"] = cfg
+    if "path_mappings" in cfg and not isinstance(prefs, dict) and hasattr(prefs, "path_mappings") \
+            and hasattr(prefs.path_mappings, "add"):
+        rows = pathmap.rows_from_wire(cfg["path_mappings"])
+        if rows != _prefs_mappings(prefs) and rows:
+            while prefs.path_mappings:
+                prefs.path_mappings.remove(0)
+            for r in rows:
+                m = prefs.path_mappings.add()
+                m.win, m.mac, m.enabled, m.label = r.win, r.mac, r.enabled, r.label
+    if cfg.get("cache_root") and hasattr(prefs, "cache_root") and prefs.cache_root != cfg["cache_root"]:
+        try:
+            prefs.cache_root = cfg["cache_root"]
+        except (AttributeError, TypeError):
+            pass
 
 
 def on_project_loaded() -> None:

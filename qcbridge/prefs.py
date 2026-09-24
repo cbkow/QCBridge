@@ -417,6 +417,31 @@ class QCB_OT_agent_set_token(Operator):
         return {"FINISHED"}
 
 
+class QCB_OT_agent_save_paths(Operator):
+    bl_idname = "qcbridge.agent_save_paths"
+    bl_label = "Save to Agent"
+    bl_description = (
+        "Send the path-mapping table and the cache root to the agent, which "
+        "owns them; the host's rows reach the replica at the next pairing"
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return session.running() and _agent_transport() is not None
+
+    def execute(self, context):
+        from .ring1 import pathmap
+
+        prefs = get_prefs(context)
+        t = _agent_transport()
+        if t is None:
+            return {"CANCELLED"}
+        rows = pathmap.rows_to_wire(session._prefs_mappings(prefs))
+        t.set_config(path_mappings=rows, cache_root=prefs.cache_root or "")
+        self.report({"INFO"}, f"{len(rows)} mapping row(s) and the cache root sent to the agent")
+        return {"FINISHED"}
+
+
 class QCB_OT_copy_stream_url(Operator):
     bl_idname = "qcbridge.copy_stream_url"
     bl_label = "Copy Stream URL"
@@ -612,7 +637,16 @@ class QCBridgePreferences(AddonPreferences):
         box.label(text="Set before baking; baked caches stay put until re-baked.", icon="INFO")
 
         box = layout.box()
-        box.label(text="Path Mappings (Windows root ↔ macOS root)")
+        if agent_mode:
+            # The agent owns the table and the cache root (2026-09-24). What
+            # is shown here mirrors the agent while a session runs; an edit
+            # goes back through Save to Agent. The host's rows reach the
+            # replica in the hello, so one machine's table is enough.
+            row = box.row()
+            row.label(text="Path Mappings — owned by the agent", icon="LINKED")
+            row.operator("qcbridge.agent_save_paths", icon="EXPORT")
+        else:
+            box.label(text="Path Mappings (Windows root ↔ macOS root)")
         row = box.row()
         row.template_list(
             "QCB_UL_path_mappings", "", self, "path_mappings",
@@ -704,6 +738,7 @@ _classes = (
     QCB_OT_replica_zoom,
     QCB_OT_open_qcview,
     QCB_OT_agent_set_token,
+    QCB_OT_agent_save_paths,
     QCB_OT_copy_stream_url,
     QCB_OT_discover,
     QCB_OT_pick_peer,

@@ -125,6 +125,14 @@ def nudge_zoom(delta: float, reset: bool = False) -> None:
                       # packets, and the new offset must still re-apply
 
 
+def set_mappings(mappings) -> None:
+    """Replace the localization table. Called from the IO thread when the
+    host's hello brings its rows; rebinding the module name is atomic, and
+    every user reads `_mappings` at call time."""
+    global _mappings
+    _mappings = list(mappings)
+
+
 def set_shot_mode(on: bool) -> None:
     """Called from the transport IO thread — flags only, no bpy."""
     global _last_hot

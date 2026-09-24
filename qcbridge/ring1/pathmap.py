@@ -30,6 +30,46 @@ class PathMapping:
     label: str = ""
 
 
+def rows_to_wire(mappings) -> list[dict]:
+    """The table as plain dicts: what the agent's config holds, what
+    set_config sends, and what the host's hello carries to the replica."""
+    return [
+        {"win": m.win, "mac": m.mac, "enabled": bool(m.enabled), "label": m.label}
+        for m in mappings
+    ]
+
+
+def rows_from_wire(rows) -> list[PathMapping]:
+    """Dicts back into rows; a malformed entry is skipped, not guessed at."""
+    out: list[PathMapping] = []
+    for r in rows or ():
+        if not isinstance(r, dict):
+            continue
+        win, mac = r.get("win"), r.get("mac")
+        if not isinstance(win, str) or not isinstance(mac, str):
+            continue
+        out.append(PathMapping(
+            win=win, mac=mac, enabled=bool(r.get("enabled", True)), label=str(r.get("label", "")),
+        ))
+    return out
+
+
+def merge_tables(own, received) -> list[PathMapping]:
+    """This machine's rows first, then the peer's rows it does not already
+    have (same roots, case-insensitive on the Windows side). Since
+    2026-09-24 the host's rows ride in the hello, so a replica with an empty
+    table still localizes; a row entered on both ends is not doubled."""
+    def key(m):
+        return (m.win.lower().replace("/", "\\").rstrip("\\"), m.mac.rstrip("/"))
+    out = list(own)
+    seen = {key(m) for m in out}
+    for m in received:
+        if key(m) not in seen:
+            out.append(m)
+            seen.add(key(m))
+    return out
+
+
 def current_os_tag() -> str:
     if sys.platform == "win32":
         return "win"

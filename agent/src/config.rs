@@ -6,6 +6,19 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// One prefix-pair row of the path-mapping table (the addon's decision
+/// #15): a Windows root and the macOS root of the same storage. Owned by
+/// the agent since 2026-09-24; the host's rows ride to the replica in the
+/// hello, so one machine's table serves both ends.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PathMapping {
+    pub win: String,
+    pub mac: String,
+    pub enabled: bool,
+    pub label: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -52,6 +65,12 @@ pub struct Config {
     pub discovery: String,
     /// Shared directory for the phonebook (MinRender's pattern). Empty = off.
     pub phonebook: String,
+    /// Path-mapping rows, served to the addon and (host) sent to the
+    /// replica at pairing.
+    pub path_mappings: Vec<PathMapping>,
+    /// Host: shared cache root for simulation caches (the addon's
+    /// `CACHES.md`). Empty = off.
+    pub cache_root: String,
 }
 
 impl Default for Config {
@@ -75,6 +94,8 @@ impl Default for Config {
             name: String::new(),
             discovery: "direct".into(),
             phonebook: String::new(),
+            path_mappings: Vec::new(),
+            cache_root: String::new(),
         }
     }
 }
@@ -133,6 +154,7 @@ impl Config {
 pub const LIVE_FIELDS: &[&str] = &[
     "peer", "token", "fingerprint", "name", "discovery", "phonebook",
     "blender_path", "blender_args", "kiosk", "idle_secs", "cap_mbps", "capture_scale",
+    "path_mappings", "cache_root",
 ];
 pub const RESTART_FIELDS: &[&str] = &["role", "listen", "local_port", "tray"];
 
@@ -182,11 +204,33 @@ pub fn apply_live(cfg: &mut Config, patch: &serde_json::Value) -> Applied {
             "idle_secs" => match val.as_u64() { Some(n) => { cfg.idle_secs = n; true } None => false },
             "cap_mbps" => match val.as_f64() { Some(f) if f > 0.0 => { cfg.cap_mbps = f; true } _ => false },
             "capture_scale" => match val.as_f64() { Some(f) if f > 0.0 && f <= 1.0 => { cfg.capture_scale = f; true } _ => false },
+            "cache_root" => set_str(&mut cfg.cache_root, val),
+            "path_mappings" => match parse_mappings(val) {
+                Some(rows) => { cfg.path_mappings = rows; true }
+                None => false,
+            },
             _ => false,
         };
         if ok { out.changed.push(key.clone()) } else { out.rejected.push(key.clone()) }
     }
     out
+}
+
+/// A mapping table from JSON: an array of objects with string `win` and
+/// `mac`; `enabled` defaults to true, `label` to "". Anything else is
+/// rejected whole rather than half-applied.
+fn parse_mappings(val: &serde_json::Value) -> Option<Vec<PathMapping>> {
+    let rows = val.as_array()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let o = r.as_object()?;
+        let win = o.get("win")?.as_str()?.to_string();
+        let mac = o.get("mac")?.as_str()?.to_string();
+        let enabled = match o.get("enabled") { None => true, Some(v) => v.as_bool()? };
+        let label = match o.get("label") { None => String::new(), Some(v) => v.as_str()?.to_string() };
+        out.push(PathMapping { win, mac, enabled, label });
+    }
+    Some(out)
 }
 
 fn set_str(slot: &mut String, val: &serde_json::Value) -> bool {
@@ -219,6 +263,8 @@ pub fn live_view(cfg: &Config) -> serde_json::Value {
         "idle_secs": cfg.idle_secs,
         "cap_mbps": cfg.cap_mbps,
         "capture_scale": cfg.capture_scale,
+        "path_mappings": cfg.path_mappings,
+        "cache_root": cfg.cache_root,
         // Restart-only, reported so the addon can show them read-only.
         "role": cfg.role,
         "listen": cfg.listen,
@@ -564,6 +610,37 @@ mod tests {
         let empty = live_view(&Config::default());
         assert_eq!(empty["token_set"], false);
         assert_eq!(empty["srt_passphrase"], "");
+    }
+
+    #[test]
+    fn mappings_and_cache_root_are_live_and_round_trip_through_toml() {
+        let mut cfg = Config::default();
+        let a = apply_live(&mut cfg, &serde_json::json!({
+            "path_mappings": [
+                {"win": "M:\\Jobs", "mac": "/Volumes/Jobs", "label": "jobs"},
+                {"win": "\\\\srv\\Assets", "mac": "/Volumes/Assets", "enabled": false},
+            ],
+            "cache_root": "/Volumes/Jobs/cache",
+        }));
+        assert_eq!(a.changed.len(), 2, "{a:?}");
+        assert_eq!(cfg.path_mappings.len(), 2);
+        assert!(cfg.path_mappings[0].enabled && cfg.path_mappings[0].label == "jobs");
+        assert!(!cfg.path_mappings[1].enabled && cfg.path_mappings[1].label.is_empty());
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.path_mappings, cfg.path_mappings);
+        assert_eq!(back.cache_root, "/Volumes/Jobs/cache");
+        let v = live_view(&cfg);
+        assert_eq!(v["path_mappings"].as_array().unwrap().len(), 2);
+        assert_eq!(v["path_mappings"][0]["win"], "M:\\Jobs");
+        // A malformed table is rejected whole, the old one kept.
+        let a = apply_live(&mut cfg, &serde_json::json!({"path_mappings": [{"win": 1}]}));
+        assert_eq!(a.rejected, vec!["path_mappings"]);
+        assert_eq!(cfg.path_mappings.len(), 2);
+        // Emptying is allowed.
+        let a = apply_live(&mut cfg, &serde_json::json!({"path_mappings": []}));
+        assert_eq!(a.changed, vec!["path_mappings"]);
+        assert!(cfg.path_mappings.is_empty());
     }
 
     #[test]
