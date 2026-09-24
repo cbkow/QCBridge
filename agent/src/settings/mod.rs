@@ -521,44 +521,46 @@ impl App {
         let (mut win, mut mac) = self.shared_root();
         let this_is_win = self.this_side_is_win();
         let mut commit = false;
-        let field_w = ui.available_width() - 120.0 - 100.0;
-        egui::Grid::new("shared").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+        // Two columns only: a text field in a middle Grid column is clamped
+        // to that column's last width and never grows, so the field and
+        // its button share the last column.
+        egui::Grid::new("shared").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label("Windows form");
-            let r = ui.add(egui::TextEdit::singleline(&mut win).desired_width(field_w.max(200.0)).hint_text(r"\\server\share\folder or M:\folder"));
-            if r.lost_focus() || (r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) { commit = true; }
-            if this_is_win {
-                if ui.button("Browse…").clicked() {
+            ui.horizontal(|ui| {
+                let w = ui.available_width() - if this_is_win { 100.0 } else { 12.0 };
+                let r = ui.add(egui::TextEdit::singleline(&mut win).desired_width(w.max(200.0)).hint_text(r"\\server\share\folder or M:\folder"));
+                if r.lost_focus() || (r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) { commit = true; }
+                if this_is_win && ui.button("Browse…").clicked() {
                     if let Some(p) = self.pick_folder(&win) {
                         win = p.clone();
                         if let Some((_, other)) = mounts::other_form(&p, &self.mounts) { if mac.is_empty() { mac = other; } }
                         commit = true;
                     }
                 }
-            } else { ui.label(""); }
+            });
             ui.end_row();
 
             ui.label("macOS form");
-            let r = ui.add(egui::TextEdit::singleline(&mut mac).desired_width(field_w.max(200.0)).hint_text("/Volumes/share/folder"));
-            if r.lost_focus() || (r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) { commit = true; }
-            if !this_is_win {
-                if ui.button("Browse…").clicked() {
+            ui.horizontal(|ui| {
+                let w = ui.available_width() - if this_is_win { 12.0 } else { 100.0 };
+                let r = ui.add(egui::TextEdit::singleline(&mut mac).desired_width(w.max(200.0)).hint_text("/Volumes/share/folder"));
+                if r.lost_focus() || (r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) { commit = true; }
+                if !this_is_win && ui.button("Browse…").clicked() {
                     if let Some(p) = self.pick_folder(&mac) {
                         mac = p.clone();
                         if let Some((_, other)) = mounts::other_form(&p, &self.mounts) { if win.is_empty() { win = other; } }
                         commit = true;
                     }
                 }
-            } else { ui.label(""); }
+            });
             ui.end_row();
 
             let (cache, book) = self.derived(&win, &mac);
             ui.label(RichText::new("caches").weak());
             ui.label(RichText::new(if cache.is_empty() { "—".to_string() } else { cache }).monospace().weak());
-            ui.label("");
             ui.end_row();
             ui.label(RichText::new("phonebook").weak());
             ui.label(RichText::new(if book.is_empty() { "—".to_string() } else { book }).monospace().weak());
-            ui.label("");
             ui.end_row();
         });
         let (cur_win, cur_mac) = self.shared_root();
@@ -574,27 +576,32 @@ impl App {
             || self.draft.rows.len() > 1;
         let title = if custom { "Advanced (in use)" } else { "Advanced" };
         egui::CollapsingHeader::new(title).default_open(custom).show(ui, |ui| {
-            let w = ui.available_width() - 130.0 - 100.0;
-            egui::Grid::new("storage-adv").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+            egui::Grid::new("storage-adv").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Cache root");
-                self.text_field_w(ui, "cache_root", |d| &mut d.cache_root, w)
-                    .on_hover_text("Where the sender writes simulation caches. Normally the shared root's `cache` subfolder.");
-                if ui.button("Browse…").clicked() {
-                    if let Some(p) = self.pick_folder(&self.draft.cache_root.clone()) {
-                        self.draft.cache_root = p.clone();
-                        self.send(json!({"cache_root": p}));
+                ui.horizontal(|ui| {
+                    let w = ui.available_width() - 100.0;
+                    self.text_field_w(ui, "cache_root", |d| &mut d.cache_root, w)
+                        .on_hover_text("Where the sender writes simulation caches. Normally the shared root's `cache` subfolder.");
+                    if ui.button("Browse…").clicked() {
+                        if let Some(p) = self.pick_folder(&self.draft.cache_root.clone()) {
+                            self.draft.cache_root = p.clone();
+                            self.send(json!({"cache_root": p}));
+                        }
                     }
-                }
+                });
                 ui.end_row();
                 ui.label("Phonebook folder");
-                self.text_field_w(ui, "phonebook", |d| &mut d.phonebook, w)
-                    .on_hover_text("Where receivers list themselves. Normally the shared root's `phonebook` subfolder. Empty = off.");
-                if ui.button("Browse…").clicked() {
-                    if let Some(p) = self.pick_folder(&self.draft.phonebook.clone()) {
-                        self.draft.phonebook = p.clone();
-                        self.send(json!({"phonebook": p}));
+                ui.horizontal(|ui| {
+                    let w = ui.available_width() - 100.0;
+                    self.text_field_w(ui, "phonebook", |d| &mut d.phonebook, w)
+                        .on_hover_text("Where receivers list themselves. Normally the shared root's `phonebook` subfolder. Empty = off.");
+                    if ui.button("Browse…").clicked() {
+                        if let Some(p) = self.pick_folder(&self.draft.phonebook.clone()) {
+                            self.draft.phonebook = p.clone();
+                            self.send(json!({"phonebook": p}));
+                        }
                     }
-                }
+                });
                 ui.end_row();
             });
 
@@ -602,7 +609,6 @@ impl App {
             ui.label(RichText::new("More roots — one entry per further storage root the two machines share. Row 1 is the shared root above.").weak());
             let mut remove: Option<usize> = None;
             let n = self.draft.rows.len();
-            let path_w = ui.available_width() - 130.0 - 60.0;
             for i in 0..n {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -614,16 +620,22 @@ impl App {
                     if i > 0 && ui.small_button("✕").on_hover_text("Remove this root").clicked() { remove = Some(i); }
                 });
                 let mut picked: Option<bool> = None; // Some(true) = win column
-                egui::Grid::new(format!("row{i}")).num_columns(3).spacing([12.0, 4.0]).show(ui, |ui| {
+                egui::Grid::new(format!("row{i}")).num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
                     ui.label(RichText::new("Windows").weak());
-                    let row = &mut self.draft.rows[i];
-                    if ui.add(egui::TextEdit::singleline(&mut row.win).desired_width(path_w.max(200.0))).changed() { self.draft.rows_dirty = true; }
-                    if this_is_win { if ui.small_button("…").clicked() { picked = Some(true); } } else { ui.label(""); }
+                    ui.horizontal(|ui| {
+                        let w = ui.available_width() - if this_is_win { 40.0 } else { 12.0 };
+                        let row = &mut self.draft.rows[i];
+                        if ui.add(egui::TextEdit::singleline(&mut row.win).desired_width(w.max(200.0))).changed() { self.draft.rows_dirty = true; }
+                        if this_is_win && ui.small_button("…").clicked() { picked = Some(true); }
+                    });
                     ui.end_row();
                     ui.label(RichText::new("macOS").weak());
-                    let row = &mut self.draft.rows[i];
-                    if ui.add(egui::TextEdit::singleline(&mut row.mac).desired_width(path_w.max(200.0))).changed() { self.draft.rows_dirty = true; }
-                    if !this_is_win { if ui.small_button("…").clicked() { picked = Some(false); } } else { ui.label(""); }
+                    ui.horizontal(|ui| {
+                        let w = ui.available_width() - if this_is_win { 12.0 } else { 40.0 };
+                        let row = &mut self.draft.rows[i];
+                        if ui.add(egui::TextEdit::singleline(&mut row.mac).desired_width(w.max(200.0))).changed() { self.draft.rows_dirty = true; }
+                        if !this_is_win && ui.small_button("…").clicked() { picked = Some(false); }
+                    });
                     ui.end_row();
                 });
                 if let Some(for_win) = picked {
