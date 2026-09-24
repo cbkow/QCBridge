@@ -284,6 +284,7 @@ def _start_host(prefs) -> None:
                 seq=sync.seq if sync else 0,
                 seq_fast=getattr(sync, "seq_fast", 0) if sync else 0,
                 mappings=pathmap.rows_to_wire(mappings),
+                shared_root=_shared_root_card(transport),
             )
             pending["req"] = transport.request_nowait(hello)
             pending["sent_at"] = now
@@ -293,6 +294,7 @@ def _start_host(prefs) -> None:
             if reply.get("ok"):
                 state["peer_epoch"] = reply.get("epoch")
                 state["peer_stream"] = reply.get("stream") or {}
+                _adopt_pair_row(transport, _shared_root_card(transport), reply.get("shared_root") or {})
                 state["peer_addon"] = reply.get("addon", "")
                 state["note"] = "connected"
                 state["resync_policy"].reset()
@@ -416,6 +418,7 @@ def _start_replica(prefs) -> None:
                 # first, the host's rows it lacks after them.
                 received = pathmap.rows_from_wire(msg.get("mappings"))
                 replica_apply.set_mappings(pathmap.merge_tables(own_rows["rows"], received))
+                _adopt_pair_row(transport, _shared_root_card(transport), msg.get("shared_root") or {})
                 state["host_mappings"] = len(received)
                 if state["peer_epoch"] != msg.get("epoch"):
                     replica_apply.notify_new_session(msg.get("seq", 0), msg.get("seq_fast", 0))
@@ -425,6 +428,7 @@ def _start_replica(prefs) -> None:
             return {
                 "kind": "hello_reply", "ok": ok, "reason": reason,
                 "epoch": epoch, "stream": stream_info,
+                "shared_root": _shared_root_card(transport),
                 "addon": our_version,
             }
         if msg.get("kind") == "goodbye":
@@ -550,6 +554,34 @@ def _effective_cache_root(prefs, transport) -> str:
     if getattr(transport, "agent_mode", False) and cfg.get("cache_root"):
         return str(cfg["cache_root"])
     return getattr(prefs, "cache_root", "") or ""
+
+
+def _shared_root_card(transport) -> dict:
+    """This machine's shared folder for the hello / hello reply."""
+    cfg = getattr(transport, "agent_config", None) or {}
+    root = str(cfg.get("shared_root") or "")
+    return {"path": root, "os": pathmap.current_os_tag()} if root else {}
+
+
+def _adopt_pair_row(transport, ours: dict, theirs: dict) -> None:
+    """Both machines named their shared folder; on a mixed pair that is a
+    mapping row, and the agent that lacks it gets it. No bpy: safe on the
+    IO thread. Same-OS pairs need no row."""
+    if not ours or not theirs:
+        return
+    if ours.get("os") == theirs.get("os") or not getattr(transport, "agent_mode", False):
+        return
+    win = ours["path"] if ours["os"] == "win" else theirs["path"]
+    mac = ours["path"] if ours["os"] == "mac" else theirs["path"]
+    if not win or not mac:
+        return
+    cfg = getattr(transport, "agent_config", None) or {}
+    rows = pathmap.rows_from_wire(cfg.get("path_mappings"))
+    new = pathmap.PathMapping(win=win, mac=mac, enabled=True, label="shared")
+    merged = pathmap.merge_tables(rows, [new])
+    if len(merged) != len(rows):
+        transport.set_config(path_mappings=pathmap.rows_to_wire(merged))
+        print("qcbridge: mapping row for the shared folder formed at pairing", flush=True)
 
 
 def _push_paths_to_agent(prefs, transport) -> None:

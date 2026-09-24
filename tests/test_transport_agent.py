@@ -305,6 +305,8 @@ def test_mappings_and_cache_root_live_in_the_agent(pair):
     host, replica = pair
     assert wait_for(lambda: host.peer_alive)
     assert host.agent_config["path_mappings"] == [] and host.agent_config["cache_root"] == ""
+    reply = wait_reply(host, host.set_config(shared_root="/Volumes/Jobs"))
+    assert reply and reply["changed"] == ["shared_root"] and host.agent_config["shared_root"] == "/Volumes/Jobs"
     rows = [{"win": "M:\\Jobs", "mac": "/Volumes/Jobs", "enabled": True, "label": "jobs"}]
     reply = wait_reply(host, host.set_config(path_mappings=rows, cache_root="/Volumes/Jobs/cache"))
     assert reply and sorted(reply["changed"]) == ["cache_root", "path_mappings"], reply

@@ -71,6 +71,10 @@ pub struct Config {
     /// Host: shared cache root for simulation caches (the addon's
     /// `CACHES.md`). Empty = off.
     pub cache_root: String,
+    /// The shared storage folder as this machine sees it. The other
+    /// machine's spelling is the mapping table's business: a row forms at
+    /// pairing when the two run different systems.
+    pub shared_root: String,
 }
 
 impl Default for Config {
@@ -96,6 +100,7 @@ impl Default for Config {
             phonebook: String::new(),
             path_mappings: Vec::new(),
             cache_root: String::new(),
+            shared_root: String::new(),
         }
     }
 }
@@ -154,7 +159,7 @@ impl Config {
 pub const LIVE_FIELDS: &[&str] = &[
     "peer", "token", "fingerprint", "name", "discovery", "phonebook",
     "blender_path", "blender_args", "kiosk", "idle_secs", "cap_mbps", "capture_scale",
-    "path_mappings", "cache_root",
+    "path_mappings", "cache_root", "shared_root",
     // Live since 2026-09-24: a change rebuilds the role runtime in place
     // (the Send/Receive switch; a replica re-listening on a new address).
     "role", "listen",
@@ -209,6 +214,7 @@ pub fn apply_live(cfg: &mut Config, patch: &serde_json::Value) -> Applied {
             "cap_mbps" => match val.as_f64() { Some(f) if f > 0.0 => { cfg.cap_mbps = f; true } _ => false },
             "capture_scale" => match val.as_f64() { Some(f) if f > 0.0 && f <= 1.0 => { cfg.capture_scale = f; true } _ => false },
             "cache_root" => set_str(&mut cfg.cache_root, val),
+            "shared_root" => set_str(&mut cfg.shared_root, val),
             "role" => match val.as_str() {
                 Some(r) if ROLES.contains(&r) => { cfg.role = r.into(); true }
                 _ => false,
@@ -277,6 +283,7 @@ pub fn live_view(cfg: &Config) -> serde_json::Value {
         "capture_scale": cfg.capture_scale,
         "path_mappings": cfg.path_mappings,
         "cache_root": cfg.cache_root,
+        "shared_root": cfg.shared_root,
         // Restart-only, reported so the addon can show them read-only.
         "role": cfg.role,
         "listen": cfg.listen,

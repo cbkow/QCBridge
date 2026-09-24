@@ -137,6 +137,7 @@ def token_fingerprint(token: str) -> str:
 def make_hello(
     token: str, epoch: str, blender_version: str, addon_version: str = "",
     seq: int = 0, seq_fast: int = 0, mappings: list | None = None,
+    shared_root: dict | None = None,
 ) -> dict:
     return {
         "kind": "hello",
@@ -145,6 +146,10 @@ def make_hello(
         # localize with the host's table alone (2026-09-24). Absent from an
         # older host: the replica uses only its own rows, as before.
         "mappings": list(mappings or []),
+        # The sender's shared storage folder as it sees it, with its OS
+        # tag; the receiver answers with its own, and on a mixed pair each
+        # side forms the mapping row from the two (2026-09-24).
+        "shared_root": dict(shared_root or {}),
         "epoch": epoch,
         # Where the host's lane counters stand, so the replica primes its
         # trackers: a lost first message after a re-handshake is still a gap.

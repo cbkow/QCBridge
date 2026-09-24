@@ -148,3 +148,9 @@ def test_hello_carries_the_mapping_rows():
     h = protocol.make_hello("s", "e", "5.2", mappings=[{"win": "M:\\J", "mac": "/Volumes/J", "enabled": True, "label": ""}])
     assert h["mappings"][0]["mac"] == "/Volumes/J"
     assert protocol.make_hello("s", "e", "5.2")["mappings"] == []
+
+
+def test_hello_carries_the_shared_root_card():
+    h = protocol.make_hello("s", "e", "5.2", shared_root={"path": "/Volumes/x", "os": "mac"})
+    assert h["shared_root"] == {"path": "/Volumes/x", "os": "mac"}
+    assert protocol.make_hello("s", "e", "5.2")["shared_root"] == {}
