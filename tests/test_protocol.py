@@ -130,3 +130,15 @@ def test_srt_passphrase_derivation():
     assert 10 <= len(p) <= 79  # SRT's hard requirement, even for short tokens
     assert p != protocol.srt_passphrase("other")
     assert protocol.srt_passphrase("") == ""
+
+
+def test_derived_secrets_match_the_agent():
+    """The same vectors as agent/src/secrets.rs: both languages must derive
+    identical values or the two ends never pair."""
+    assert protocol.token_fingerprint("tok") == "e796aeb8"
+    assert protocol.srt_passphrase("tok") == "394281a840f6f63396e7ee2ea3acc796"
+    assert protocol.hello_secret("tok") == (
+        "19d5258551c4531785e33f9c5b1a342d065834ad401871638842e198d69bc92a"
+    )
+    assert protocol.srt_passphrase("devtoken") == "22ac324cdd19e313f70edd1316823d94"
+    assert protocol.token_fingerprint("") == "" and protocol.hello_secret("") == ""

@@ -113,6 +113,27 @@ def srt_passphrase(token: str) -> str:
     return hashlib.sha256(f"qcb-srt:{token}".encode()).hexdigest()[:32]
 
 
+def hello_secret(token: str) -> str:
+    """What the hello carries and checks in agent mode (2026-09-24): the
+    agent keeps the token and hands each end this derivation, so the raw
+    token never reaches Blender. Mirrored in agent/src/secrets.rs."""
+    if not token:
+        return ""
+    import hashlib
+
+    return hashlib.sha256(f"qcb-hello:{token}".encode()).hexdigest()
+
+
+def token_fingerprint(token: str) -> str:
+    """Eight hex characters to compare across the two ends without either
+    showing its token. Mirrored in agent/src/secrets.rs."""
+    if not token:
+        return ""
+    import hashlib
+
+    return hashlib.sha256(f"qcb-token:{token}".encode()).hexdigest()[:8]
+
+
 def make_hello(
     token: str, epoch: str, blender_version: str, addon_version: str = "",
     seq: int = 0, seq_fast: int = 0,

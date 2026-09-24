@@ -66,11 +66,17 @@ libc = "0.2"
 # with the agent, AttachConsole for --version from a terminal, and the
 # message box a start failure shows (there is no console to print to).
 # 0.61 is the copy tokio and tray-icon already bring in; adds no packages.
+# Win32_Security_Credentials: the token lives in Credential Manager.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
-    "Win32_Foundation", "Win32_Security", "Win32_System_Threading",
+    "Win32_Foundation", "Win32_Security", "Win32_Security_Credentials", "Win32_System_Threading",
     "Win32_System_JobObjects", "Win32_System_Console", "Win32_UI_WindowsAndMessaging",
 ] }
+
+# Security.framework dictionaries for the Keychain item that holds the
+# token. 0.10 is the copy tao/cocoa already bring in; adds no packages.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
 
 [profile.release]
 debug = 1

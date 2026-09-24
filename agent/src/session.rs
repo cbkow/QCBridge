@@ -48,7 +48,9 @@ pub trait PeerObserver: Send + Sync {
 
 pub struct Ctx {
     pub role_host: bool,
-    pub token: String,
+    /// Read at each handshake, so a token set at runtime is the one checked
+    /// and sent; a copy taken at start would have needed a restart.
+    pub cfg: crate::config::SharedConfig,
     pub link: Arc<Link>,
     pub inb: Arc<Inbound>,
     pub control_rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
@@ -238,7 +240,8 @@ pub async fn serve_one(ctx: Arc<Ctx>, endpoint: &quinn::Endpoint) -> Result<()> 
     let token = recv_msg(&mut control_recv)
         .await?
         .ok_or_else(|| anyhow!("peer closed before sending a token"))?;
-    if !tokens_match(&token, ctx.token.as_bytes()) {
+    let ours = ctx.cfg.with(|c| c.token.clone());
+    if !tokens_match(&token, ours.as_bytes()) {
         conn.close(CLOSE_TOKEN.into(), b"token rejected");
         bail!("peer token mismatch; rejected");
     }
@@ -420,7 +423,8 @@ async fn dial(
     // what keeps a rejected token from ever looking like a live peer.
     let (mut control_send, mut control_recv) = conn.open_bi().await.context("open control lane")?;
     write_tag(&mut control_send, LANE_CONTROL).await?;
-    send_msg(&mut control_send, ctx.token.as_bytes()).await.context("send token")?;
+    let ours = ctx.cfg.with(|c| c.token.clone());
+    send_msg(&mut control_send, ours.as_bytes()).await.context("send token")?;
     let reply = tokio::time::timeout(HANDSHAKE, recv_msg(&mut control_recv))
         .await
         .context("auth reply timeout")?

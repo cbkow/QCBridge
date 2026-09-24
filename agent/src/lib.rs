@@ -372,6 +372,7 @@ pub fn load_or_create_cert(
         let key_der = ck.key_pair.serialize_der();
         std::fs::write(&cert_path, &cert_der)?;
         std::fs::write(&key_path, &key_der)?;
+        crate::secrets::owner_only(&key_path);
         (cert_der, key_der)
     };
     if cert_der.is_empty() || key_der.is_empty() {
@@ -523,5 +524,6 @@ pub mod discovery;
 pub mod config;
 pub mod link;
 pub mod platform;
+pub mod secrets;
 pub mod session;
 pub mod video;

@@ -208,7 +208,6 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
     if let Some(r) = args.get("role") { cfg.role = r.to_string(); }
     if let Some(l) = args.get("listen") { cfg.listen = l.to_string(); }
     if let Some(p) = args.get("peer") { cfg.peer = p.to_string(); }
-    if let Some(t) = args.get("token") { cfg.token = t.to_string(); }
     if let Some(p) = args.get("local-port") { cfg.local_port = p.parse()?; }
     if args.flag("no-tray") { cfg.tray = false; }
     // A spawned agent belongs to whoever spawned it. Without this it
@@ -218,6 +217,13 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
     let exit_with_addon = args.flag("exit-with-addon");
     let role_host = cfg.role == "host";
     log!("[agent] {VERSION} role={} config={}", cfg.role, cfg_path.display());
+    // The token comes from its store (keychain, file), never from the TOML
+    // — except once, to move an old clear-text entry out of it. After the
+    // --role override: the store is per role.
+    if let Some(note) = config::load_token(&cfg_path, &mut cfg)? {
+        log!("[agent] {note}");
+    }
+    if let Some(t) = args.get("token") { cfg.token = t.to_string(); } // in memory only
     // Children die with the agent, whichever way it goes: a hard kill must
     // not leave Blender, the helper and ffmpeg holding its ports.
     if let Err(e) = platform::install_job_object() {
@@ -301,7 +307,7 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
     };
     let ctx = Arc::new(Ctx {
         role_host,
-        token: cfg.token.clone(),
+        cfg: shared.clone(),
         link: link.clone(),
         inb: inb.clone(),
         control_rx: tokio::sync::Mutex::new(control_rx),
@@ -491,6 +497,17 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
                 if let Err(e) = config::save(&agent.cfg_path, &snapshot) {
                     log!("[agent] could not persist config: {e}");
                 }
+                if applied.changed.iter().any(|f| f == "token") {
+                    // save() left it out of the TOML; its home is the store.
+                    match qcbridge_agent::secrets::store(&snapshot.token_store, &agent.base, &snapshot.role, &snapshot.token) {
+                        Ok(()) => log!("[agent] token {} ({})", if snapshot.token.is_empty() { "cleared" } else { "set" },
+                            qcbridge_agent::secrets::fingerprint(&snapshot.token)),
+                        Err(e) => {
+                            log!("[agent] token could not be stored: {e:#}");
+                            agent.link.event_blocking(json!({"event": "error", "msg": format!("token not stored: {e:#}")}));
+                        }
+                    }
+                }
                 if applied.changed.iter().any(|f| f == "peer") && agent.cfg.is_host() {
                     retarget(agent, snapshot.peer.clone(), snapshot.fingerprint.clone());
                 }
@@ -567,6 +584,14 @@ mod tray {
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     use tray_icon::{Icon, TrayIconBuilder};
 
+    /// The fingerprint, never the token: two people can compare eight hex
+    /// characters over a call without either reading theirs out.
+    fn token_text(cfg: &SharedConfig) -> String {
+        cfg.with(|c| if c.token.is_empty() { "token: not set".to_string() } else {
+            format!("token: set · {}", qcbridge_agent::secrets::fingerprint(&c.token))
+        })
+    }
+
     fn icon() -> Icon {
         // A filled circle; the real bundle will ship a proper asset.
         let (w, h) = (32u32, 32u32);
@@ -595,6 +620,7 @@ mod tray {
             if agent.replica_fingerprint.is_empty() { "fingerprint: (host role)".to_string() } else { format!("fingerprint {}…", &agent.replica_fingerprint[..16]) },
             false, None,
         );
+        let token_item = MenuItem::new(token_text(&agent.cfg), false, None);
         let start_item = MenuItem::new("Launch Blender now", !agent.cfg.is_host(), None);
         let stop_item = MenuItem::new("Close Blender", !agent.cfg.is_host(), None);
         let config_item = MenuItem::new("Open config folder", true, None);
@@ -619,7 +645,7 @@ mod tray {
         };
 
         menu.append_items(&[
-            &status_item, &info_item, &fp_item, &PredefinedMenuItem::separator(),
+            &status_item, &info_item, &fp_item, &token_item, &PredefinedMenuItem::separator(),
             &network, &PredefinedMenuItem::separator(),
             &start_item, &stop_item, &PredefinedMenuItem::separator(),
             &config_item, &quit_item,
@@ -637,6 +663,7 @@ mod tray {
         let rx = MenuEvent::receiver();
         let mut last_status = String::new();
         let mut last_info = String::new();
+        let mut last_token = String::new();
         let mut last_tooltip = String::new();
         let mut last_mode = mode0;
         event_loop.run(move |event, _, control_flow| {
@@ -662,6 +689,11 @@ mod tray {
             if info != last_info {
                 info_item.set_text(&info);
                 last_info = info;
+            }
+            let token = token_text(&agent.cfg);
+            if token != last_token {
+                token_item.set_text(&token);
+                last_token = token;
             }
             let mode = agent.cfg.with(|c| c.discovery.clone());
             if mode != last_mode {

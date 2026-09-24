@@ -11,8 +11,15 @@ use std::sync::{Arc, Mutex};
 pub struct Config {
     /// "replica" (listens, runs Blender for a host) or "host".
     pub role: String,
-    /// Session token, checked at the QUIC layer and again by the addon's hello.
+    /// Session token, checked at the QUIC layer and again by the addon's
+    /// hello. In memory only: `save` never writes it, `load` takes it from
+    /// the store named by `token_store` (a value found in the TOML is
+    /// migrated there once).
     pub token: String,
+    /// "keychain" (default: macOS Keychain / Windows Credential Manager),
+    /// "file" (owner-only file beside the config), or "toml" (clear text in
+    /// this file, the pre-2026-09-24 behaviour).
+    pub token_store: String,
     /// Replica: UDP listen address. Host: the replica's address.
     pub listen: String,
     pub peer: String,
@@ -52,6 +59,7 @@ impl Default for Config {
         Self {
             role: "replica".into(),
             token: String::new(),
+            token_store: "keychain".into(),
             listen: "0.0.0.0:19990".into(),
             peer: "127.0.0.1:19990".into(),
             fingerprint: String::new(),
@@ -189,13 +197,17 @@ fn set_str(slot: &mut String, val: &serde_json::Value) -> bool {
 }
 
 /// The live fields as JSON — the body of the `config` event and part of the
-/// attach reply. The token is included: this crosses the loopback socket
-/// under a per-start secret, the same trust domain that already carries it
-/// in QCB_AGENT_TOKEN.
+/// attach reply. The token itself is not in it: the addon gets what it
+/// consumes — the SRT passphrase and the hello secret — and a fingerprint
+/// to compare with the other end, so the raw token never leaves the agent.
 pub fn live_view(cfg: &Config) -> serde_json::Value {
     serde_json::json!({
         "peer": cfg.peer,
-        "token": cfg.token,
+        "token_set": !cfg.token.is_empty(),
+        "token_fingerprint": crate::secrets::fingerprint(&cfg.token),
+        "srt_passphrase": crate::secrets::srt_passphrase(&cfg.token),
+        "hello_secret": crate::secrets::hello_secret(&cfg.token),
+        "token_store": cfg.token_store,
         "fingerprint": cfg.fingerprint,
         "name": cfg.display_name(),
         "name_is_default": cfg.name.trim().is_empty(),
@@ -304,18 +316,68 @@ pub fn cert_dir(base: &Path) -> PathBuf {
 pub fn load_or_create(path: &PathBuf) -> Result<Config> {
     if path.exists() {
         let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        return toml::from_str(&text).with_context(|| format!("parse {}", path.display()));
+        let cfg: Config = toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        if !crate::secrets::STORES.contains(&cfg.token_store.as_str()) {
+            anyhow::bail!("token_store must be one of {:?} in {}", crate::secrets::STORES, path.display());
+        }
+        return Ok(cfg);
     }
     let cfg = Config::default();
     save(path, &cfg)?;
     Ok(cfg)
 }
 
+/// Fill `cfg.token` from its store, after `load_or_create`. A token still
+/// written in the TOML (the old layout) is moved into the store and the
+/// file rewritten without it; if the store refuses, the TOML keeps it and
+/// the returned note says so. Returns a line for the log, if anything
+/// happened.
+pub fn load_token(path: &PathBuf, cfg: &mut Config) -> Result<Option<String>> {
+    let base = base_dir(path);
+    if cfg.token_store == "toml" {
+        return Ok(None);
+    }
+    let in_toml = std::mem::take(&mut cfg.token);
+    match crate::secrets::load(&cfg.token_store, &base, &cfg.role)? {
+        Some(stored) => {
+            cfg.token = stored;
+            if !in_toml.is_empty() {
+                // The store wins; the clear-text copy goes.
+                save(path, cfg)?;
+                return Ok(Some(format!("token: using the {} entry; removed the copy from {}", cfg.token_store, path.display())));
+            }
+            Ok(None)
+        }
+        None if !in_toml.is_empty() => {
+            cfg.token = in_toml;
+            match crate::secrets::store(&cfg.token_store, &base, &cfg.role, &cfg.token) {
+                Ok(()) => {
+                    save(path, cfg)?;
+                    Ok(Some(format!("token: moved from {} into the {}", path.display(), cfg.token_store)))
+                }
+                Err(e) => {
+                    // Keep it where it was rather than lose it; say so.
+                    cfg.token_store = "toml".into();
+                    Ok(Some(format!("token: could not move it into the store ({e:#}); it stays in {}", path.display())))
+                }
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+/// Write the TOML. The token is left out unless `token_store` is "toml":
+/// its home is the store, and a config file that is copied, pasted into a
+/// chat or backed up must not carry it.
 pub fn save(path: &PathBuf, cfg: &Config) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, toml::to_string_pretty(cfg)?)?;
+    let mut on_disk = cfg.clone();
+    if on_disk.token_store != "toml" {
+        on_disk.token.clear();
+    }
+    std::fs::write(path, toml::to_string_pretty(&on_disk)?)?;
     Ok(())
 }
 
@@ -342,6 +404,7 @@ pub fn write_socket_info(base: &Path, role: &str, port: u16, secret: &str) -> Re
         }
         doc[role] = mine.clone();
         std::fs::write(&path, doc.to_string())?;
+        crate::secrets::owner_only(&path);
         std::thread::sleep(std::time::Duration::from_millis(50 + 30 * attempt));
         let back: Option<serde_json::Value> = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok());
         if back.as_ref().and_then(|d| d.get(role)) == Some(&mine) {
@@ -436,6 +499,71 @@ mod tests {
         assert_eq!(cfg.discovery, "direct");
         assert!(cfg.name.is_empty() && cfg.phonebook.is_empty());
         assert!(!cfg.display_name().is_empty(), "falls back to the machine name");
+    }
+
+    #[test]
+    fn save_leaves_the_token_out_unless_the_store_is_toml() {
+        let dir = std::env::temp_dir().join(format!("qcb-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("agent.toml");
+        let mut cfg = Config { token: "s3cret".into(), ..Config::default() };
+        save(&path, &cfg).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(text.contains("token_store = \"keychain\""));
+        cfg.token_store = "toml".into();
+        save(&path, &cfg).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("s3cret"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The old layout: a token in the TOML moves into the store (the file
+    /// store here, so the test touches no keychain) and leaves the TOML.
+    #[test]
+    fn a_toml_token_is_migrated_into_the_store() {
+        let dir = std::env::temp_dir().join(format!("qcb-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.toml");
+        std::fs::write(&path, "role = \"replica\"\ntoken = \"legacy\"\ntoken_store = \"file\"\n").unwrap();
+        let mut cfg = load_or_create(&path).unwrap();
+        assert_eq!(cfg.token, "legacy");
+        let note = load_token(&path, &mut cfg).unwrap();
+        assert!(note.unwrap().contains("moved"));
+        assert_eq!(cfg.token, "legacy");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("legacy"));
+        assert_eq!(crate::secrets::load("file", &dir, "replica").unwrap().as_deref(), Some("legacy"));
+        // Second start: the store is the source.
+        let mut again = load_or_create(&path).unwrap();
+        assert!(again.token.is_empty());
+        assert!(load_token(&path, &mut again).unwrap().is_none());
+        assert_eq!(again.token, "legacy");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bad_token_store_is_refused_at_load() {
+        let dir = std::env::temp_dir().join(format!("qcb-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.toml");
+        std::fs::write(&path, "token_store = \"vault\"\n").unwrap();
+        assert!(load_or_create(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_live_view_carries_derived_values_not_the_token() {
+        let cfg = Config { token: "tok".into(), ..Config::default() };
+        let v = live_view(&cfg);
+        assert!(v.get("token").is_none());
+        assert_eq!(v["token_set"], true);
+        assert_eq!(v["token_fingerprint"], "e796aeb8");
+        assert_eq!(v["srt_passphrase"], "394281a840f6f63396e7ee2ea3acc796");
+        assert_eq!(v["hello_secret"].as_str().unwrap().len(), 64);
+        let empty = live_view(&Config::default());
+        assert_eq!(empty["token_set"], false);
+        assert_eq!(empty["srt_passphrase"], "");
     }
 
     #[test]

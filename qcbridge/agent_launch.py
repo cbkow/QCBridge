@@ -29,7 +29,7 @@ def _dev_prefs():
     return SimpleNamespace(
         role="REPLICA", replica_address="", bind_address="0.0.0.0",
         port_control=19990, port_hot=19991, port_cold=19992,
-        token=os.environ.get("QCB_AGENT_TOKEN", ""),
+        token="",  # the agent keeps it; the attach reply carries the derivations
         enable_stream=os.environ.get("QCB_AGENT_STREAM", "1") == "1",
         srt_port=9998, srt_url="", srt_latency_ms=60,
         encoder_rung="hevc_10_420_50", ffmpeg_path="",
@@ -43,8 +43,8 @@ def run() -> None:
     prefs = _prefs()
     if prefs is not None:
         prefs.role = "REPLICA"
-        if os.environ.get("QCB_AGENT_TOKEN"):
-            prefs.token = os.environ["QCB_AGENT_TOKEN"]
+        # No token here since 2026-09-24: the agent never exports it, and
+        # the session takes the derived secrets from the attach reply.
         prefs.replica_kiosk = os.environ.get("QCB_AGENT_KIOSK", "1") == "1"
         if hasattr(prefs, "transport"):
             prefs.transport = "AGENT"

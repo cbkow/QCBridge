@@ -347,6 +347,10 @@ def spawn_agent(cfg: TransportConfig, role: str) -> tuple[tuple[str, int, str], 
     lines = [
         f'role = "{role}"',
         f'token = "{getattr(cfg, "token", "") or "qcbridge"}"',
+        # A spawned agent must not touch the user's keychain: its token
+        # lives in an owner-only file in this directory (the agent moves
+        # it there from this line on first start) and dies with it.
+        'token_store = "file"',
         f'listen = "{peer}"' if role == "replica" else f'peer = "{peer}"',
         'blender_path = ""',   # whoever spawned us already has Blender
         "tray = false",
@@ -449,7 +453,7 @@ class HostTransportAgent:
 
     def wait_attached(self, timeout: float = 3.0) -> bool:
         """True once the agent's `attached` reply — and with it agent_config —
-        has arrived. The session reads the token and peer from there."""
+        has arrived. The session reads the derived secrets and peer from there."""
         return self._attached.wait(timeout)
 
     def start(self) -> None:

@@ -113,8 +113,8 @@ impl Lifecycle {
         // and it suits a machine where Blender is started by hand.
         // One read of the shared config, so a launch cannot see half of an
         // edit made while it was assembling the command.
-        let (path, args, token, kiosk) = self.cfg.with(|c| {
-            (c.blender_path.clone(), c.blender_args.clone(), c.token.clone(), c.kiosk)
+        let (path, args, kiosk) = self.cfg.with(|c| {
+            (c.blender_path.clone(), c.blender_args.clone(), c.kiosk)
         });
         if path.trim().is_empty() {
             self.set_status("connected (Blender supervision off)");
@@ -137,7 +137,8 @@ impl Lifecycle {
             .arg(LAUNCH_EXPR)
             .env("QCB_AGENT_PORT", self.local_port.to_string())
             .env("QCB_AGENT_SECRET", &self.secret)
-            .env("QCB_AGENT_TOKEN", &token)
+            // No QCB_AGENT_TOKEN any more: the addon takes the derived
+            // secrets from the attach reply; the token stays in the agent.
             .env("QCB_AGENT_KIOSK", if kiosk { "1" } else { "0" })
             .env("QCB_TRANSPORT", "agent")
             .stdin(Stdio::null())

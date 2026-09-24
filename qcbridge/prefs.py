@@ -383,6 +383,40 @@ class QCB_OT_pick_peer(Operator):
         return {"FINISHED"}
 
 
+class QCB_OT_agent_set_token(Operator):
+    bl_idname = "qcbridge.agent_set_token"
+    bl_label = "Set Session Token"
+    bl_description = (
+        "Give the agent the session token (the same on both ends). It is "
+        "kept in the OS keychain by the agent, never in these preferences"
+    )
+    bl_options = {"INTERNAL"}
+
+    # Not a preference: typed, sent, forgotten.
+    token: bpy.props.StringProperty(name="Token", subtype="PASSWORD", options={"SKIP_SAVE"})
+
+    @classmethod
+    def poll(cls, context):
+        return session.running() and _agent_transport() is not None
+
+    def invoke(self, context, event):
+        self.token = ""
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        self.layout.prop(self, "token")
+        self.layout.label(text="Empty clears it. Both agents must hold the same token.", icon="INFO")
+
+    def execute(self, context):
+        t = _agent_transport()
+        if t is None:
+            return {"CANCELLED"}
+        t.set_config(token=self.token)
+        self.token = ""
+        self.report({"INFO"}, "token sent to the agent")
+        return {"FINISHED"}
+
+
 class QCB_OT_copy_stream_url(Operator):
     bl_idname = "qcbridge.copy_stream_url"
     bl_label = "Copy Stream URL"
@@ -528,6 +562,14 @@ class QCBridgePreferences(AddonPreferences):
                     col.label(text=f"Pinned replica cert: {fp[:16] + '…' if fp else '(learn on first use)'}")
                 else:
                     col.label(text=f"Listens: {ac.get('listen', '?')}  ·  {ac.get('discovery', '?')}")
+                # The agent holds the token; only its fingerprint is shown,
+                # so the two ends can compare without reading a secret out.
+                row = col.row(align=True)
+                if ac.get("token_set"):
+                    row.label(text=f"Token: set · {ac.get('token_fingerprint', '')}", icon="LOCKED")
+                else:
+                    row.label(text="Token: not set", icon="UNLOCKED")
+                row.operator("qcbridge.agent_set_token", text="", icon="GREASEPENCIL")
             else:
                 box.label(text="Start a session to see the agent's settings", icon="INFO")
             if self.role == "HOST":
@@ -535,7 +577,6 @@ class QCBridgePreferences(AddonPreferences):
             else:
                 box.prop(self, "bind_address")
             box.prop(self, "port_control", text="Port (when overriding)")
-            box.prop(self, "token", text="Token (fallback)")
         else:
             box.label(text="Connection")
             if self.role == "HOST":
@@ -662,6 +703,7 @@ _classes = (
     QCB_OT_shot_mode,
     QCB_OT_replica_zoom,
     QCB_OT_open_qcview,
+    QCB_OT_agent_set_token,
     QCB_OT_copy_stream_url,
     QCB_OT_discover,
     QCB_OT_pick_peer,

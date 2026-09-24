@@ -39,6 +39,17 @@ ffmpeg it started, so the next agent never finds its ports taken. One
 agent per role and directory, exactly. Autostart is a Run-key value
 (`agent/windows/autostart.ps1`) instead of a scheduled task.
 
+**The token stays in the agent.** It lives in the OS credential store
+(macOS Keychain, Windows Credential Manager; an owner-only file where
+there is neither, or `token_store` says so), `agent.toml` never carries
+it, and a token found there from an older install is moved out on the
+first start. Blender never sees it: the agent hands the addon the SRT
+passphrase and a hello secret derived from it, and both ends show an
+eight-character fingerprint so two people can tell they typed different
+tokens without reading theirs out. The token is set from the panel's
+lock icon (the agent's window, later); the addon's own token field
+remains only for the zmq fallback.
+
 **Faster, and honest about it.** An edit reaches the replica in about
 105 ms (it was ~185), a visibility toggle or rename in about 200 ms (it
 was ~500), and a small edit no longer waits behind a large mesh: deltas

@@ -192,11 +192,34 @@ def _check_address(address: str) -> str:
         return f"replica address does not resolve: {address!r} — check preferences"
 
 
-def _effective_token(prefs, transport) -> str:
-    """The token in force. In agent mode the agent owns it and reports it at
-    attach; the addon's pref is the fallback, and the value for zmq."""
+def _agent_secrets(transport) -> tuple[str, str] | None:
+    """(hello secret, SRT passphrase) as the agent reports them, or None
+    before the attach reply has arrived. No bpy: safe on the IO thread. An
+    older agent that still mirrored `token` is handled by deriving here."""
     cfg = getattr(transport, "agent_config", None) or {}
-    return cfg.get("token") or prefs.token
+    if cfg.get("hello_secret") is not None and cfg.get("srt_passphrase") is not None:
+        return cfg["hello_secret"], cfg["srt_passphrase"]
+    if cfg.get("token"):
+        return protocol.hello_secret(cfg["token"]), protocol.srt_passphrase(cfg["token"])
+    return None
+
+
+def _secrets(prefs, transport, fallback_token: str | None = None) -> tuple[str, str]:
+    """(hello secret, SRT passphrase) in force. In agent mode the agent owns
+    the token and reports only these derivations at attach (2026-09-24);
+    the addon's own token pref is the zmq fallback, derived here the same
+    way the agent does it. Read at the moment of use, not captured at
+    start: the replica's attach reply lands after its session starts, and
+    a secret captured before it is empty (the first paired run said
+    "token mismatch" for exactly that). `fallback_token` stands in for
+    `prefs.token` where bpy must not be touched."""
+    from_agent = _agent_secrets(transport)
+    if from_agent is not None:
+        return from_agent
+    if getattr(transport, "agent_mode", False):
+        return "", ""  # attached but nothing mirrored: refuse rather than guess
+    token = prefs.token if fallback_token is None else fallback_token
+    return token, protocol.srt_passphrase(token)
 
 
 def _effective_peer_host(prefs, transport) -> str:
@@ -229,9 +252,7 @@ def _start_host(prefs) -> None:
     state["transport"] = transport
     state["note"] = address_error or "connecting"
     if agent and hasattr(transport, "wait_attached"):
-        transport.wait_attached(3.0)  # agent_config — token, peer — arrives with `attached`
-
-    token = _effective_token(prefs, transport)
+        transport.wait_attached(3.0)  # agent_config — secrets, peer — arrives with `attached`
 
     # Fire-and-poll — this timer runs on Blender's main thread, and a dead
     # peer must never freeze the UI (it did: a blocking 3 s request per
@@ -247,8 +268,11 @@ def _start_host(prefs) -> None:
         now = _time.monotonic()
         if pending["req"] is None:
             sync = state.get("sync")
+            # Main thread (a timer): the secret as of now, so a slow attach
+            # or a token set meanwhile is picked up by the next hello.
+            hello_secret, _ = _secrets(prefs, transport)
             hello = protocol.make_hello(
-                token, state["epoch"], bpy.app.version_string,
+                hello_secret, state["epoch"], bpy.app.version_string,
                 addon_version=_addon_version(),
                 seq=sync.seq if sync else 0,
                 seq_fast=getattr(sync, "seq_fast", 0) if sync else 0,
@@ -359,7 +383,7 @@ def _start_replica(prefs) -> None:
     # The capture child is ours in both transports now: video leaves over SRT
     # and never touches the connection.
     pixel_path.set_external()
-    token = _effective_token(prefs, transport)
+    fallback_token = prefs.token  # main thread; the handler must not touch bpy
     epoch = state["epoch"]
 
     # Captured now (main thread) so the IO-thread handler touches no bpy.
@@ -375,7 +399,8 @@ def _start_replica(prefs) -> None:
 
     def _handler(msg: dict) -> dict:  # IO thread: strings only, no bpy
         if msg.get("kind") == "hello":
-            ok, reason = protocol.check_hello(msg, token)
+            hello_secret, _ = _secrets(None, transport, fallback_token)
+            ok, reason = protocol.check_hello(msg, hello_secret)
             if ok:
                 if state["peer_epoch"] != msg.get("epoch"):
                     replica_apply.notify_new_session(msg.get("seq", 0), msg.get("seq_fast", 0))
@@ -463,7 +488,7 @@ def _start_pixel_path(prefs) -> None:
     args = (
         prefs.ffmpeg_path, prefs.encoder_rung,
         _replica_srt_url(prefs),
-        protocol.srt_passphrase(_effective_token(prefs, state.get("transport"))),
+        _secrets(prefs, state.get("transport"))[1],
     )
     transport = state.get("transport")
 
@@ -524,7 +549,7 @@ def viewer_url() -> str:
         f"srt://{host_addr}:{stream.get('port', 9998)}"
         f"?mode=caller&latency={latency_us}"
     )
-    passphrase = protocol.srt_passphrase(_effective_token(prefs, transport))
+    _, passphrase = _secrets(prefs, transport)
     if passphrase:
         url += f"&passphrase={passphrase}&pbkeylen=16"
     return url

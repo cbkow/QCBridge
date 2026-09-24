@@ -13,6 +13,7 @@ Skipped whole-module when the agent isn't built (cargo build in agent/).
 
 import os
 import pathlib
+from pathlib import Path
 import socket
 import sys
 import time
@@ -269,6 +270,33 @@ def test_set_config_round_trip_and_needs_restart(pair):
     # A bad value is rejected, not coerced.
     reply = wait_reply(host, host.set_config(discovery="loud"))
     assert reply and reply["rejected"] == ["discovery"], reply
+
+
+def test_the_mirror_carries_derived_secrets_not_the_token(pair, tmp_path):
+    """Since 2026-09-24 the agent keeps the token: the attach reply and every
+    config event carry a fingerprint, the SRT passphrase and the hello
+    secret, and never the token. Setting a token through set_config lands in
+    the store (the file store for a spawned agent) and leaves the TOML."""
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    for t in (host, replica):
+        cfg = t.agent_config
+        assert "token" not in cfg, cfg
+        assert cfg["token_set"] is True
+        assert cfg["token_fingerprint"] == protocol.token_fingerprint("tok")
+        assert cfg["srt_passphrase"] == protocol.srt_passphrase("tok")
+        assert cfg["hello_secret"] == protocol.hello_secret("tok")
+        assert cfg["token_store"] == "file"
+    reply = wait_reply(host, host.set_config(token="newtok"))
+    assert reply and reply["changed"] == ["token"], reply
+    assert "token" not in host.agent_config
+    assert host.agent_config["token_fingerprint"] == protocol.token_fingerprint("newtok")
+    # The host's own directory: TOML without the token, the file with it.
+    proc = host._link._proc
+    assert proc is not None, "these tests spawn their agents (QCB_AGENT=spawn)"
+    host_dir = Path(proc.args[2]).parent
+    assert "newtok" not in (host_dir / "host.toml").read_text(encoding="utf-8")
+    assert (host_dir / "host.token").read_text(encoding="utf-8").strip() == "newtok"
 
 
 def test_discover_by_direct_probe_finds_the_replica(pair):

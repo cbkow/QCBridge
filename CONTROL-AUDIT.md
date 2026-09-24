@@ -175,7 +175,11 @@ lives in Blender never has to find the tray.
 
 ## 5. Secrets: what to do
 
-Short term (this release), keep the token but stop scattering it:
+Short term (this release), keep the token but stop scattering it —
+**done 2026-09-24** (agent commit "the token stays in the agent"; the
+keyring crate was not needed: Security.framework through the
+core-foundation crate already in the lock, Credential Manager through
+windows-sys, and a `token_store = "file"` for tests and Linux):
 - store it in the OS keychain (`keyring` crate: Keychain, Credential
   Manager) and keep `agent.toml` for everything else;
 - drop `token` from the settings mirror and from the addon preferences
@@ -213,7 +217,7 @@ lesson in QCBridge's terms: the user never invents or copies a secret.
 1. Agent hygiene on Windows (console, log file, job object) — blocks any
    install. *Done 2026-09-24 (agent commit "Windows hygiene").*
 2. Token to the keychain; token out of the addon and the mirror; the
-   fingerprint line on both ends.
+   fingerprint line on both ends. *Done 2026-09-24.*
 3. Mappings and cache root move to the agent config and the `config`
    event; the addon reads them from there; the replica receives the
    host's rows at pairing.
