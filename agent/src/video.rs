@@ -42,6 +42,8 @@ pub struct VideoSource {
     generation: AtomicU64,
     child: Mutex<Option<std::process::Child>>,
     child_stdin: Mutex<Option<std::process::ChildStdin>>,
+    /// Where capture.log goes (the child's stderr); None = inherit.
+    log_dir: Mutex<Option<std::path::PathBuf>>,
     pub counters: VideoCounters,
     pub state: Mutex<String>,
 }
@@ -55,9 +57,16 @@ impl VideoSource {
             generation: AtomicU64::new(0),
             child: Mutex::new(None),
             child_stdin: Mutex::new(None),
+            log_dir: Mutex::new(None),
             counters: VideoCounters::default(),
             state: Mutex::new("off".into()),
         }
+    }
+
+    /// Send the capture child's stderr to `<dir>/capture.log` (one file per
+    /// spawn) instead of the agent's own stderr.
+    pub fn set_log_dir(&self, dir: std::path::PathBuf) {
+        *self.log_dir.lock().unwrap() = Some(dir);
     }
 
     pub fn start(self: &Arc<Self>, argv: Vec<String>, link: Arc<Link>) {
@@ -90,16 +99,26 @@ impl VideoSource {
 
     fn supervise(self: Arc<Self>, argv: Vec<String>, generation: u64, link: Arc<Link>) {
         while self.current(generation) {
-            let spawned = std::process::Command::new(&argv[0])
-                .args(&argv[1..])
+            let stderr = match self.log_dir.lock().unwrap().as_ref().map(|d| d.join("capture.log")) {
+                Some(p) => match std::fs::File::create(&p) {
+                    Ok(f) => std::process::Stdio::from(f),
+                    Err(e) => {
+                        crate::log!("[video] cannot open {}: {e}; helper output is dropped", p.display());
+                        std::process::Stdio::null()
+                    }
+                },
+                None => std::process::Stdio::inherit(),
+            };
+            let mut cmd = std::process::Command::new(&argv[0]);
+            cmd.args(&argv[1..])
                 .stdin(std::process::Stdio::piped()) // "key\n" = keyframe on request (native capture)
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit())
-                .spawn();
-            let mut child = match spawned {
+                .stderr(stderr);
+            crate::platform::no_window(&mut cmd);
+            let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("[video] spawn failed: {e}");
+                    crate::log!("[video] spawn failed: {e}");
                     self.set_state(&link, "spawn_failed");
                     return;
                 }

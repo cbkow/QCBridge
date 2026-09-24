@@ -7,12 +7,20 @@
 //! `--version` and in every attach reply — no longer an obligation, just
 //! useful.
 
+// Release builds on Windows are GUI-subsystem executables: no console, so
+// nothing can close one or send it a control event (the logon-task death,
+// 0xC000013A). Output goes to agent.log beside agent.toml; a terminal that
+// runs --version gets its output back through platform::attach_parent_console.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use anyhow::{Context, Result};
 use qcbridge_agent::blender::{Event, Lifecycle};
 use qcbridge_agent::config::{self, Config, SharedConfig};
 use qcbridge_agent::discovery;
 use qcbridge_agent::link::{Inbound, Link, serve_local, writer_thread};
+use qcbridge_agent::platform;
 use qcbridge_agent::session::{self, Ctx, HostTarget, PeerObserver};
+use qcbridge_agent::log;
 use qcbridge_agent::video::{VideoSink, VideoSource, video_listener};
 use serde_json::{Value, json};
 use std::net::TcpListener;
@@ -58,13 +66,13 @@ impl PeerObserver for HostObserver {
             });
             if let Some(cfg) = saved {
                 if let Err(e) = config::save(&self.cfg_path, &cfg) {
-                    eprintln!("[agent] could not persist fingerprint: {e}");
+                    log!("[agent] could not persist fingerprint: {e}");
                 }
                 if let Some(t) = self.control.target.lock().unwrap().as_mut() {
                     t.fingerprint = hex::decode(fp).ok(); // enforce from now on, no reconnect
                 }
                 pinned = true;
-                eprintln!("[agent] pinned replica certificate {fp}");
+                log!("[agent] pinned replica certificate {fp}");
             }
         }
         self.link.event_try(json!({"event": "peer", "peer": 0, "up": true, "fingerprint": fp, "pinned": !pinned}));
@@ -164,17 +172,39 @@ fn retarget(agent: &Agent, addr: String, fp: String) {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    platform::attach_parent_console();
     let args = qcbridge_agent::Args::parse(USAGE);
     if args.flag("version") {
         println!("qcbridge-agent {VERSION}\nsource: {SOURCE_URL}\nlicense: GPL-3.0-or-later");
-        return Ok(());
+        return;
     }
-    let cfg_path = args.get("config").map(Into::into).unwrap_or_else(config::config_path);
-    let mut cfg = config::load_or_create(&cfg_path)?;
-    // Cert and agent.json live beside the config, so --config isolates an
-    // instance completely (two agents in a test, or host+replica in dev).
+    if let Err(e) = run(&args) {
+        // The line goes to the log (and stderr, when there is one); the box
+        // is for the Windows user who has neither, unless this is a headless
+        // run from a test or a script.
+        let msg = format!("{e:#}");
+        log!("[agent] start failed: {msg}");
+        if !args.flag("no-tray") {
+            let mut text = msg.clone();
+            if let Some(p) = qcbridge_agent::logging::path() {
+                text.push_str(&format!("\n\nLog: {}", p.display()));
+            }
+            platform::fatal_dialog("QCBridge Agent could not start", &text);
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run(args: &qcbridge_agent::Args) -> Result<()> {
+    let cfg_path: std::path::PathBuf = args.get("config").map(Into::into).unwrap_or_else(config::config_path);
+    // Cert, agent.json and the logs live beside the config, so --config
+    // isolates an instance completely (two agents in a test, or
+    // host+replica in dev). The log opens first: a broken TOML is the kind
+    // of failure the file exists to show.
     let base = config::base_dir(&cfg_path);
+    qcbridge_agent::logging::init(&base.join("agent.log"));
+    let mut cfg = config::load_or_create(&cfg_path)?;
     if let Some(r) = args.get("role") { cfg.role = r.to_string(); }
     if let Some(l) = args.get("listen") { cfg.listen = l.to_string(); }
     if let Some(p) = args.get("peer") { cfg.peer = p.to_string(); }
@@ -187,7 +217,15 @@ fn main() -> Result<()> {
     // exactly what happened to the first bootstrap bench.
     let exit_with_addon = args.flag("exit-with-addon");
     let role_host = cfg.role == "host";
-    eprintln!("[agent] {VERSION} role={} config={}", cfg.role, cfg_path.display());
+    log!("[agent] {VERSION} role={} config={}", cfg.role, cfg_path.display());
+    // Children die with the agent, whichever way it goes: a hard kill must
+    // not leave Blender, the helper and ffmpeg holding its ports.
+    if let Err(e) = platform::install_job_object() {
+        log!("[agent] no job object ({e}); children may outlive the agent");
+    }
+    // The exact guard (Windows: a named mutex); the pid check below stays
+    // as the cross-platform one, and as the one a recycled pid could fool.
+    let _instance = platform::claim_instance(&base, &cfg.role).map_err(anyhow::Error::msg)?;
 
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -211,7 +249,8 @@ fn main() -> Result<()> {
     let status = Arc::new(Mutex::new("starting".to_string()));
 
     // Local socket the addon attaches to.
-    let local = TcpListener::bind(("127.0.0.1", cfg.local_port)).context("bind local socket")?;
+    let local = TcpListener::bind(("127.0.0.1", cfg.local_port))
+        .with_context(|| format!("bind the addon socket 127.0.0.1:{}", cfg.local_port))?;
     let local_port = local.local_addr()?.port();
     let secret: String = {
         use rand::RngCore;
@@ -233,6 +272,7 @@ fn main() -> Result<()> {
 
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     let video_src = Arc::new(VideoSource::new());
+    video_src.set_log_dir(base.clone());
     let video_sink = Arc::new(VideoSink::new());
 
     // One config from here on. Everything long-lived takes a handle to it,
@@ -254,7 +294,7 @@ fn main() -> Result<()> {
         host_obs = Some(h.clone());
         h
     } else {
-        let (l, rx) = Lifecycle::new(shared.clone(), link.clone(), local_port, secret.clone(), status.clone());
+        let (l, rx) = Lifecycle::new(shared.clone(), link.clone(), local_port, secret.clone(), base.clone(), status.clone());
         runtime.spawn(l.clone().run(rx));
         lifecycle = Some(l.clone());
         l
@@ -299,16 +339,17 @@ fn main() -> Result<()> {
         // Quinn binds its socket inside a Tokio context.
         let listener = {
             let _guard = runtime.enter();
-            session::listen(addr, &config::cert_dir(&base), session::DEFAULT_MTU)?
+            session::listen(addr, &config::cert_dir(&base), session::DEFAULT_MTU)
+                .with_context(|| format!("listen on {}", cfg.listen))?
         };
         replica_fingerprint = listener.fingerprint.clone();
-        eprintln!("[agent] listening on {} fingerprint {}", cfg.listen, replica_fingerprint);
+        log!("[agent] listening on {} fingerprint {}", cfg.listen, replica_fingerprint);
         *status.lock().unwrap() = "listening".into();
         let ctx = ctx.clone();
         runtime.spawn(async move {
             loop {
                 if let Err(e) = session::serve_one(ctx.clone(), &listener.endpoint).await {
-                    eprintln!("[agent] session ended: {e:#}");
+                    log!("[agent] session ended: {e:#}");
                 }
             }
         });
@@ -354,7 +395,7 @@ fn main() -> Result<()> {
         let on_detach: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             if let Some(l) = &a.lifecycle { let _ = l.tx.send(Event::AddonDetached); }
             if exit_with_addon {
-                eprintln!("[agent] addon detached; exiting (--exit-with-addon)");
+                log!("[agent] addon detached; exiting (--exit-with-addon)");
                 a.ctx.video_src.stop();
                 a.quit.notify_waiters();
             }
@@ -366,7 +407,7 @@ fn main() -> Result<()> {
             .name("local-socket".into())
             .spawn(move || serve_local(local, secret, inb, link, on_attach, on_detach, on_cmd))?;
     }
-    eprintln!("[agent] addon socket 127.0.0.1:{local_port}");
+    log!("[agent] addon socket 127.0.0.1:{local_port}");
 
     if cfg.tray {
         tray::run(agent, runtime)
@@ -448,7 +489,7 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
             });
             if !applied.changed.is_empty() {
                 if let Err(e) = config::save(&agent.cfg_path, &snapshot) {
-                    eprintln!("[agent] could not persist config: {e}");
+                    log!("[agent] could not persist config: {e}");
                 }
                 if applied.changed.iter().any(|f| f == "peer") && agent.cfg.is_host() {
                     retarget(agent, snapshot.peer.clone(), snapshot.fingerprint.clone());
@@ -501,7 +542,7 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
                 c.clone()
             });
             if let Err(e) = config::save(&agent.cfg_path, &snapshot) {
-                eprintln!("[agent] could not persist config: {e}");
+                log!("[agent] could not persist config: {e}");
             }
             // It used to persist and tell nobody.
             let applied = config::Applied { changed: vec!["fingerprint".into()], ..Default::default() };
@@ -515,7 +556,7 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
                 agent.quit.notify_waiters();
             }
         }
-        other => eprintln!("[agent] unknown cmd {other:?}"),
+        other => log!("[agent] unknown cmd {other:?}"),
     }
 }
 
@@ -650,7 +691,7 @@ mod tray {
                     });
                     if !applied.changed.is_empty() {
                         if let Err(e) = config::save(&agent.cfg_path, &snapshot) {
-                            eprintln!("[agent] could not persist config: {e}");
+                            log!("[agent] could not persist config: {e}");
                         }
                         agent.beacon.set_mode(&snapshot.discovery);
                     }
@@ -669,7 +710,16 @@ mod tray {
                     #[cfg(windows)]
                     let _ = std::process::Command::new("explorer").arg(&dir).spawn();
                 } else if ev.id == quit_item.id() {
-                    if let Some(l) = &agent.lifecycle { let _ = l.tx.send(Event::Shutdown); }
+                    if let Some(l) = &agent.lifecycle {
+                        let _ = l.tx.send(Event::Shutdown);
+                        // Shutdown asks the addon to quit Blender cleanly.
+                        // Our exit closes the job object, which kills what
+                        // is left, so give the clean path a few seconds.
+                        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        while l.blender_running() && std::time::Instant::now() < until {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    }
                     agent.ctx.video_src.stop();
                     agent.beacon.set_mode("off"); // sends bye, removes the phonebook entry
                     config::remove_socket_info(&agent.base, &agent.cfg.role());
