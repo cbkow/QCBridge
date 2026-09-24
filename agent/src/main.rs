@@ -96,17 +96,192 @@ struct Agent {
     /// handle_cmd runs on the socket thread and is sync; anything that must
     /// await (a discovery sweep) is spawned here.
     rt: tokio::runtime::Handle,
-    beacon: discovery::Service,
     host_control: Arc<session::HostControl>,
     link: Arc<Link>,
     inb: Arc<Inbound>,
     ctx: Arc<Ctx>,
+    /// Everything that exists only for the current role; rebuilt by the
+    /// Send/Receive switch (`switch_role`) without a restart.
+    role: Mutex<RoleRuntime>,
+    local_port: u16,
+    /// The per-start secret the addon presents; a replica's Blender gets it
+    /// in its environment.
+    secret: String,
+    status: Arc<Mutex<String>>,
+    quit: Arc<Notify>,
+}
+
+/// What a role owns: a replica its listener, accept loop, Blender
+/// lifecycle and beacon; a host its observer and dial loop. `stop_role`
+/// takes it all down; `start_role` builds it for the role in the config.
+#[derive(Default)]
+struct RoleRuntime {
     lifecycle: Option<Arc<Lifecycle>>,
     host_obs: Option<Arc<HostObserver>>,
     replica_fingerprint: String,
-    local_port: u16,
-    status: Arc<Mutex<String>>,
-    quit: Arc<Notify>,
+    endpoint: Option<quinn::Endpoint>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    beacon: Option<discovery::Service>,
+}
+
+impl RoleRuntime {
+    fn peer_up(&self) -> bool {
+        self.lifecycle.as_ref().map(|l| l.peer_up.load(Relaxed))
+            .or_else(|| self.host_obs.as_ref().map(|h| h.up.load(Relaxed)))
+            .unwrap_or(false)
+    }
+}
+
+/// Build the runtime for the role in the config. Registers the local socket
+/// under that role in agent.json, so the addon of the new role finds it.
+fn start_role(agent: &Agent) -> Result<RoleRuntime> {
+    let cfg = agent.cfg.snapshot();
+    let role_host = cfg.role == "host";
+    let mut rt = RoleRuntime::default();
+    let observer: Arc<dyn PeerObserver> = if role_host {
+        let h = Arc::new(HostObserver {
+            status: agent.status.clone(), fingerprint: Mutex::new(None), up: AtomicBool::new(false),
+            link: agent.link.clone(), cfg_path: agent.cfg_path.clone(), cfg: agent.cfg.clone(),
+            control: agent.host_control.clone(),
+        });
+        rt.host_obs = Some(h.clone());
+        h
+    } else {
+        let (l, rx) = Lifecycle::new(
+            agent.cfg.clone(), agent.link.clone(), agent.local_port, agent.secret.clone(), agent.base.clone(), agent.status.clone(),
+        );
+        rt.tasks.push(agent.rt.spawn(l.clone().run(rx)));
+        rt.lifecycle = Some(l.clone());
+        l
+    };
+    agent.ctx.set_role(role_host, observer);
+
+    if role_host {
+        // A configured peer connects at once; otherwise the addon sends
+        // CMD connect with the address from its preferences.
+        if !cfg.peer.is_empty() {
+            agent.host_control.set(Some(HostTarget {
+                addr: cfg.peer.clone(),
+                fingerprint: (!cfg.fingerprint.is_empty())
+                    .then(|| hex::decode(cfg.fingerprint.to_lowercase().replace(':', "")))
+                    .transpose()
+                    .context("config fingerprint must be hex")?,
+                mtu: session::DEFAULT_MTU,
+            }));
+            *agent.status.lock().unwrap() = format!("connecting to {}", cfg.peer);
+        } else {
+            *agent.status.lock().unwrap() = "waiting for the addon".into();
+        }
+        if cfg.video_port > 0 {
+            let addr = format!("127.0.0.1:{}", cfg.video_port).parse()?;
+            rt.tasks.push(agent.rt.spawn(video_listener(addr, agent.ctx.video_sink.clone(), agent.link.clone())));
+        }
+        rt.tasks.push(agent.rt.spawn(session::host_loop(agent.ctx.clone(), agent.host_control.clone())));
+    } else {
+        let addr = cfg.listen.parse().context("listen must be IP:PORT")?;
+        // Quinn binds its socket inside a Tokio context.
+        let listener = {
+            let _guard = agent.rt.enter();
+            session::listen(addr, &config::cert_dir(&agent.base), session::DEFAULT_MTU)
+                .with_context(|| format!("listen on {}", cfg.listen))?
+        };
+        rt.replica_fingerprint = listener.fingerprint.clone();
+        rt.endpoint = Some(listener.endpoint.clone());
+        log!("[agent] listening on {} fingerprint {}", cfg.listen, rt.replica_fingerprint);
+        *agent.status.lock().unwrap() = "listening".into();
+        let ctx = agent.ctx.clone();
+        rt.tasks.push(agent.rt.spawn(async move {
+            loop {
+                match session::serve_one(ctx.clone(), &listener.endpoint).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        if listener.endpoint.local_addr().is_err() { return; }
+                        log!("[agent] session ended: {e:#}");
+                        // A closed endpoint yields errors without waiting;
+                        // one poll per loop is enough to notice the abort.
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        }));
+    }
+
+    // The beacon: a host's service returns at once (hosts never bind 4246).
+    let paired: Arc<dyn Fn() -> bool + Send + Sync> = {
+        let l = rt.lifecycle.clone();
+        let h = rt.host_obs.clone();
+        Arc::new(move || {
+            l.as_ref().map(|l| l.peer_up.load(Relaxed))
+                .or_else(|| h.as_ref().map(|h| h.up.load(Relaxed)))
+                .unwrap_or(false)
+        })
+    };
+    let listen_port = if role_host { 0 } else {
+        cfg.listen.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(0)
+    };
+    rt.beacon = Some(discovery::Service::start(&agent.rt, agent.cfg.clone(), Arc::new(discovery::Identity {
+        role: cfg.role.clone(),
+        listen_port,
+        fingerprint: rt.replica_fingerprint.clone(),
+        version: VERSION.to_string(),
+        paired,
+    })));
+    config::write_socket_info(&agent.base, &cfg.role, agent.local_port, &agent.secret)?;
+    Ok(rt)
+}
+
+/// Take a role runtime down: Blender asked to quit, the dial loop idled,
+/// the listener closed, the beacon gone (bye sent, phonebook entry
+/// removed), the tasks aborted.
+fn stop_role(agent: &Agent, rt: RoleRuntime, old_role: &str) {
+    if let Some(l) = &rt.lifecycle {
+        let _ = l.tx.send(Event::Shutdown);
+    }
+    agent.host_control.set(None);
+    if let Some(b) = &rt.beacon {
+        b.set_mode("off");
+    }
+    if let Some(ep) = &rt.endpoint {
+        ep.close(0u32.into(), b"role change");
+    }
+    agent.ctx.set_role(agent.ctx.is_host(), Arc::new(session::NoObserver));
+    // Give the beacon its "off" turn (bye + phonebook removal) and the
+    // sessions their close before the tasks are cut.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    for t in &rt.tasks {
+        t.abort();
+    }
+    drop(rt);
+    config::remove_socket_info(&agent.base, old_role);
+}
+
+/// The Send/Receive switch, and a replica's new listen address: rebuild
+/// the role runtime for the config as it now stands. On failure the old
+/// role is restored in the config and rebuilt, and the error goes to the
+/// log and the listeners.
+fn switch_role(agent: &Agent, old_role: &str) {
+    let old = std::mem::take(&mut *agent.role.lock().unwrap());
+    stop_role(agent, old, old_role);
+    let new_role = agent.cfg.role();
+    match start_role(agent) {
+        Ok(rt) => {
+            *agent.role.lock().unwrap() = rt;
+            log!("[agent] now {new_role}");
+        }
+        Err(e) => {
+            log!("[agent] could not become {new_role}: {e:#}; staying {old_role}");
+            agent.link.event_try(json!({"event": "error", "msg": format!("could not become {new_role}: {e:#}")}));
+            let snapshot = agent.cfg.update(|c| { c.role = old_role.to_string(); c.clone() });
+            let _ = config::save(&agent.cfg_path, &snapshot);
+            match start_role(agent) {
+                Ok(rt) => *agent.role.lock().unwrap() = rt,
+                Err(e2) => {
+                    log!("[agent] could not restore {old_role} either: {e2:#}");
+                    *agent.status.lock().unwrap() = format!("no role: {e2:#}");
+                }
+            }
+        }
+    }
 }
 
 fn attach_reply(agent: &Agent) -> Value {
@@ -116,9 +291,10 @@ fn attach_reply(agent: &Agent) -> Value {
         "version": VERSION,
         "source": SOURCE_URL,
         "port": agent.cfg.with(|c| c.listen.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(0)),
-        "fingerprint": agent.replica_fingerprint,
-        "peer_up": agent.lifecycle.as_ref().map(|l| l.peer_up.load(Relaxed))
-            .or_else(|| agent.host_obs.as_ref().map(|h| h.up.load(Relaxed))).unwrap_or(false),
+        "fingerprint": agent.role.lock().unwrap().replica_fingerprint,
+        "peer_up": agent.role.lock().unwrap().peer_up(),
+        // Where this binary is: the addon opens the settings window from it.
+        "exe": std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
         "video_port": agent.cfg.with(|c| if c.role == "host" { c.video_port } else { 0 }),
         "video_state": *agent.ctx.video_src.state.lock().unwrap(),
         // COLD_ACK carries bytes since 2026-09-23; an addon that does not
@@ -131,7 +307,7 @@ fn attach_reply(agent: &Agent) -> Value {
         // threw them away; now there is a reason to keep them.
         "config": agent.cfg.with(config::live_view),
     });
-    if let Some(h) = &agent.host_obs {
+    if let Some(h) = &agent.role.lock().unwrap().host_obs {
         v["peer_fingerprint"] = json!(h.fingerprint.lock().unwrap().clone());
     }
     v
@@ -274,8 +450,6 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
             cfg.role, base.display()
         );
     }
-    config::write_socket_info(&base, &cfg.role, local_port, &secret)?;
-
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
     let video_src = Arc::new(VideoSource::new());
     video_src.set_log_dir(base.clone());
@@ -286,112 +460,23 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
     // startup reads below, which happen before any of this can be edited.
     let shared = SharedConfig::new(cfg.clone());
 
-    // Role wiring.
-    let mut replica_fingerprint = String::new();
-    let mut lifecycle: Option<Arc<Lifecycle>> = None;
-    let mut host_obs: Option<Arc<HostObserver>> = None;
+    // The role's runtime is built after the Agent exists, and rebuilt by
+    // the Send/Receive switch; the context starts with no observer.
     let host_control = Arc::new(session::HostControl::new(None));
-    let observer: Arc<dyn PeerObserver> = if role_host {
-        let h = Arc::new(HostObserver {
-            status: status.clone(), fingerprint: Mutex::new(None), up: AtomicBool::new(false),
-            link: link.clone(), cfg_path: cfg_path.clone(), cfg: shared.clone(),
-            control: host_control.clone(),
-        });
-        host_obs = Some(h.clone());
-        h
-    } else {
-        let (l, rx) = Lifecycle::new(shared.clone(), link.clone(), local_port, secret.clone(), base.clone(), status.clone());
-        runtime.spawn(l.clone().run(rx));
-        lifecycle = Some(l.clone());
-        l
-    };
-    let ctx = Arc::new(Ctx {
-        role_host,
-        cfg: shared.clone(),
-        link: link.clone(),
-        inb: inb.clone(),
-        control_rx: tokio::sync::Mutex::new(control_rx),
-        cold_rx: tokio::sync::Mutex::new(cold_rx),
-        fast_rx: tokio::sync::Mutex::new(fast_rx),
-        video_src: video_src.clone(),
-        video_sink: video_sink.clone(),
-        observer,
-        last_stats: Mutex::new(Value::Null),
-    });
-
-    if role_host {
-        // A configured peer connects at once; otherwise the addon sends
-        // CMD connect with the address from its preferences.
-        if !cfg.peer.is_empty() {
-            host_control.set(Some(HostTarget {
-                addr: cfg.peer.clone(),
-                fingerprint: (!cfg.fingerprint.is_empty())
-                    .then(|| hex::decode(cfg.fingerprint.to_lowercase().replace(':', "")))
-                    .transpose()
-                    .context("config fingerprint must be hex")?,
-                mtu: session::DEFAULT_MTU,
-            }));
-            *status.lock().unwrap() = format!("connecting to {}", cfg.peer);
-        } else {
-            *status.lock().unwrap() = "waiting for the addon".into();
-        }
-        if cfg.video_port > 0 {
-            let addr = format!("127.0.0.1:{}", cfg.video_port).parse()?;
-            runtime.spawn(video_listener(addr, video_sink.clone(), link.clone()));
-        }
-        runtime.spawn(session::host_loop(ctx.clone(), host_control.clone()));
-    } else {
-        let addr = cfg.listen.parse().context("listen must be IP:PORT")?;
-        // Quinn binds its socket inside a Tokio context.
-        let listener = {
-            let _guard = runtime.enter();
-            session::listen(addr, &config::cert_dir(&base), session::DEFAULT_MTU)
-                .with_context(|| format!("listen on {}", cfg.listen))?
-        };
-        replica_fingerprint = listener.fingerprint.clone();
-        log!("[agent] listening on {} fingerprint {}", cfg.listen, replica_fingerprint);
-        *status.lock().unwrap() = "listening".into();
-        let ctx = ctx.clone();
-        runtime.spawn(async move {
-            loop {
-                if let Err(e) = session::serve_one(ctx.clone(), &listener.endpoint).await {
-                    log!("[agent] session ended: {e:#}");
-                }
-            }
-        });
-    }
-
-    let beacon = {
-        let paired: Arc<dyn Fn() -> bool + Send + Sync> = {
-            let l = lifecycle.clone();
-            let h = host_obs.clone();
-            Arc::new(move || {
-                l.as_ref().map(|l| l.peer_up.load(Relaxed))
-                    .or_else(|| h.as_ref().map(|h| h.up.load(Relaxed)))
-                    .unwrap_or(false)
-            })
-        };
-        // A host does not listen; advertising the default listen port from
-        // its config would offer a port nothing answers on.
-        let listen_port = if role_host { 0 } else {
-            cfg.listen.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()).unwrap_or(0)
-        };
-        discovery::Service::start(runtime.handle(), shared.clone(), Arc::new(discovery::Identity {
-            role: cfg.role.clone(),
-            listen_port,
-            fingerprint: replica_fingerprint.clone(),
-            version: VERSION.to_string(),
-            paired,
-        }))
-    };
+    let ctx = Arc::new(Ctx::new(
+        role_host, shared.clone(), link.clone(), inb.clone(),
+        control_rx, cold_rx, fast_rx, video_src.clone(), video_sink.clone(),
+        Arc::new(session::NoObserver),
+    ));
     let agent = Arc::new(Agent {
         cfg: shared.clone(), base: base.clone(), cfg_path: cfg_path.clone(),
-        rt: runtime.handle().clone(), beacon,
+        rt: runtime.handle().clone(),
         host_control: host_control.clone(), link: link.clone(),
         inb: inb.clone(), ctx: ctx.clone(),
-        lifecycle: lifecycle.clone(), host_obs, replica_fingerprint, local_port, status: status.clone(),
+        role: Mutex::new(RoleRuntime::default()), local_port, secret: secret.clone(), status: status.clone(),
         quit: Arc::new(Notify::new()),
     });
+    *agent.role.lock().unwrap() = start_role(&agent)?;
 
     // Local socket server.
     {
@@ -399,7 +484,7 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
         let on_attach: Arc<dyn Fn() -> Value + Send + Sync> = Arc::new(move || attach_reply(&a));
         let a = agent.clone();
         let on_detach: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            if let Some(l) = &a.lifecycle { let _ = l.tx.send(Event::AddonDetached); }
+            if let Some(l) = &a.role.lock().unwrap().lifecycle { let _ = l.tx.send(Event::AddonDetached); }
             if exit_with_addon {
                 log!("[agent] addon detached; exiting (--exit-with-addon)");
                 a.ctx.video_src.stop();
@@ -419,11 +504,11 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
         tray::run(agent, runtime)
     } else {
         runtime.block_on(agent.quit.notified());
-        if let Some(l) = &agent.lifecycle { let _ = l.tx.send(Event::Shutdown); }
         // Deregister on the way out, so the next agent in this directory
         // does not read a dead port back out of agent.json.
-        agent.beacon.set_mode("off");
-        config::remove_socket_info(&agent.base, &agent.cfg.role());
+        let role = agent.cfg.role();
+        let rt = std::mem::take(&mut *agent.role.lock().unwrap());
+        stop_role(&agent, rt, &role);
         Ok(())
     }
 }
@@ -514,7 +599,16 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
                 if applied.changed.iter().any(|f| f == "discovery" || f == "phonebook" || f == "name") {
                     // The service rebinds on a mode change and re-reads the
                     // name/phonebook on its next announce; nudge it now.
-                    agent.beacon.set_mode(&snapshot.discovery);
+                    if let Some(b) = &agent.role.lock().unwrap().beacon { b.set_mode(&snapshot.discovery); }
+                }
+                let role_changed = applied.changed.iter().any(|f| f == "role");
+                let listen_changed = applied.changed.iter().any(|f| f == "listen") && !agent.cfg.is_host();
+                if role_changed || listen_changed {
+                    // Rebuild in place: the Send/Receive switch, or a replica
+                    // moving its listener. The old role is what the runtime
+                    // still is; the config already says the new one.
+                    let old_role = if role_changed { if snapshot.role == "host" { "replica" } else { "host" } } else { snapshot.role.as_str() };
+                    switch_role(agent, old_role);
                 }
             }
             push_config_event(agent, cmd.get("req").cloned(), &applied);
@@ -527,7 +621,7 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
             let link = agent.link.clone();
             let cfg = agent.cfg.clone();
             let me = discovery::SelfId {
-                fp: agent.replica_fingerprint.clone(),
+                fp: agent.role.lock().unwrap().replica_fingerprint.clone(),
                 name: agent.cfg.with(|c| c.display_name()),
                 role: agent.cfg.role(),
             };
@@ -592,6 +686,11 @@ mod tray {
         })
     }
 
+    fn fp_text(agent: &Agent) -> String {
+        let fp = agent.role.lock().unwrap().replica_fingerprint.clone();
+        if fp.is_empty() { "fingerprint: (host role)".to_string() } else { format!("fingerprint {}…", &fp[..16]) }
+    }
+
     fn icon() -> Icon {
         // A filled circle; the real bundle will ship a proper asset.
         let (w, h) = (32u32, 32u32);
@@ -616,10 +715,7 @@ mod tray {
             agent.cfg.with(|c| if c.role == "host" { format!("host → {}", c.peer) } else { format!("replica · listening {}", c.listen) }),
             false, None,
         );
-        let fp_item = MenuItem::new(
-            if agent.replica_fingerprint.is_empty() { "fingerprint: (host role)".to_string() } else { format!("fingerprint {}…", &agent.replica_fingerprint[..16]) },
-            false, None,
-        );
+        let fp_item = MenuItem::new(fp_text(&agent), false, None);
         let token_item = MenuItem::new(token_text(&agent.cfg), false, None);
         let start_item = MenuItem::new("Launch Blender now", !agent.cfg.is_host(), None);
         let stop_item = MenuItem::new("Close Blender", !agent.cfg.is_host(), None);
@@ -664,6 +760,8 @@ mod tray {
         let mut last_status = String::new();
         let mut last_info = String::new();
         let mut last_token = String::new();
+        let mut last_fp = fp_text(&agent);
+        let mut last_is_host = agent.cfg.is_host();
         let mut last_tooltip = String::new();
         let mut last_mode = mode0;
         event_loop.run(move |event, _, control_flow| {
@@ -695,6 +793,20 @@ mod tray {
                 token_item.set_text(&token);
                 last_token = token;
             }
+            // The role can flip at runtime: the fingerprint line and the
+            // replica-only items follow it.
+            let fp = fp_text(&agent);
+            if fp != last_fp {
+                fp_item.set_text(&fp);
+                last_fp = fp;
+            }
+            let is_host = agent.cfg.is_host();
+            if is_host != last_is_host {
+                start_item.set_enabled(!is_host);
+                stop_item.set_enabled(!is_host);
+                network.set_enabled(!is_host);
+                last_is_host = is_host;
+            }
             let mode = agent.cfg.with(|c| c.discovery.clone());
             if mode != last_mode {
                 net_off.set_checked(mode == "off");
@@ -725,16 +837,16 @@ mod tray {
                         if let Err(e) = config::save(&agent.cfg_path, &snapshot) {
                             log!("[agent] could not persist config: {e}");
                         }
-                        agent.beacon.set_mode(&snapshot.discovery);
+                        if let Some(b) = &agent.role.lock().unwrap().beacon { b.set_mode(&snapshot.discovery); }
                     }
                     push_config_event(&agent, None, &applied);
                     last_mode.clear(); // force the check refresh next tick
                     continue;
                 }
                 if ev.id == start_item.id() {
-                    if let Some(l) = &agent.lifecycle { let _ = l.tx.send(Event::ManualStart); }
+                    if let Some(l) = &agent.role.lock().unwrap().lifecycle { let _ = l.tx.send(Event::ManualStart); }
                 } else if ev.id == stop_item.id() {
-                    if let Some(l) = &agent.lifecycle { let _ = l.tx.send(Event::ManualStop); }
+                    if let Some(l) = &agent.role.lock().unwrap().lifecycle { let _ = l.tx.send(Event::ManualStop); }
                 } else if ev.id == config_item.id() {
                     let dir = agent.base.clone();
                     #[cfg(target_os = "macos")]
@@ -742,7 +854,8 @@ mod tray {
                     #[cfg(windows)]
                     let _ = std::process::Command::new("explorer").arg(&dir).spawn();
                 } else if ev.id == quit_item.id() {
-                    if let Some(l) = &agent.lifecycle {
+                    let lifecycle = agent.role.lock().unwrap().lifecycle.clone();
+                    if let Some(l) = lifecycle {
                         let _ = l.tx.send(Event::Shutdown);
                         // Shutdown asks the addon to quit Blender cleanly.
                         // Our exit closes the job object, which kills what
@@ -753,8 +866,11 @@ mod tray {
                         }
                     }
                     agent.ctx.video_src.stop();
-                    agent.beacon.set_mode("off"); // sends bye, removes the phonebook entry
-                    config::remove_socket_info(&agent.base, &agent.cfg.role());
+                    // Sends bye, removes the phonebook entry, deregisters
+                    // from agent.json.
+                    let role = agent.cfg.role();
+                    let rt = std::mem::take(&mut *agent.role.lock().unwrap());
+                    stop_role(&agent, rt, &role);
                     if let Some(rt) = runtime.lock().unwrap().take() {
                         rt.shutdown_timeout(std::time::Duration::from_millis(500));
                     }

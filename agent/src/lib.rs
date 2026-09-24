@@ -523,6 +523,7 @@ pub mod blender;
 pub mod discovery;
 pub mod config;
 pub mod link;
+pub mod mounts;
 pub mod platform;
 pub mod secrets;
 pub mod session;

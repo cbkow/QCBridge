@@ -56,6 +56,11 @@ pub struct Link {
     sink: Mutex<Option<TcpStream>>,
     sink_cv: Condvar,
     pub attached: AtomicBool,
+    /// Control clients (the settings window, since 2026-09-24): they get
+    /// every event and may send commands, and carry no lanes. Any number,
+    /// beside the one addon.
+    aux: Mutex<Vec<(u64, TcpStream)>>,
+    aux_seq: std::sync::atomic::AtomicU64,
 }
 
 impl Link {
@@ -68,7 +73,29 @@ impl Link {
             sink: Mutex::new(None),
             sink_cv: Condvar::new(),
             attached: AtomicBool::new(false),
+            aux: Mutex::new(Vec::new()),
+            aux_seq: std::sync::atomic::AtomicU64::new(1),
         }
+    }
+
+    fn aux_add(&self, stream: TcpStream) -> u64 {
+        let id = self.aux_seq.fetch_add(1, Relaxed);
+        self.aux.lock().unwrap().push((id, stream));
+        id
+    }
+
+    fn aux_remove(&self, id: u64) {
+        self.aux.lock().unwrap().retain(|(i, _)| *i != id);
+    }
+
+    pub fn control_clients(&self) -> usize {
+        self.aux.lock().unwrap().len()
+    }
+
+    /// Every control client gets the event; a failed write drops that client.
+    fn aux_event(&self, body: &[u8]) {
+        let mut aux = self.aux.lock().unwrap();
+        aux.retain_mut(|(_, s)| write_frame(s, T_EVENT, body).and_then(|_| s.flush()).is_ok());
     }
 
     fn is_prio(kind: u8) -> bool {
@@ -113,6 +140,23 @@ impl Link {
         if let Some(s) = sink.as_mut() {
             let _ = write_frame(s, T_EVENT, v.to_string().as_bytes()).and_then(|_| s.flush());
         }
+    }
+
+    /// An event to every listener there is right now: the addon if one is
+    /// attached, and the control clients. Nothing waits for an addon —
+    /// state is in the attach reply, and a settings window with no Blender
+    /// open must still see config and peers events.
+    fn write_event_now(&self, body: &[u8]) {
+        {
+            let mut sink = self.sink.lock().unwrap();
+            if let Some(s) = sink.as_mut() {
+                if write_frame(s, T_EVENT, body).is_err() {
+                    *sink = None;
+                    self.attached.store(false, Relaxed);
+                }
+            }
+        }
+        self.aux_event(body);
     }
 
     pub fn hot(&self, key: Vec<u8>, body: Bytes) {
@@ -162,11 +206,11 @@ pub fn writer_thread(link: Arc<Link>, mut rx: mpsc::Receiver<Out>, mut prio_rx: 
         // Priority frames first, always: whatever woke us, a queued pong,
         // ack or event goes out before the next cold chunk.
         while let Ok(Out::Frame(kind, body)) = prio_rx.try_recv() {
-            link.write_when_attached(kind, &body);
+            if kind == T_EVENT { link.write_event_now(&body) } else { link.write_when_attached(kind, &body); }
         }
         match item {
             Out::Frame(kind, body) => {
-                link.write_when_attached(kind, &body);
+                if kind == T_EVENT { link.write_event_now(&body) } else { link.write_when_attached(kind, &body); }
             }
             Out::Wake => {}
         }
@@ -255,9 +299,38 @@ fn reader_loop(mut r: impl Read, inb: &Inbound, link: &Link, on_cmd: &(dyn Fn(&V
     }
 }
 
-/// Accept loop for the local socket. One addon at a time; the first frame
-/// must be `{"cmd":"attach","secret":...}`. `on_attach`/`on_detach` let the
-/// lifecycle react; `on_cmd` gets every later command.
+/// Commands only: what a control client may send.
+fn reader_loop_cmd(mut r: impl Read, on_cmd: &(dyn Fn(&Value) + Sync)) {
+    let mut head = [0u8; 5];
+    loop {
+        if !read_exact(&mut r, &mut head) {
+            return;
+        }
+        let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        if len == 0 || len > MAX_FRAME {
+            return;
+        }
+        let kind = head[4];
+        let mut body = vec![0u8; len - 1];
+        if !read_exact(&mut r, &mut body) {
+            return;
+        }
+        if kind == T_CMD {
+            match serde_json::from_slice::<Value>(&body) {
+                Ok(cmd) => on_cmd(&cmd),
+                Err(e) => crate::log!("[link] bad CMD json: {e}"),
+            }
+        }
+    }
+}
+
+/// Accept loop for the local socket. The first frame must be
+/// `{"cmd":"attach","secret":...}`. One addon at a time (it owns the lanes);
+/// any number of control clients (`"kind":"control"`), which get events
+/// and send commands. Each client is served on its own thread, so the
+/// settings window attaches while Blender is attached, and the other way
+/// round. `on_attach`/`on_detach` let the lifecycle react to the addon;
+/// `on_cmd` gets every later command from anyone.
 pub fn serve_local(
     listener: TcpListener,
     secret: String,
@@ -290,15 +363,32 @@ pub fn serve_local(
             let _ = write_frame(&mut stream, T_EVENT, json!({"event": "rejected"}).to_string().as_bytes());
             continue;
         }
-        if link.attached.load(Relaxed) {
+        let Ok(reader) = stream.try_clone() else { continue };
+        if cmd.get("kind").and_then(Value::as_str) == Some("control") {
+            let mut reply = on_attach();
+            reply["control"] = json!(true);
+            if write_frame(&mut stream, T_EVENT, reply.to_string().as_bytes()).and_then(|_| stream.flush()).is_err() {
+                continue;
+            }
+            let id = link.aux_add(stream);
+            let (link, on_cmd) = (link.clone(), on_cmd.clone());
+            let _ = std::thread::Builder::new().name("local-control".into()).spawn(move || {
+                reader_loop_cmd(reader, &*on_cmd);
+                link.aux_remove(id);
+            });
+            continue;
+        }
+        if link.attached.swap(true, Relaxed) {
             let _ = write_frame(&mut stream, T_EVENT, json!({"event": "rejected", "reason": "already attached"}).to_string().as_bytes());
             continue;
         }
-        let Ok(reader) = stream.try_clone() else { continue };
         link.set_sink(Some(stream));
         link.event_direct(on_attach());
-        reader_loop(reader, &inb, &link, &*on_cmd);
-        link.set_sink(None);
-        on_detach();
+        let (inb, link, on_cmd, on_detach) = (inb.clone(), link.clone(), on_cmd.clone(), on_detach.clone());
+        let _ = std::thread::Builder::new().name("local-addon".into()).spawn(move || {
+            reader_loop(reader, &inb, &link, &*on_cmd);
+            link.set_sink(None);
+            on_detach();
+        });
     }
 }

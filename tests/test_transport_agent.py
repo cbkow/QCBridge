@@ -264,9 +264,8 @@ def test_set_config_round_trip_and_needs_restart(pair):
     assert reply and reply["changed"] == ["idle_secs"], reply
     assert host.agent_config["idle_secs"] == 7
     # A restart-only field is named back, not silently ignored.
-    reply = wait_reply(host, host.set_config(listen="0.0.0.0:1"))
-    assert reply and reply["needs_restart"] == ["listen"] and reply["changed"] == [], reply
-    assert host.agent_config["listen"] != "0.0.0.0:1"
+    reply = wait_reply(host, host.set_config(local_port=1))
+    assert reply and reply["needs_restart"] == ["local_port"] and reply["changed"] == [], reply
     # A bad value is rejected, not coerced.
     reply = wait_reply(host, host.set_config(discovery="loud"))
     assert reply and reply["rejected"] == ["discovery"], reply
@@ -314,6 +313,75 @@ def test_mappings_and_cache_root_live_in_the_agent(pair):
     reply = wait_reply(host, host.set_config(path_mappings=[{"win": 1}]))
     assert reply and reply["rejected"] == ["path_mappings"], reply
     assert host.agent_config["path_mappings"] == rows
+
+
+def test_the_role_switch_is_live(pair, tmp_path):
+    """Since 2026-09-24 `role` is a live field: the host agent becomes a
+    replica in place (its dial loop stops, it listens), then a host again
+    (it re-dials its configured peer and pairs). No restart, one agent."""
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    # Listen somewhere free first (also live for a replica), then flip.
+    port = free_udp_port()
+    reply = wait_reply(host, host.set_config(listen=f"127.0.0.1:{port}"))
+    assert reply and reply["changed"] == ["listen"], reply
+    reply = wait_reply(host, host.set_config(role="replica"))
+    assert reply and reply["changed"] == ["role"], reply
+    assert host.agent_config["role"] == "replica"
+    assert wait_for(lambda: not host.peer_alive, timeout=8.0), "the dial loop should have stopped"
+    # Commands still work across the switch (the probe here reaches
+    # whichever of the two loopback replicas holds 4246, so its content is
+    # not asserted; the paired run proves the listener).
+    reply = wait_reply(host, host.discover("127.0.0.1"), timeout=6.0)
+    assert reply and reply["event"] == "peers", reply
+    # And back: the configured peer is dialled again.
+    reply = wait_reply(host, host.set_config(role="host"))
+    assert reply and reply["changed"] == ["role"], reply
+    assert wait_for(lambda: host.peer_alive, timeout=10.0), "the host should re-pair"
+
+
+def test_a_control_client_gets_events_beside_the_addon(pair):
+    """The settings window attaches as a control client (2026-09-24): it
+    gets the attach reply and every event, may send commands, and does not
+    displace the addon that owns the lanes."""
+    import json as _json
+    import socket as _socket
+    import struct as _struct
+
+    from ring1.transport_agent import T_CMD, T_EVENT  # frame kinds
+
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    addr, port, secret = host._link._info
+    s = _socket.create_connection((addr, port), timeout=5.0)
+
+    def send(kind, obj):
+        body = _json.dumps(obj).encode()
+        s.sendall(_struct.pack(">I", len(body) + 1) + bytes([kind]) + body)
+
+    def recv():
+        head = s.recv(5, _socket.MSG_WAITALL)
+        n = _struct.unpack(">I", head[:4])[0]
+        body = s.recv(n - 1, _socket.MSG_WAITALL)
+        return head[4], _json.loads(body)
+
+    send(T_CMD, {"cmd": "attach", "secret": secret, "kind": "control"})
+    kind, attached = recv()
+    assert kind == T_EVENT and attached["event"] == "attached" and attached["control"] is True, attached
+    assert "config" in attached and "token" not in attached["config"]
+    # A command from the control client is answered on the control client.
+    send(T_CMD, {"cmd": "set_config", "req": 7, "set": {"idle_secs": 11}})
+    for _ in range(20):
+        kind, ev = recv()
+        if ev.get("event") == "config" and ev.get("req") == 7:
+            break
+    else:
+        raise AssertionError("no config reply on the control client")
+    assert ev["changed"] == ["idle_secs"]
+    # The addon saw the same change, and is still attached.
+    assert wait_for(lambda: host.agent_config.get("idle_secs") == 11)
+    assert host.peer_alive
+    s.close()
 
 
 def test_discover_by_direct_probe_finds_the_replica(pair):

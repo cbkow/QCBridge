@@ -155,8 +155,12 @@ pub const LIVE_FIELDS: &[&str] = &[
     "peer", "token", "fingerprint", "name", "discovery", "phonebook",
     "blender_path", "blender_args", "kiosk", "idle_secs", "cap_mbps", "capture_scale",
     "path_mappings", "cache_root",
+    // Live since 2026-09-24: a change rebuilds the role runtime in place
+    // (the Send/Receive switch; a replica re-listening on a new address).
+    "role", "listen",
 ];
-pub const RESTART_FIELDS: &[&str] = &["role", "listen", "local_port", "tray"];
+pub const RESTART_FIELDS: &[&str] = &["local_port", "tray"];
+pub const ROLES: &[&str] = &["host", "replica"];
 
 /// What `apply_live` did with a patch. Reported back verbatim.
 #[derive(Debug, Default, PartialEq)]
@@ -205,6 +209,14 @@ pub fn apply_live(cfg: &mut Config, patch: &serde_json::Value) -> Applied {
             "cap_mbps" => match val.as_f64() { Some(f) if f > 0.0 => { cfg.cap_mbps = f; true } _ => false },
             "capture_scale" => match val.as_f64() { Some(f) if f > 0.0 && f <= 1.0 => { cfg.capture_scale = f; true } _ => false },
             "cache_root" => set_str(&mut cfg.cache_root, val),
+            "role" => match val.as_str() {
+                Some(r) if ROLES.contains(&r) => { cfg.role = r.into(); true }
+                _ => false,
+            },
+            "listen" => match val.as_str() {
+                Some(l) if l.parse::<std::net::SocketAddr>().is_ok() => { cfg.listen = l.into(); true }
+                _ => false,
+            },
             "path_mappings" => match parse_mappings(val) {
                 Some(rows) => { cfg.path_mappings = rows; true }
                 None => false,
@@ -653,7 +665,7 @@ mod tests {
         let mut cfg = Config::default();
         let a = apply_live(&mut cfg, &serde_json::json!({
             "peer": "10.0.0.5:19990", "idle_secs": 60, "discovery": "discoverable",
-            "listen": "0.0.0.0:1", "role": "host",
+            "local_port": 1, "tray": false,
             "nonsense": 1,
         }));
         assert_eq!(cfg.peer, "10.0.0.5:19990");
@@ -662,11 +674,18 @@ mod tests {
         // Order is not a contract: a JSON object iterates by sorted key.
         let sorted = |v: &Vec<String>| { let mut v = v.clone(); v.sort(); v };
         assert_eq!(sorted(&a.changed), vec!["discovery", "idle_secs", "peer"]);
-        assert_eq!(sorted(&a.needs_restart), vec!["listen", "role"]);
+        assert_eq!(sorted(&a.needs_restart), vec!["local_port", "tray"]);
         assert_eq!(a.rejected, vec!["nonsense"]);
         // Restart-only fields were not touched.
-        assert_eq!(cfg.listen, Config::default().listen);
-        assert_eq!(cfg.role, Config::default().role);
+        assert_eq!(cfg.local_port, Config::default().local_port);
+        assert!(cfg.tray);
+        // Role and listen are live, and validated.
+        let a = apply_live(&mut cfg, &serde_json::json!({"role": "host", "listen": "0.0.0.0:1"}));
+        assert_eq!(sorted(&a.changed), vec!["listen", "role"]);
+        assert_eq!(cfg.role, "host");
+        let a = apply_live(&mut cfg, &serde_json::json!({"role": "sender", "listen": "nowhere"}));
+        assert_eq!(sorted(&a.rejected), vec!["listen", "role"]);
+        assert_eq!(cfg.role, "host");
     }
 
     #[test]

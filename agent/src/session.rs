@@ -47,7 +47,9 @@ pub trait PeerObserver: Send + Sync {
 }
 
 pub struct Ctx {
-    pub role_host: bool,
+    /// Live since 2026-09-24: the Send/Receive switch flips it without a
+    /// restart. Read at each use, never copied.
+    role_host: std::sync::atomic::AtomicBool,
     /// Read at each handshake, so a token set at runtime is the one checked
     /// and sent; a copy taken at start would have needed a restart.
     pub cfg: crate::config::SharedConfig,
@@ -58,8 +60,57 @@ pub struct Ctx {
     pub fast_rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
     pub video_src: Arc<VideoSource>,
     pub video_sink: Arc<VideoSink>,
-    pub observer: Arc<dyn PeerObserver>,
+    /// The role's observer (a replica's Blender lifecycle, a host's pin
+    /// keeper); replaced on a role switch.
+    observer: Mutex<Arc<dyn PeerObserver>>,
     pub last_stats: Mutex<serde_json::Value>,
+}
+
+impl Ctx {
+    pub fn new(
+        role_host: bool,
+        cfg: crate::config::SharedConfig,
+        link: Arc<Link>,
+        inb: Arc<Inbound>,
+        control_rx: mpsc::Receiver<Bytes>,
+        cold_rx: mpsc::Receiver<Bytes>,
+        fast_rx: mpsc::Receiver<Bytes>,
+        video_src: Arc<VideoSource>,
+        video_sink: Arc<VideoSink>,
+        observer: Arc<dyn PeerObserver>,
+    ) -> Self {
+        Self {
+            role_host: std::sync::atomic::AtomicBool::new(role_host),
+            cfg, link, inb,
+            control_rx: tokio::sync::Mutex::new(control_rx),
+            cold_rx: tokio::sync::Mutex::new(cold_rx),
+            fast_rx: tokio::sync::Mutex::new(fast_rx),
+            video_src, video_sink,
+            observer: Mutex::new(observer),
+            last_stats: Mutex::new(serde_json::Value::Null),
+        }
+    }
+
+    pub fn is_host(&self) -> bool {
+        self.role_host.load(Relaxed)
+    }
+
+    pub fn observer(&self) -> Arc<dyn PeerObserver> {
+        self.observer.lock().unwrap().clone()
+    }
+
+    pub fn set_role(&self, host: bool, observer: Arc<dyn PeerObserver>) {
+        *self.observer.lock().unwrap() = observer;
+        self.role_host.store(host, Relaxed);
+    }
+}
+
+/// Between roles: nothing to tell.
+pub struct NoObserver;
+impl PeerObserver for NoObserver {
+    fn peer_up(&self, _fp: Option<String>) {}
+    fn peer_down(&self, _reason: String) {}
+    fn goodbye(&self) {}
 }
 
 fn lane_body(peer: u8, payload: &[u8]) -> Bytes {
@@ -265,7 +316,7 @@ pub async fn serve_one(ctx: Arc<Ctx>, endpoint: &quinn::Endpoint) -> Result<()> 
         }
     }
 
-    ctx.observer.peer_up(None);
+    ctx.observer().peer_up(None);
     let lanes = Lanes {
         control_send,
         control_recv,
@@ -277,7 +328,7 @@ pub async fn serve_one(ctx: Arc<Ctx>, endpoint: &quinn::Endpoint) -> Result<()> 
         fast_recv,
     };
     let r = run_lanes(ctx.clone(), conn, lanes).await;
-    ctx.observer.peer_down(r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+    ctx.observer().peer_down(r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
     r
 }
 
@@ -371,13 +422,13 @@ pub async fn connect_one(ctx: Arc<Ctx>, target: &HostTarget) -> Result<()> {
             // a changed certificate, no route — used to be swallowed whole:
             // host_loop discards the error and peer_down was only reached
             // after a session had already started. The addon got no reason.
-            ctx.observer.peer_down(format!("{e:#}"));
+            ctx.observer().peer_down(format!("{e:#}"));
             return Err(e);
         }
     };
-    ctx.observer.peer_up(fingerprint);
+    ctx.observer().peer_up(fingerprint);
     let r = run_lanes(ctx.clone(), conn, lanes).await;
-    ctx.observer.peer_down(r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
+    ctx.observer().peer_down(r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
     r
 }
 
@@ -494,7 +545,7 @@ pub async fn host_loop(ctx: Arc<Ctx>, control: Arc<HostControl>) {
                     control.notify.notified().await;
                     if control.generation.load(Relaxed) != generation { break; }
                 }
-            } => { ctx.observer.peer_down("target changed".into()); backoff = Duration::from_millis(100); continue; }
+            } => { ctx.observer().peer_down("target changed".into()); backoff = Duration::from_millis(100); continue; }
         }
         if started.elapsed() > Duration::from_secs(5) {
             backoff = Duration::from_millis(250);
@@ -546,11 +597,11 @@ async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Resu
         let ctx = ctx.clone();
         tasks.spawn(async move {
             while let Some(payload) = recv_msg(&mut control_recv).await? {
-                if !ctx.role_host
+                if !ctx.is_host()
                     && payload.len() < 512
                     && payload.windows(17).any(|w| w == b"\"kind\":\"goodbye\"")
                 {
-                    ctx.observer.goodbye();
+                    ctx.observer().goodbye();
                 }
                 ctx.link.frame(T_CONTROL, lane_body(0, &payload)).await;
             }
@@ -558,7 +609,7 @@ async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Resu
         });
     }
 
-    if ctx.role_host {
+    if ctx.is_host() {
         let mut hot_send = hot_send.ok_or_else(|| anyhow!("host session without a hot lane"))?;
         let mut cold_send = cold_send.ok_or_else(|| anyhow!("host session without a cold lane"))?;
         let c = ctx.clone();
