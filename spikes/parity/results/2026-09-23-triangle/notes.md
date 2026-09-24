@@ -107,6 +107,32 @@ logged no write failure, with the Mac scanning the same file.
 the reader, stale-drop). The mapped-drive form of the writer path was not
 tried separately; it is the same path the mapping row already proved.
 
+## Leg 1 reversed — host on Windows, replica on the Mac (2026-09-24)
+
+A second agent instance on each box under `--config` (a replica on the
+Mac, `tray = false`; a host on Windows), the same token, the Windows host
+pointed at the Mac's tunnel address. The Windows host agent attached
+across the VPN and pinned the Mac replica's certificate on first use; the
+Mac replica agent launched its Blender on the attach. A scripted host
+Blender on the Windows desktop (the same four edits) against that agent:
+
+| | |
+|---|---|
+| bootstrap | 1 on the Mac replica |
+| tier 1 move, tier 2 modifier, rename, frame | seq 3, seq_fast 2, gaps 0, errors 0 |
+| the Mac replica's pixel path | `streaming` — the ffmpeg (avfoundation → VideoToolbox) path; the native Mac helper is not built on this checkout |
+| QCView on Windows on the Mac's `srt://` across the VPN | `connected — hevc 1920x1200 yuv420p10le`, `LIVE (d3d11va zero-copy)` 1.3 s after launch |
+
+The direction is not baked in anywhere: both roles on both boxes, both
+ways across the tunnel.
+
+Along the way, a Windows finding worth its own item: the replica agent
+killed hard (`Stop-Process`) leaves its Blender, capture helper and mux
+alive holding its ports, and the next agent then exits at once with no
+line in its log. Killing the orphans first restores it. The agent should
+own its children's lifetime (a job object on Windows) and say why it
+cannot bind.
+
 ## Not yet
 
-The reversed pairing, the AE leg and glass-to-glass numbers follow.
+The AE leg and glass-to-glass numbers follow.
