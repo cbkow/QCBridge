@@ -133,6 +133,29 @@ line in its log. Killing the orphans first restores it. The agent should
 own its children's lifetime (a job object on Windows) and say why it
 cannot bind.
 
+## 2026-09-24, afternoon — the pair on the hygiene and token builds
+
+Both agents rebuilt on the two commits of the day ("Windows hygiene",
+"the token stays in the agent"); each box's `agent.toml` had a token in
+clear from the first paired day, and each first start moved it into the
+OS store (macOS Keychain on the host, Credential Manager on the Windows
+replica) and blanked the file. Then, with both tokens read back from the
+stores alone: the QUIC attach in one second, the replica's Blender
+launched, and the scripted host (the same four edits):
+
+| | |
+|---|---|
+| hello | `connected` — both ends carrying the hello secret derived by their agents |
+| tier 1 move, tier 2 modifier, rename, frame | seq 3, gaps 0, errors 0 on the replica |
+| replica pixel path | `streaming (native)` on the passphrase the replica derived |
+| QCView on Windows on the replica's `srt://` | `connected — hevc 3840x2160 yuv420p10le`, `LIVE (d3d11va zero-copy)` — the URL's passphrase is the host-side derivation, so the two derivations agree |
+
+The first attempt of the day said *denied: token mismatch*: the replica
+session captured its hello secret before its transport had attached, and
+the empty value used to be hidden by the token arriving in an environment
+variable. Both ends now resolve the secret at the moment of use. Nothing
+else changed on the wire.
+
 ## Not yet
 
 Glass-to-glass numbers (Phase 4 item 3). The AE leg ran on 2026-09-24 and is
