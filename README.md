@@ -42,14 +42,23 @@ on macOS (both roles on one machine, `smokes/bench_latency.sh`):
 How it fits together, as it is now: `SYNC-AUDIT.md` (§2 for the
 transport), `COVERAGE.md`, `CACHES.md`, and `smokes/README.md` for the
 suites that prove it. `ARCHITECTURE.md` describes the design before this
-work and says so at its top. Running it from a checkout: build the agent
-(`cargo build --release` in `agent/`; on Windows `agent\windows\autostart.ps1`
-starts it at logon). The agent writes `agent.log`, `blender.log` and
-`capture.log` beside its `agent.toml`; the session token is not in that
-file but in the OS keychain (`token_store` picks a file instead), set
-from the agent's settings window (tray → Settings…, or the button in
-Blender's preferences), which also holds the Send/Receive switch, the
-receiver to pair with, the path mappings and the cache root. With an agent running for the
+work and says so at its top. **Installing (0.2.0):** the extension zip goes into Blender as usual
+(Preferences → Get Extensions → Install from Disk). The agent is a
+separate install: on macOS the `QCBridge-Agent-<version>-arm64.pkg`
+(signed and notarized; puts *QCBridge Agent.app* in `/Applications/QCBridge`),
+on Windows `QCBridge-Agent-<version>-Setup-x64.exe` (Inno Setup, unsigned —
+Windows will warn once; it installs to `Program Files\QCBridge` with
+Start-menu entries). There is no autostart: the extension starts the
+installed agent when a session needs it, and the tray's Settings… window
+(or the button in Blender's preferences) is where the role, token,
+receiver and shared folder are set.
+
+Running it from a checkout instead: build the agent (`cargo build --release`
+in `agent/`; `agent/packaging/macos/build-app.sh` and `build-pkg.sh` make
+the Mac bundle and pkg, `agent/windows/installer.iss` the Windows setup).
+The agent writes `agent.log`, `blender.log` and `capture.log` beside its
+`agent.toml`; the session token is not in that file but in the OS
+keychain (`token_store` picks a file instead). With an agent running for the
 session's role, the addon uses it by default; `QCB_TRANSPORT=agent
 QCB_AGENT=spawn` has each Blender start a private one instead (the
 smokes' way). Without an agent the zmq transport from 0.1.6 still runs as

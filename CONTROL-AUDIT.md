@@ -227,8 +227,11 @@ lesson in QCBridge's terms: the user never invents or copies a secret.
    process attached as a control client; the live Send/Receive switch
    with it).*
 5. Bundle + first-enable install. *Autostart dropped 2026-09-24 (owner's
-   call): the agent is started by hand, from Blender, or from the tray;
-   `agent/windows/autostart.ps1` stays as an option, not a step.*
+   call). Superseded the same evening: the agent is not bundled in the
+   zip but installed — a signed, notarized PKG on macOS
+   (`agent/packaging/macos`), Inno Setup on Windows
+   (`agent/windows/installer.iss`) — and the addon starts the installed
+   agent at session start (`ensure_agent`). Done.*
 6. Docs: both-ends settings, what the phonebook exposes, one viewer per
    stream, install steps.
 

@@ -75,6 +75,11 @@ or correct; custom folders under Advanced) — the stream cap and scale,
 and the diagnostics. The window is its own process attached
 to the agent beside Blender, so nothing it does disturbs a session.
 
+**Installers.** The agent ships as *QCBridge Agent.app* in a signed,
+notarized package on macOS and as an Inno Setup installer on Windows;
+the extension zip carries no binaries and starts the installed agent
+itself when a session needs one. No autostart, by decision.
+
 **Faster, and honest about it.** An edit reaches the replica in about
 105 ms (it was ~185), a visibility toggle or rename in about 200 ms (it
 was ~500), and a small edit no longer waits behind a large mesh: deltas
