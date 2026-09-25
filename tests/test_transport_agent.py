@@ -461,9 +461,9 @@ def test_cold_payloads_round_trip_byte_identical(pair):
 def _registered(tmp_path, monkeypatch, role="host"):
     # agent_socket_info reads agent.json under the platform config base.
     home = tmp_path / "home"
-    (home / "Library" / "Application Support" / "QCBridge").mkdir(parents=True)
-    (home / ".config" / "QCBridge").mkdir(parents=True)
-    appdata = tmp_path / "appdata"; (appdata / "QCBridge").mkdir(parents=True)
+    (home / "Library" / "Application Support" / "QCBridge").mkdir(parents=True, exist_ok=True)
+    (home / ".config" / "QCBridge").mkdir(parents=True, exist_ok=True)
+    appdata = tmp_path / "appdata"; (appdata / "QCBridge").mkdir(parents=True, exist_ok=True)
     import json as _json
     info = _json.dumps({role: {"pid": 1, "port": 12345, "secret": "s"}})
     for p in (home / "Library" / "Application Support" / "QCBridge" / "agent.json",
@@ -483,7 +483,9 @@ def test_transport_defaults_to_agent_when_one_is_registered(tmp_path, monkeypatc
     from ring1.transport_agent import transport_kind
     _registered(tmp_path, monkeypatch, "host")
     assert transport_kind("HOST") == "agent"          # role case does not matter
-    assert transport_kind("REPLICA") == "zmq"         # no replica agent here
+    # A host agent registered puts the machine in agent mode whatever the
+    # addon's role field says: the session adopts the agent's role.
+    assert transport_kind("REPLICA") == "agent"
 
 
 def test_transport_defaults_to_zmq_without_an_agent(tmp_path, monkeypatch):
@@ -513,3 +515,52 @@ def test_ensure_agent_never_spawns_under_the_test_harness(tmp_path):
     assert ensure_agent("host") is False
     paths = installed_agent_paths()
     assert all(os.path.isabs(p) for p in paths)
+
+
+# ---- the agent's role is the session's role (2026-09-25) --------------
+
+def test_registered_role_follows_the_one_agent_on_the_machine(tmp_path, monkeypatch):
+    from ring1.transport_agent import registered_role
+    import ring1.transport_agent as ta
+    _registered(tmp_path, monkeypatch, "replica")
+    ta._registered_role_cache = None
+    assert registered_role() == "replica"
+    _registered(tmp_path, monkeypatch, "host")
+    ta._registered_role_cache = None
+    assert registered_role() == "host"
+
+
+def test_registered_role_is_none_when_ambiguous_or_launched(tmp_path, monkeypatch):
+    from ring1.transport_agent import registered_role
+    _registered(tmp_path, monkeypatch, "host")
+    import json as _json
+    both = _json.dumps({"host": {"pid": 1, "port": 1, "secret": "s"},
+                        "replica": {"pid": 2, "port": 2, "secret": "t"}})
+    for p in (tmp_path / "home" / "Library" / "Application Support" / "QCBridge" / "agent.json",
+              tmp_path / "home" / ".config" / "QCBridge" / "agent.json",
+              tmp_path / "appdata" / "QCBridge" / "agent.json"):
+        p.write_text(both)
+    import ring1.transport_agent as ta
+    ta._registered_role_cache = None
+    assert registered_role() is None            # two agents: the addon keeps its own field
+    _registered(tmp_path, monkeypatch, "host")
+    monkeypatch.setenv("QCB_AGENT_PORT", "5"); monkeypatch.setenv("QCB_AGENT_SECRET", "x")
+    assert registered_role() is None            # an agent-launched Blender names no role
+    monkeypatch.delenv("QCB_AGENT_PORT"); monkeypatch.delenv("QCB_AGENT_SECRET")
+    monkeypatch.setenv("QCB_AGENT", "spawn")
+    assert registered_role() is None            # the tests own their agents
+
+
+def test_session_fields_follow_the_agent_in_agent_mode():
+    """In agent mode the addon's address, kiosk and peer fields are not
+    overrides: what the agent reports is what the session uses."""
+    from types import SimpleNamespace
+    from ring1.transport_agent import effective_kiosk, effective_peer_host
+    agent = SimpleNamespace(agent_mode=True,
+                            agent_config={"peer": "10.0.0.5:19990", "kiosk": False})
+    prefs = SimpleNamespace(replica_address="1.2.3.4", replica_kiosk=True)
+    assert effective_peer_host(prefs, agent) == "10.0.0.5"
+    assert effective_kiosk(prefs, agent) is False
+    zmq = SimpleNamespace(agent_mode=False, agent_config={})
+    assert effective_peer_host(prefs, zmq) == "1.2.3.4"
+    assert effective_kiosk(prefs, zmq) is True

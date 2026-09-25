@@ -55,13 +55,21 @@ cache root belong to the agent now, and the host's rows travel to the
 replica when the two pair, so a row entered on the host machine is
 enough — the replica no longer needs its own copy (it may still have
 one; the two are merged, same roots not doubled). An existing table in
-Blender's preferences moves into the agent on the first session, and
-the preferences show the agent's table from then on, with a Save to
-Agent button for edits until the agent's own window arrives.
+Blender's preferences moves into the agent on the first session; from
+then on the table is edited in the agent's window and the preferences
+hold no copy of it.
 
-**A settings window.** The agent's tray has a Settings… item, and
-Blender's preferences an Open Agent Settings button, both opening one
-native window for everything the agent owns: the machine's name, the
+**A settings window, and nothing else to set in Blender.** The agent's
+tray has a Settings… item, and Blender's preferences and QC Bridge panel
+an Open Agent Settings button, both opening one native window for
+everything the agent owns. In agent mode Blender's preferences are a
+read-out of the agent — role, name, receiver or listen address, token
+fingerprint, shared folder — plus the Pixel Path, which is Blender's own;
+the role, address, port, token, cache-root and path-mapping fields, the
+Save to Agent and Set Token buttons and the panel's discover box are gone
+(2026-09-25), and the session's role is the agent's: the addon adopts
+whichever role the installed agent is set to when a session starts, and
+starts the installed agent if none is registered. The window holds: the machine's name, the
 Send scene / Receive scene switch (which takes effect at once — no
 restart, one agent per machine), the Blender to run, the token with its
 fingerprint, the receiver to dial with a Find receivers list and a Pair

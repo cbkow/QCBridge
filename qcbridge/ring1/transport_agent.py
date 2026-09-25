@@ -221,6 +221,93 @@ def use_agent(role: str) -> bool:
     return os.environ.get("QCB_AGENT", "") != "spawn" and agent_socket_info(role) is not None
 
 
+def registered_role() -> str | None:
+    """The role of the agent registered on this machine — "host" or
+    "replica" — or None when there is none. Since 2026-09-25 the addon
+    takes its role from the agent (one agent per machine, its role
+    switched in the settings window), so the addon's own role field is
+    only a cache of this, and the zmq fallback's setting. A launch
+    environment (QCB_AGENT_PORT) names no role; the caller keeps its own."""
+    if os.environ.get("QCB_AGENT", "") == "spawn":
+        return None
+    if os.environ.get("QCB_AGENT_PORT") and os.environ.get("QCB_AGENT_SECRET"):
+        return None
+    # Panels ask on every redraw; one agent.json read per half second.
+    now = time.monotonic()
+    cached = _registered_role_cache
+    if cached is not None and now - cached[0] < 0.5 and cached[2] == _role_cache_key():
+        return cached[1]
+    found = [r for r in ("host", "replica") if agent_socket_info(r) is not None]
+    role = found[0] if len(found) == 1 else None
+    globals()["_registered_role_cache"] = (now, role, _role_cache_key())
+    return role
+
+
+_registered_role_cache: tuple[float, str | None, str] | None = None
+
+
+def _role_cache_key() -> str:
+    """The tests move the config base between calls; the memo follows it."""
+    return os.environ.get("HOME", "") + "|" + os.environ.get("APPDATA", "") + "|" + os.environ.get("XDG_CONFIG_HOME", "")
+
+
+def effective_peer_host(prefs, transport) -> str:
+    """The replica's address for the SRT viewer URL: the agent's configured
+    peer in agent mode (the addon's field is not an override any more,
+    2026-09-25), the addon's own field otherwise, or when the agent
+    reports no peer (a private agent the addon spawned)."""
+    if getattr(transport, "agent_mode", False):
+        cfg = getattr(transport, "agent_config", None) or {}
+        peer = (cfg.get("peer") or "").rsplit(":", 1)[0]
+        if peer:
+            return peer
+    return str(getattr(prefs, "replica_address", "") or "")
+
+
+def effective_kiosk(prefs, transport) -> bool:
+    """Kiosk is the agent's setting in agent mode (its window's Kiosk box;
+    the agent also passes it to a Blender it launches), the addon's own
+    field otherwise."""
+    cfg = getattr(transport, "agent_config", None) or {}
+    if getattr(transport, "agent_mode", False) and "kiosk" in cfg:
+        return bool(cfg["kiosk"])
+    return bool(getattr(prefs, "replica_kiosk", False))
+
+
+def ensure_any_agent(timeout: float = 6.0) -> str | None:
+    """Like ensure_agent, but for whichever role the installed agent is set
+    to: start it when nothing is registered, wait for it to register, and
+    return its role. None when nothing could be started or registered."""
+    role = registered_role()
+    if role is not None:
+        return role
+    if os.environ.get("QCB_AGENT", "") == "spawn":
+        return None
+    binary = find_agent()
+    if binary is None:
+        return None
+    try:
+        if sys.platform == "win32":
+            flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen([binary], creationflags=flags, close_fds=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen([binary], start_new_session=True, close_fds=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        print(f"qcbridge: could not start the agent at {binary}: {exc}", flush=True)
+        return None
+    print(f"qcbridge: started the agent ({binary})", flush=True)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        role = registered_role()
+        if role is not None:
+            return role
+        time.sleep(0.1)
+    print("qcbridge: the agent did not register in time", flush=True)
+    return None
+
+
 def ensure_agent(role: str, timeout: float = 6.0) -> bool:
     """The product path since 2026-09-24: no autostart, so a session that
     finds no agent registered starts the installed one — its own process,
@@ -272,7 +359,10 @@ def transport_kind(role: str, pref: str = "") -> str:
     pref = (pref or "").strip().lower()
     if pref in ("agent", "zmq"):
         return pref
-    return "agent" if use_agent(role.lower()) else "zmq"
+    # An agent registered for either role puts the machine in agent mode:
+    # the session adopts the agent's role (2026-09-25), so the addon's own
+    # role field must not decide this.
+    return "agent" if (use_agent(role.lower()) or registered_role() is not None) else "zmq"
 
 
 class _AgentLink(_FrameLink):

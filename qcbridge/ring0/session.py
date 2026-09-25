@@ -138,7 +138,17 @@ def _start_agent_if_needed(prefs) -> None:
     pref = str(getattr(prefs, "transport", "") or "").strip().lower()
     if env == "zmq" or pref == "zmq":
         return
-    transport_agent.ensure_agent(str(getattr(prefs, "role", "HOST") or "HOST"))
+    # The agent's role is the session's role (2026-09-25): whichever the
+    # installed agent is set to, this end follows. The addon's role field
+    # is updated so the panel and the zmq fallback agree with it.
+    role = transport_agent.ensure_any_agent()
+    if role is not None:
+        want = role.upper()
+        if str(getattr(prefs, "role", "") or "") != want:
+            try:
+                prefs.role = want
+            except (AttributeError, TypeError):
+                pass
 
 
 def start(prefs) -> str:
@@ -237,13 +247,13 @@ def _secrets(prefs, transport, fallback_token: str | None = None) -> tuple[str, 
 
 
 def _effective_peer_host(prefs, transport) -> str:
-    """The replica's address: the addon's, when given (an explicit override),
-    else the agent's configured peer. Feeds the SRT viewer URL, which is
-    the addon's business even though the connection is the agent's."""
-    if prefs.replica_address:
-        return prefs.replica_address
-    cfg = getattr(transport, "agent_config", None) or {}
-    return (cfg.get("peer") or "").rsplit(":", 1)[0]
+    """The replica's address: the agent's configured peer in agent mode
+    (the addon's field is not an override any more, 2026-09-25), else the
+    addon's. Feeds the SRT viewer URL, which is the addon's business even
+    though the connection is the agent's."""
+    from ..ring1 import transport_agent
+
+    return transport_agent.effective_peer_host(prefs, transport)
 
 
 def _start_host(prefs) -> None:
@@ -251,9 +261,14 @@ def _start_host(prefs) -> None:
     # Agent mode: a blank address means the agent's own peer stands, so there
     # is nothing to pre-check; the old "127.0.0.1" fallback would have
     # overridden that peer with the loopback.
-    address_error = "" if (agent and not prefs.replica_address) else _check_address(prefs.replica_address or "127.0.0.1")
+    # Agent mode: the agent's own peer stands and the addon's address field
+    # is the zmq fallback's — except for a private agent the addon spawned
+    # (QCB_AGENT=spawn, the smokes), which has no peer of its own and takes
+    # the addon's.
+    spawned = os.environ.get("QCB_AGENT", "") == "spawn"
+    address_error = "" if (agent and not spawned) else _check_address(prefs.replica_address or "127.0.0.1")
     cfg = TransportConfig(
-        address=prefs.replica_address if agent else (prefs.replica_address or "127.0.0.1"),
+        address=(prefs.replica_address if spawned else "") if agent else (prefs.replica_address or "127.0.0.1"),
         port_control=prefs.port_control,
         port_hot=prefs.port_hot,
         port_cold=prefs.port_cold,
@@ -492,7 +507,7 @@ def _start_replica(prefs) -> None:
     own_rows["rows"] = _effective_mappings(prefs, transport)
     replica_apply.start(transport, own_rows["rows"])
     overlay.enable(_replica_overlay_text)
-    if getattr(prefs, "replica_kiosk", False):
+    if _effective_kiosk(prefs, transport):
         kiosk.enter()
     else:
         kiosk.prepare_viewport()
@@ -563,6 +578,12 @@ def _effective_mappings(prefs, transport) -> list[pathmap.PathMapping]:
     return _prefs_mappings(prefs)
 
 
+def _effective_kiosk(prefs, transport) -> bool:
+    from ..ring1 import transport_agent
+
+    return transport_agent.effective_kiosk(prefs, transport)
+
+
 def _effective_cache_root(prefs, transport) -> str:
     cfg = getattr(transport, "agent_config", None) or {}
     if getattr(transport, "agent_mode", False) and cfg.get("cache_root"):
@@ -616,9 +637,9 @@ def _push_paths_to_agent(prefs, transport) -> None:
 
 
 def _mirror_paths_from_agent(prefs, transport) -> None:
-    """Main thread only. The preferences show the agent's table and cache
-    root so the panel reads what is in force; edits go back through
-    qcbridge.agent_save_paths."""
+    """Main thread only. The addon's table and cache root follow the
+    agent's, so the zmq fallback and a later move back into the agent
+    start from what was in force. Edits are made in the agent's window."""
     cfg = getattr(transport, "agent_config", None) or {}
     if not getattr(transport, "agent_mode", False) or not cfg:
         return
@@ -649,7 +670,7 @@ def on_project_loaded() -> None:
     prefs = state.get("prefs")
     if prefs is None or state["role"] != "REPLICA":
         return
-    if getattr(prefs, "replica_kiosk", False):
+    if _effective_kiosk(prefs, state.get("transport")):
         kiosk.enter(first=False)
     _start_pixel_path(prefs)
 

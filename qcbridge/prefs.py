@@ -339,82 +339,25 @@ def _agent_transport():
     return t if (t is not None and getattr(t, "agent_mode", False)) else None
 
 
-class QCB_OT_discover(Operator):
-    bl_idname = "qcbridge.discover"
-    bl_label = "Find Replicas"
-    bl_description = (
-        "Ask the agent for replicas: probe the address above if one is set "
-        "(works over a VPN), otherwise sweep the LAN and the phonebook"
-    )
+def _agent_exe() -> str:
+    """The agent binary to open the settings window with: the attached
+    agent's own path while a session runs, else the installed one."""
+    from .ring1 import transport_agent
 
-    @classmethod
-    def poll(cls, context):
-        return session.running() and _agent_transport() is not None and session.state["role"] == "HOST"
-
-    def execute(self, context):
-        prefs = get_prefs(context)
-        t = _agent_transport()
-        t.discover(prefs.replica_address.strip() or None)
-        self.report({"INFO"}, "asking the agent…")
-        return {"FINISHED"}
+    t = _agent_transport()
+    exe = getattr(t, "agent_exe", "") if t is not None else ""
+    return exe or (transport_agent.find_agent() or "")
 
 
-class QCB_OT_pick_peer(Operator):
-    bl_idname = "qcbridge.pick_peer"
-    bl_label = "Use This Replica"
-    bl_description = "Point the agent at this replica and pin its certificate"
-    bl_options = {"INTERNAL"}
+def _agent_role_label(prefs) -> str:
+    """The role as the agent has it, for the panels: attached config first,
+    then the registered agent, then the addon's own field."""
+    from .ring1 import transport_agent
 
-    index: bpy.props.IntProperty()
-
-    def execute(self, context):
-        t = _agent_transport()
-        if t is None or not (0 <= self.index < len(t.peers)):
-            return {"CANCELLED"}
-        p = t.peers[self.index]
-        if p.get("role") != "replica" or not p.get("port"):
-            self.report({"WARNING"}, "that is not a replica you can pair to")
-            return {"CANCELLED"}
-        t.set_config(peer=f"{p['ip']}:{p['port']}", fingerprint=p.get("fp", ""))
-        # The SRT viewer URL is assembled here from replica_address, so keep
-        # it in step with the peer the agent will dial.
-        get_prefs(context).replica_address = p["ip"]
-        self.report({"INFO"}, f"agent now dials {p.get('n') or p['ip']}")
-        return {"FINISHED"}
-
-
-class QCB_OT_agent_set_token(Operator):
-    bl_idname = "qcbridge.agent_set_token"
-    bl_label = "Set Session Token"
-    bl_description = (
-        "Give the agent the session token (the same on both ends). It is "
-        "kept in the OS keychain by the agent, never in these preferences"
-    )
-    bl_options = {"INTERNAL"}
-
-    # Not a preference: typed, sent, forgotten.
-    token: bpy.props.StringProperty(name="Token", subtype="PASSWORD", options={"SKIP_SAVE"})
-
-    @classmethod
-    def poll(cls, context):
-        return session.running() and _agent_transport() is not None
-
-    def invoke(self, context, event):
-        self.token = ""
-        return context.window_manager.invoke_props_dialog(self)
-
-    def draw(self, context):
-        self.layout.prop(self, "token")
-        self.layout.label(text="Empty clears it. Both agents must hold the same token.", icon="INFO")
-
-    def execute(self, context):
-        t = _agent_transport()
-        if t is None:
-            return {"CANCELLED"}
-        t.set_config(token=self.token)
-        self.token = ""
-        self.report({"INFO"}, "token sent to the agent")
-        return {"FINISHED"}
+    t = _agent_transport()
+    role = ((getattr(t, "agent_config", None) or {}).get("role") if t is not None else None) \
+        or transport_agent.registered_role() or str(prefs.role).lower()
+    return "Send scene (host)" if role == "host" else "Receive scene (replica)"
 
 
 class QCB_OT_open_agent_settings(Operator):
@@ -427,44 +370,17 @@ class QCB_OT_open_agent_settings(Operator):
 
     @classmethod
     def poll(cls, context):
-        t = _agent_transport()
-        return t is not None and bool(getattr(t, "agent_exe", ""))
+        return bool(_agent_exe())
 
     def execute(self, context):
         import subprocess
 
-        t = _agent_transport()
-        exe = getattr(t, "agent_exe", "")
+        exe = _agent_exe()
         try:
             subprocess.Popen([exe, "--settings"])
         except OSError as exc:
             self.report({"ERROR"}, f"could not start the settings window: {exc}")
             return {"CANCELLED"}
-        return {"FINISHED"}
-
-
-class QCB_OT_agent_save_paths(Operator):
-    bl_idname = "qcbridge.agent_save_paths"
-    bl_label = "Save to Agent"
-    bl_description = (
-        "Send the path-mapping table and the cache root to the agent, which "
-        "owns them; the host's rows reach the replica at the next pairing"
-    )
-
-    @classmethod
-    def poll(cls, context):
-        return session.running() and _agent_transport() is not None
-
-    def execute(self, context):
-        from .ring1 import pathmap
-
-        prefs = get_prefs(context)
-        t = _agent_transport()
-        if t is None:
-            return {"CANCELLED"}
-        rows = pathmap.rows_to_wire(session._prefs_mappings(prefs))
-        t.set_config(path_mappings=rows, cache_root=prefs.cache_root or "")
-        self.report({"INFO"}, f"{len(rows)} mapping row(s) and the cache root sent to the agent")
         return {"FINISHED"}
 
 
@@ -593,44 +509,39 @@ class QCBridgePreferences(AddonPreferences):
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(self, "role")
-
-        box = layout.box()
         agent_mode = session._use_agent(self)
+
         if agent_mode:
-            # The agent owns the connection. What it reports is shown while a
-            # session is attached; the fields below are overrides and the
-            # zmq fallback, not the source of truth.
+            # Everything about the connection is the agent's (2026-09-25):
+            # role, token, receiver, listen address, network mode, shared
+            # folder, path mappings, cache root, kiosk. The preferences
+            # show what the agent reports and open its window; they hold
+            # no copy to edit. Only the Pixel Path below is Blender's own.
+            box = layout.box()
             row = box.row()
             row.label(text="Connection — managed by the QCBridge Agent", icon="LINKED")
             row.operator("qcbridge.open_agent_settings", icon="PREFERENCES")
+            col = box.column(align=True)
+            col.label(text=f"Role: {_agent_role_label(self)}")
             t = _agent_transport()
             ac = getattr(t, "agent_config", None) or {}
             if ac:
-                col = box.column(align=True)
-                col.label(text=f"Agent: {ac.get('name', '?')}  ·  role {ac.get('role', '?')}")
-                if self.role == "HOST":
-                    col.label(text=f"Dials: {ac.get('peer') or '(none set)'}")
-                    fp = ac.get("fingerprint") or ""
-                    col.label(text=f"Pinned replica cert: {fp[:16] + '…' if fp else '(learn on first use)'}")
+                col.label(text=f"Agent: {ac.get('name', '?')}")
+                if ac.get("role") == "host":
+                    col.label(text=f"Dials: {ac.get('peer') or '(no receiver set)'}")
                 else:
                     col.label(text=f"Listens: {ac.get('listen', '?')}  ·  {ac.get('discovery', '?')}")
-                # The agent holds the token; only its fingerprint is shown,
-                # so the two ends can compare without reading a secret out.
-                row = col.row(align=True)
                 if ac.get("token_set"):
-                    row.label(text=f"Token: set · {ac.get('token_fingerprint', '')}", icon="LOCKED")
+                    col.label(text=f"Token: set · {ac.get('token_fingerprint', '')}", icon="LOCKED")
                 else:
-                    row.label(text="Token: not set", icon="UNLOCKED")
-                row.operator("qcbridge.agent_set_token", text="", icon="GREASEPENCIL")
+                    col.label(text="Token: not set — set it in the agent's settings", icon="UNLOCKED")
+                col.label(text=f"Shared folder: {ac.get('shared_root') or '(not set)'}")
             else:
-                box.label(text="Start a session to see the agent's settings", icon="INFO")
-            if self.role == "HOST":
-                box.prop(self, "replica_address", text="Address override (blank = agent's peer)")
-            else:
-                box.prop(self, "bind_address")
-            box.prop(self, "port_control", text="Port (when overriding)")
+                col.label(text="Start a session to see what the agent reports", icon="INFO")
+            replica = _agent_role_label(self).startswith("Receive")
         else:
+            layout.prop(self, "role")
+            box = layout.box()
             box.label(text="Connection")
             if self.role == "HOST":
                 box.prop(self, "replica_address")
@@ -641,8 +552,9 @@ class QCBridgePreferences(AddonPreferences):
             row.prop(self, "port_hot")
             row.prop(self, "port_cold")
             box.prop(self, "token")
+            replica = self.role == "REPLICA"
 
-        if self.role == "REPLICA":
+        if replica:
             box = layout.box()
             box.label(text="Pixel Path")
             box.prop(self, "enable_stream")
@@ -653,7 +565,11 @@ class QCBridgePreferences(AddonPreferences):
             sub.prop(self, "srt_url")
             sub.prop(self, "encoder_rung")
             sub.prop(self, "ffmpeg_path")
-            box.prop(self, "replica_kiosk")
+            if not agent_mode:
+                box.prop(self, "replica_kiosk")
+
+        if agent_mode:
+            return
 
         row = layout.row(align=True)
         row.operator("qcbridge.settings_save", icon="EXPORT")
@@ -665,16 +581,7 @@ class QCBridgePreferences(AddonPreferences):
         box.label(text="Set before baking; baked caches stay put until re-baked.", icon="INFO")
 
         box = layout.box()
-        if agent_mode:
-            # The agent owns the table and the cache root (2026-09-24). What
-            # is shown here mirrors the agent while a session runs; an edit
-            # goes back through Save to Agent. The host's rows reach the
-            # replica in the hello, so one machine's table is enough.
-            row = box.row()
-            row.label(text="Path Mappings — owned by the agent", icon="LINKED")
-            row.operator("qcbridge.agent_save_paths", icon="EXPORT")
-        else:
-            box.label(text="Path Mappings (Windows root ↔ macOS root)")
+        box.label(text="Path Mappings (Windows root ↔ macOS root)")
         row = box.row()
         row.template_list(
             "QCB_UL_path_mappings", "", self, "path_mappings",
@@ -694,7 +601,12 @@ class QCB_PT_main(Panel):
     def draw(self, context):
         layout = self.layout
         prefs = get_prefs(context)
-        if session.running():
+        agent_mode = session._use_agent(prefs)
+        if agent_mode:
+            row = layout.row(align=True)
+            row.label(text=f"Role: {_agent_role_label(prefs)}")
+            row.operator("qcbridge.open_agent_settings", text="", icon="PREFERENCES")
+        elif session.running():
             layout.label(text=f"Role: {prefs.role.title()}")
         else:
             layout.prop(prefs, "role", text="Role")
@@ -721,27 +633,9 @@ class QCB_PT_main(Panel):
                 op.delta = 6.0
                 op = row.operator("qcbridge.replica_zoom", text="", icon="LOOP_BACK")
                 op.reset = True
-                t = _agent_transport()
-                if t is not None:
-                    box = layout.box()
-                    row = box.row(align=True)
-                    row.prop(prefs, "replica_address", text="", placeholder="address to probe, or blank to sweep")
-                    row.operator("qcbridge.discover", text="", icon="VIEWZOOM")
-                    peers = list(getattr(t, "peers", []))
-                    if peers:
-                        srcs = ", ".join(getattr(t, "peers_sources", []))
-                        box.label(text=f"Found via {srcs}:" if srcs else "Found:")
-                        for i, p in enumerate(peers):
-                            state = "in a session" if p.get("paired") else "free"
-                            op = box.operator(
-                                "qcbridge.pick_peer",
-                                text=f"{p.get('n') or p.get('ip')}  ·  {p.get('ip')}:{p.get('port')}  ·  {state}",
-                                icon="LINKED" if p.get("paired") else "UNLINKED",
-                            )
-                            op.index = i
         else:
             layout.operator("qcbridge.session_start", icon="PLAY")
-        if prefs.role == "REPLICA":
+        if (_agent_role_label(prefs).startswith("Receive") if agent_mode else prefs.role == "REPLICA"):
             label = "Exit Minimal Mode" if kiosk.active() else "Minimal Mode"
             layout.operator("qcbridge.kiosk_toggle", text=label, icon="FULLSCREEN_ENTER")
 
@@ -765,12 +659,8 @@ _classes = (
     QCB_OT_shot_mode,
     QCB_OT_replica_zoom,
     QCB_OT_open_qcview,
-    QCB_OT_agent_set_token,
-    QCB_OT_agent_save_paths,
     QCB_OT_open_agent_settings,
     QCB_OT_copy_stream_url,
-    QCB_OT_discover,
-    QCB_OT_pick_peer,
     QCBridgePreferences,
     QCB_PT_main,
 )
