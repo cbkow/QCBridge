@@ -156,7 +156,7 @@ filer:/export/renders on /Volumes/renders (nfs, nodev, nosuid)
         );
         assert_eq!(other_form("/Volumes/jobs/", &t).unwrap().1, "\\\\nas.local\\jobs");
         assert_eq!(other_form("/Volumes/jobs-archive/x", &t), None, "component boundary");
-        assert_eq!(other_form("/Users/chris/Desktop", &t), None, "local folder");
+        assert_eq!(other_form("/Users/someone/Desktop", &t), None, "local folder");
     }
 
     #[test]

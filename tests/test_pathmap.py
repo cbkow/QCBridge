@@ -40,14 +40,14 @@ def test_mac_to_win_and_back():
 def test_bare_drive_mapping_does_not_capture_other_drives():
     maps = [
         mapping("U:\\", "/Volumes/Jobs_Live"),
-        mapping("C:\\Volumes\\union-ny-gfx\\union-jobs\\", "/Volumes/union-ny-gfx/union-jobs"),
+        mapping("C:\\Volumes\\studio\\jobs\\", "/Volumes/studio/jobs"),
     ]
-    out = translate("win", "win", "C:/Volumes/union-ny-gfx/union-jobs/261317_x/file.mov", maps)
-    assert out == "C:\\Volumes\\union-ny-gfx\\union-jobs\\261317_x\\file.mov"
-    out = translate("win", "mac", "U:\\261317_x\\file.mov", maps)
-    assert out == "/Volumes/Jobs_Live/261317_x/file.mov"
-    out = translate("mac", "win", "/Volumes/Jobs_Live/261317_x/file.mov", maps)
-    assert out == "U:\\261317_x\\file.mov"
+    out = translate("win", "win", "C:/Volumes/studio/jobs/100001_x/file.mov", maps)
+    assert out == "C:\\Volumes\\studio\\jobs\\100001_x\\file.mov"
+    out = translate("win", "mac", "U:\\100001_x\\file.mov", maps)
+    assert out == "/Volumes/Jobs_Live/100001_x/file.mov"
+    out = translate("mac", "win", "/Volumes/Jobs_Live/100001_x/file.mov", maps)
+    assert out == "U:\\100001_x\\file.mov"
 
 
 def test_drive_letterless_win_path_matches():
@@ -151,7 +151,7 @@ def test_canonical_round_trip_on_mac():
 
 def test_is_mapped():
     assert is_mapped("mac", "/Volumes/studio-nas/jobs/x", NAS)
-    assert not is_mapped("mac", "/Users/chris/Desktop/x", NAS)
+    assert not is_mapped("mac", "/Users/someone/Desktop/x", NAS)
     assert is_mapped("win", "C:\\Volumes\\studio-nas\\jobs\\x", NAS)
     assert not is_mapped("win", "D:\\elsewhere\\x", NAS)
 
