@@ -341,7 +341,7 @@ impl App {
                         let v = self.draft.blender_path.clone();
                         self.send(json!({"blender_path": v}));
                     }
-                    if ui.button("Browse…").clicked() {
+                    if theme::icon_button(ui, theme::ph::FOLDER, "Browse").clicked() {
                         if let Some(p) = rfd::FileDialog::new().set_title("The Blender to run for a sender").pick_file() {
                             let mut p = p;
                             if cfg!(target_os = "macos") && p.extension().map(|e| e == "app").unwrap_or(false) {
@@ -386,11 +386,11 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.draft.token_input).password(true).desired_width(260.0).hint_text("type the token"));
-                    if ui.add_enabled(!self.draft.token_input.is_empty(), egui::Button::new("Set")).clicked() {
+                    if ui.add_enabled_ui(!self.draft.token_input.is_empty(), |ui| theme::icon_button(ui, theme::ph::CHECK, "Set")).inner.clicked() {
                         let t = std::mem::take(&mut self.draft.token_input);
                         self.send(json!({"token": t}));
                     }
-                    if set && ui.button("Clear").clicked() {
+                    if set && theme::icon_button(ui, theme::ph::X, "Clear").clicked() {
                         self.send(json!({"token": ""}));
                     }
                 });
@@ -402,7 +402,7 @@ impl App {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         self.text_field_w(ui, "peer", |d| &mut d.peer, 260.0).on_hover_text("address:port of the receiving machine's agent (its listen port, 19990 by default)");
-                        if ui.button("Find receivers").clicked() {
+                        if theme::icon_button(ui, theme::ph::MAGNIFYING_GLASS, "Find receivers").clicked() {
                             if let Some(c) = &self.client {
                                 let addr = self.draft.peer.split(':').next().unwrap_or("").trim().to_string();
                                 let mut cmd = json!({"cmd": "discover"});
@@ -421,7 +421,7 @@ impl App {
                             ui.label(RichText::new("no certificate pinned yet — pinned on first pairing").weak());
                         } else {
                             ui.label(RichText::new(format!("pinned certificate {}…", pinned.chars().take(16).collect::<String>())).weak());
-                            if ui.button("Forget").on_hover_text("Trust the receiver's certificate afresh at the next pairing").clicked() {
+                            if theme::icon_button(ui, theme::ph::X_CIRCLE, "Forget").on_hover_text("Trust the receiver's certificate afresh at the next pairing").clicked() {
                                 if let Some(c) = &self.client { c.cmd(json!({"cmd": "forget_fingerprint"})); }
                             }
                         }
@@ -440,7 +440,7 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.label(format!("{name}  {ip}:{port}  {}{}", fp.chars().take(12).collect::<String>(), if paired { "  (paired)" } else { "" }));
                             let can = role == "replica" && port > 0;
-                            if ui.add_enabled(can, egui::Button::new("Pair")).clicked() {
+                            if ui.add_enabled_ui(can, |ui| theme::icon_button(ui, theme::ph::LINK, "Pair")).inner.clicked() {
                                 let peer = format!("{ip}:{port}");
                                 self.draft.peer = peer.clone();
                                 self.send(json!({"peer": peer, "fingerprint": fp}));
@@ -518,7 +518,7 @@ impl App {
                 let hint = if self.this_side_is_win() { r"\\server\share\folder or M:\folder" } else { "/Volumes/share/folder" };
                 let r = ui.add(egui::TextEdit::singleline(&mut root).desired_width(w.max(200.0)).hint_text(hint));
                 if r.lost_focus() || (r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) { commit = true; }
-                if ui.button("Browse…").clicked() {
+                if theme::icon_button(ui, theme::ph::FOLDER, "Browse").clicked() {
                     if let Some(p) = self.pick_folder(&root) {
                         root = p;
                         commit = true;
@@ -563,7 +563,7 @@ impl App {
                     let w = ui.available_width() - 100.0;
                     self.text_field_w(ui, "cache_root", |d| &mut d.cache_root, w)
                         .on_hover_text("Where the sender writes simulation caches. Normally the shared root's `cache` subfolder.");
-                    if ui.button("Browse…").clicked() {
+                    if theme::icon_button(ui, theme::ph::FOLDER, "Browse").clicked() {
                         if let Some(p) = self.pick_folder(&self.draft.cache_root.clone()) {
                             self.draft.cache_root = p.clone();
                             self.send(json!({"cache_root": p}));
@@ -576,7 +576,7 @@ impl App {
                     let w = ui.available_width() - 100.0;
                     self.text_field_w(ui, "phonebook", |d| &mut d.phonebook, w)
                         .on_hover_text("Where receivers list themselves. Normally the shared root's `phonebook` subfolder. Empty = off.");
-                    if ui.button("Browse…").clicked() {
+                    if theme::icon_button(ui, theme::ph::FOLDER, "Browse").clicked() {
                         if let Some(p) = self.pick_folder(&self.draft.phonebook.clone()) {
                             self.draft.phonebook = p.clone();
                             self.send(json!({"phonebook": p}));
@@ -601,7 +601,7 @@ impl App {
                 let row = &mut self.draft.rows[i];
                 ui.label(RichText::new(format!("{}.", i + 1)).weak());
                 if ui.add(egui::TextEdit::singleline(&mut row.label).desired_width(120.0).hint_text("label")).changed() { self.draft.rows_dirty = true; }
-                if ui.small_button("×").on_hover_text("Remove this root").clicked() { remove = Some(i); }
+                if theme::glyph_button(ui, theme::ph::X, "Remove this root").clicked() { remove = Some(i); }
             });
             let mut picked: Option<bool> = None; // Some(true) = win column
             egui::Grid::new(format!("row{i}")).num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
@@ -610,7 +610,7 @@ impl App {
                     let w = ui.available_width() - if this_is_win { 40.0 } else { 12.0 };
                     let row = &mut self.draft.rows[i];
                     if ui.add(egui::TextEdit::singleline(&mut row.win).desired_width(w.max(200.0))).changed() { self.draft.rows_dirty = true; }
-                    if this_is_win && ui.small_button("…").clicked() { picked = Some(true); }
+                    if this_is_win && theme::glyph_button(ui, theme::ph::FOLDER, "Choose the folder on this machine").clicked() { picked = Some(true); }
                 });
                 ui.end_row();
                 ui.label(RichText::new("macOS").weak());
@@ -618,7 +618,7 @@ impl App {
                     let w = ui.available_width() - if this_is_win { 12.0 } else { 40.0 };
                     let row = &mut self.draft.rows[i];
                     if ui.add(egui::TextEdit::singleline(&mut row.mac).desired_width(w.max(200.0))).changed() { self.draft.rows_dirty = true; }
-                    if !this_is_win && ui.small_button("…").clicked() { picked = Some(false); }
+                    if !this_is_win && theme::glyph_button(ui, theme::ph::FOLDER, "Choose the folder on this machine").clicked() { picked = Some(false); }
                 });
                 ui.end_row();
             });
@@ -654,16 +654,16 @@ impl App {
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if ui.button("Add root").clicked() {
+            if theme::icon_button(ui, theme::ph::PLUS, "Add root").clicked() {
                 self.draft.rows.push(Row { enabled: true, ..Default::default() });
                 self.draft.rows_dirty = true;
             }
-            if ui.add_enabled(self.draft.rows_dirty, egui::Button::new("Apply roots")).clicked() {
+            if ui.add_enabled_ui(self.draft.rows_dirty, |ui| theme::icon_button(ui, theme::ph::CHECK, "Apply roots")).inner.clicked() {
                 let rows: Vec<Value> = self.draft.rows.iter().filter(|r| !(r.win.is_empty() && r.mac.is_empty())).map(Row::to_json).collect();
                 self.send(json!({"path_mappings": rows}));
                 self.draft.rows_dirty = false;
             }
-            if self.draft.rows_dirty && ui.button("Revert").clicked() {
+            if self.draft.rows_dirty && theme::icon_button(ui, theme::ph::ARROW_COUNTER_CLOCKWISE, "Revert").clicked() {
                 let remote = self.remote.clone();
                 self.take_config(remote, true);
             }
@@ -698,7 +698,7 @@ impl App {
             ui.label("Blender"); ui.label(if self.addon_attached { "attached to the agent" } else { "not attached" }); ui.end_row();
             ui.label("Config"); ui.horizontal(|ui| {
                 ui.monospace(self.cfg_path.to_string_lossy());
-                if ui.small_button("Open folder").clicked() { open_folder(&self.base); }
+                if theme::icon_button(ui, theme::ph::FOLDER_OPEN, "Open folder").clicked() { open_folder(&self.base); }
             }); ui.end_row();
             ui.label("Log"); ui.monospace(self.base.join("agent.log").to_string_lossy()); ui.end_row();
         });
@@ -750,7 +750,7 @@ impl eframe::App for App {
                 ui.colored_label(theme::WARN, "The agent is not running on this machine.");
                 ui.label(RichText::new(&self.connect_err).weak());
                 ui.add_space(8.0);
-                if ui.button("Start the agent").clicked() {
+                if theme::icon_button(ui, theme::ph::PLAY, "Start the agent").clicked() {
                     if let Ok(exe) = std::env::current_exe() {
                         let _ = std::process::Command::new(exe).arg("--config").arg(&self.cfg_path).spawn();
                     }

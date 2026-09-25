@@ -30,9 +30,50 @@ pub const ERROR: Color32 = Color32::from_rgb(0xc0, 0x40, 0x40);
 const INTER: &[u8] = include_bytes!("../../assets/fonts/Inter_18pt-Regular.ttf");
 const INTER_BOLD: &[u8] = include_bytes!("../../assets/fonts/Inter_18pt-Bold.ttf");
 const MONO: &[u8] = include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf");
+const PHOSPHOR: &[u8] = include_bytes!("../../assets/fonts/Phosphor.ttf");
 
 pub fn bold() -> FontFamily {
     FontFamily::Name("inter-bold".into())
+}
+
+pub fn icons() -> FontFamily {
+    FontFamily::Name("phosphor".into())
+}
+
+/// Phosphor glyphs, the subset QCView ships (codepoints from its
+/// PhosphorIcons.js).
+pub mod ph {
+    pub const FOLDER: char = '\u{E24A}';
+    pub const FOLDER_OPEN: char = '\u{E256}';
+    pub const X: char = '\u{E4F6}';
+    pub const X_CIRCLE: char = '\u{E4F8}';
+    pub const MAGNIFYING_GLASS: char = '\u{E30C}';
+    pub const LINK: char = '\u{E2E2}';
+    pub const CHECK: char = '\u{E182}';
+    pub const PLUS: char = '\u{E3D4}';
+    pub const ARROW_COUNTER_CLOCKWISE: char = '\u{E038}';
+    pub const PLAY: char = '\u{E3D0}';
+    pub const LOCK: char = '\u{E2FA}';
+}
+
+/// An icon glyph as rich text, sized to sit beside body text.
+pub fn icon(code: char) -> egui::RichText {
+    egui::RichText::new(code.to_string()).font(FontId::new(14.0, icons()))
+}
+
+/// A button with a Phosphor glyph before its label, the way QCView's
+/// FlatButton pairs icon and text.
+pub fn icon_button(ui: &mut egui::Ui, code: char, label: &str) -> egui::Response {
+    let mut job = egui::text::LayoutJob::default();
+    let color = ui.visuals().widgets.inactive.fg_stroke.color;
+    job.append(&code.to_string(), 0.0, egui::TextFormat { font_id: FontId::new(13.0, icons()), color, valign: egui::Align::Center, ..Default::default() });
+    job.append(label, 5.0, egui::TextFormat { font_id: FontId::new(12.0, FontFamily::Proportional), color, valign: egui::Align::Center, ..Default::default() });
+    ui.add(egui::Button::new(job))
+}
+
+/// A glyph-only button for row actions (pick, remove).
+pub fn glyph_button(ui: &mut egui::Ui, code: char, tip: &str) -> egui::Response {
+    ui.add(egui::Button::new(icon(code)).min_size(Vec2::new(22.0, 20.0))).on_hover_text(tip)
 }
 
 pub fn apply(ctx: &egui::Context) {
@@ -42,6 +83,8 @@ pub fn apply(ctx: &egui::Context) {
     fonts.font_data.insert("inter".into(), Arc::new(FontData::from_static(INTER)));
     fonts.font_data.insert("inter-bold".into(), Arc::new(FontData::from_static(INTER_BOLD)));
     fonts.font_data.insert("jetbrains-mono".into(), Arc::new(FontData::from_static(MONO)));
+    fonts.font_data.insert("phosphor".into(), Arc::new(FontData::from_static(PHOSPHOR)));
+    fonts.families.insert(icons(), vec!["phosphor".into()]);
     fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "inter".into());
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "jetbrains-mono".into());
     fonts.families.insert(bold(), vec!["inter-bold".into(), "inter".into()]);

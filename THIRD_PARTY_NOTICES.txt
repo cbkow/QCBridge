@@ -17,6 +17,8 @@ Inter — SIL Open Font License 1.1
   https://rsms.me/inter/ — License text: agent/assets/fonts/Inter-LICENSE.txt
 JetBrains Mono — SIL Open Font License 1.1
   https://www.jetbrains.com/lp/mono/ — License text: agent/assets/fonts/JetBrainsMono-LICENSE.txt
+Phosphor Icons (icon font, the subset QCView ships) — MIT
+  https://phosphoricons.com — License text: agent/assets/fonts/Phosphor-LICENSE.txt
 
 3. External tools (invoked at runtime, NOT distributed with QCBridge)
 ---------------------------------------------------------------------
