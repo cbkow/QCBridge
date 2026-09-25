@@ -1,6 +1,5 @@
 //! QCBridge Agent — tray app owning the QUIC connection, the capture child
-//! and (replica) Blender's lifecycle. See spikes/parity/PLAN.md "The QCBridge
-//! Agent". Config: <config dir>/QCBridge/agent.toml; the addon finds the
+//! and (replica) Blender's lifecycle (design: CONTROL-AUDIT.md). Config: <config dir>/QCBridge/agent.toml; the addon finds the
 //! local socket via agent.json next to it.
 //!
 //! GPL-3.0-or-later, same as the repository. SOURCE_URL is still reported by

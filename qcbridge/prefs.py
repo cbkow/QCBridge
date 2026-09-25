@@ -19,7 +19,7 @@ from .ring0 import kiosk, session
 
 ENCODER_RUNGS = [
     # (identifier, label, description) — judged on a production scene,
-    # spikes/stage0-capture-harness/results/windows-v0-matrix/notes.md
+    # (the stage-0 capture harness's Windows matrix, 2026-09)
     (
         "hevc_10_420_100",
         "HEVC 10-bit 4:2:0 100M (default)",

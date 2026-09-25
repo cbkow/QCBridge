@@ -1,6 +1,6 @@
 """Kiosk mode — reduce the replica to pure viewport pixels (decision #13).
 
-Port of the proven spike (spikes/stage0-capture-harness/win_kiosk.py),
+Port of the proven stage-0 kiosk spike,
 restructured as a state machine serviced by the replica apply loop's tick —
 deliberately NO timers of its own. Tier-3 bootstrap calls open_mainfile from
 inside a timer callback; registering or owning separate timers around that
