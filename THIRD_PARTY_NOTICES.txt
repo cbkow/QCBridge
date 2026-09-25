@@ -11,7 +11,14 @@ pyzmq — BSD-3-Clause
   The pyzmq binary wheels statically bundle libzmq (ZeroMQ), licensed
   MPL-2.0: https://github.com/zeromq/libzmq — https://www.mozilla.org/MPL/2.0/
 
-2. External tools (invoked at runtime, NOT distributed with QCBridge)
+2. Fonts embedded in the agent's settings window (agent/assets/fonts/)
+----------------------------------------------------------------------
+Inter — SIL Open Font License 1.1
+  https://rsms.me/inter/ — License text: agent/assets/fonts/Inter-LICENSE.txt
+JetBrains Mono — SIL Open Font License 1.1
+  https://www.jetbrains.com/lp/mono/ — License text: agent/assets/fonts/JetBrainsMono-LICENSE.txt
+
+3. External tools (invoked at runtime, NOT distributed with QCBridge)
 ---------------------------------------------------------------------
 FFmpeg — GPL/LGPL (build-dependent)
   https://ffmpeg.org

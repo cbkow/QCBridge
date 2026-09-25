@@ -10,12 +10,13 @@
 //! platform's path from the mount table), stream, diagnostics.
 
 mod client;
+mod theme;
 
 use crate::config::{self, PathMapping};
 use crate::mounts;
 use anyhow::Result;
 use client::Client;
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -38,6 +39,7 @@ pub fn run(cfg_path: PathBuf) -> Result<()> {
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_pixels_per_point(cc.egui_ctx.pixels_per_point().max(1.0));
+            theme::apply(&cc.egui_ctx);
             Ok(Box::new(App::new(cfg_path, shot)))
         }),
     )
@@ -311,7 +313,7 @@ impl App {
     }
 
     fn section_machine(&mut self, ui: &mut egui::Ui) {
-        ui.heading("This machine");
+        theme::section(ui, "This machine");
         egui::Grid::new("machine").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label("Name");
             let r = self.text_field(ui, "name", |d| &mut d.name);
@@ -371,7 +373,7 @@ impl App {
     }
 
     fn section_pairing(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Pairing");
+        theme::section(ui, "Pairing");
         egui::Grid::new("pairing").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label("Token");
             ui.vertical(|ui| {
@@ -380,7 +382,7 @@ impl App {
                 if set {
                     ui.label(format!("set · fingerprint {fp} — the other machine must show the same"));
                 } else {
-                    ui.colored_label(Color32::from_rgb(200, 120, 0), "not set — both machines need the same token");
+                    ui.colored_label(theme::WARN, "not set — both machines need the same token");
                 }
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.draft.token_input).password(true).desired_width(260.0).hint_text("type the token"));
@@ -411,7 +413,7 @@ impl App {
                         }
                     });
                     if self.peer_up {
-                        ui.label(RichText::new(format!("paired · receiver certificate {}…", self.peer_fingerprint.chars().take(16).collect::<String>())).color(Color32::from_rgb(40, 160, 90)));
+                        ui.label(RichText::new(format!("paired · receiver certificate {}…", self.peer_fingerprint.chars().take(16).collect::<String>())).color(theme::SUCCESS));
                     }
                     let pinned = self.remote_str("fingerprint");
                     ui.horizontal(|ui| {
@@ -456,7 +458,7 @@ impl App {
                         ui.label(RichText::new(format!("this machine's certificate {}…", self.own_fingerprint.chars().take(16).collect::<String>())).weak());
                     }
                     if self.peer_up {
-                        ui.label(RichText::new("a sender is connected").color(Color32::from_rgb(40, 160, 90)));
+                        ui.label(RichText::new("a sender is connected").color(theme::SUCCESS));
                     }
                 });
                 ui.end_row();
@@ -504,7 +506,7 @@ impl App {
     }
 
     fn section_storage(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Shared storage");
+        theme::section(ui, "Shared storage");
         ui.label(RichText::new("The folder on storage both machines see, as this machine sees it. Simulation caches go in its `cache` subfolder and receivers list themselves in `phonebook`; every subfolder maps on its own.").weak());
         ui.add_space(4.0);
         let mut root = self.draft.shared_root.clone();
@@ -599,7 +601,7 @@ impl App {
                 let row = &mut self.draft.rows[i];
                 ui.label(RichText::new(format!("{}.", i + 1)).weak());
                 if ui.add(egui::TextEdit::singleline(&mut row.label).desired_width(120.0).hint_text("label")).changed() { self.draft.rows_dirty = true; }
-                if ui.small_button("✕").on_hover_text("Remove this root").clicked() { remove = Some(i); }
+                if ui.small_button("×").on_hover_text("Remove this root").clicked() { remove = Some(i); }
             });
             let mut picked: Option<bool> = None; // Some(true) = win column
             egui::Grid::new(format!("row{i}")).num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
@@ -666,13 +668,13 @@ impl App {
                 self.take_config(remote, true);
             }
             if self.draft.rows_dirty {
-                ui.label(RichText::new("unsaved edits").color(Color32::from_rgb(200, 120, 0)));
+                ui.label(RichText::new("unsaved edits").color(theme::WARN));
             }
         });
     }
 
     fn section_stream(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Stream");
+        theme::section(ui, "Stream");
         egui::Grid::new("stream").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
             ui.label("Wire-rate cap");
             ui.horizontal(|ui| {
@@ -690,7 +692,7 @@ impl App {
     }
 
     fn section_diagnostics(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Diagnostics");
+        theme::section(ui, "Diagnostics");
         egui::Grid::new("diag").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
             ui.label("Agent"); ui.label(format!("{} · {}", self.version, self.status)); ui.end_row();
             ui.label("Blender"); ui.label(if self.addon_attached { "attached to the agent" } else { "not attached" }); ui.end_row();
@@ -745,7 +747,7 @@ impl eframe::App for App {
             if self.client.is_none() {
                 ui.heading("QCBridge Agent");
                 ui.add_space(8.0);
-                ui.colored_label(Color32::from_rgb(200, 120, 0), "The agent is not running on this machine.");
+                ui.colored_label(theme::WARN, "The agent is not running on this machine.");
                 ui.label(RichText::new(&self.connect_err).weak());
                 ui.add_space(8.0);
                 if ui.button("Start the agent").clicked() {
@@ -760,12 +762,12 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.heading(format!("QCBridge Agent — {}", self.draft.name));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let color = if self.peer_up { Color32::from_rgb(40, 160, 90) } else { Color32::GRAY };
+                        let color = if self.peer_up { theme::SUCCESS } else { theme::TEXT_SECONDARY };
                         ui.label(RichText::new(&self.status).color(color));
                     });
                 });
                 if !self.note.is_empty() {
-                    let color = if self.note_is_error { Color32::from_rgb(200, 60, 60) } else { Color32::from_rgb(40, 160, 90) };
+                    let color = if self.note_is_error { theme::ERROR } else { theme::SUCCESS };
                     ui.label(RichText::new(&self.note).color(color).small());
                 }
                 ui.separator();
