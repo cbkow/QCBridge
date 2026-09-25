@@ -132,8 +132,8 @@ mod tests {
     const MAC: &str = "\
 /dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)
 devfs on /dev (devfs, local, nobrowse)
-//chris@nas.local/jobs on /Volumes/jobs (smbfs, nodev, nosuid, mounted by chris)
-//nas.local/assets/ on /Volumes/assets (smbfs, nodev, nosuid, mounted by chris)
+//someone@nas.local/jobs on /Volumes/jobs (smbfs, nodev, nosuid, mounted by someone)
+//nas.local/assets/ on /Volumes/assets (smbfs, nodev, nosuid, mounted by someone)
 filer:/export/renders on /Volumes/renders (nfs, nodev, nosuid)
 ";
 
