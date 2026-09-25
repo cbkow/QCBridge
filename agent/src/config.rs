@@ -73,7 +73,7 @@ pub struct Config {
     /// replica at pairing.
     pub path_mappings: Vec<PathMapping>,
     /// Host: shared cache root for simulation caches (the addon's
-    /// `CACHES.md`). Empty = off.
+    /// DESIGN-NOTES caches). Empty = off.
     pub cache_root: String,
     /// The shared storage folder as this machine sees it. The other
     /// machine's spelling is the mapping table's business: a row forms at

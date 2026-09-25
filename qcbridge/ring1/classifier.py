@@ -12,7 +12,7 @@ from __future__ import annotations
 from .dirtyset import Tier
 
 # 0.15 until 2026-09-23: it was 80 % of a delta's edit→visible time
-# (SYNC-AUDIT §1). 0.08 still coalesces a drag (UI events arrive every
+# (DESIGN-NOTES sync §1). 0.08 still coalesces a drag (UI events arrive every
 # ~16 ms) and the fast lane makes the extra sends cheap.
 DEBOUNCE_S = 0.08
 

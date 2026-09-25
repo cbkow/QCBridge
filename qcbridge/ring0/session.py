@@ -330,7 +330,7 @@ def _start_host(prefs) -> None:
                 # Fresh handshake = fresh epoch pairing → full bootstrap
                 # (decision #16). Transport blips re-handshake too, with a
                 # fresh host epoch, because frames sent into the outage are
-                # gone (SYNC-AUDIT A6) and the replica may be a new process.
+                # gone (DESIGN-NOTES sync A6) and the replica may be a new process.
                 state["sync"].send_bootstrap()
                 # Re-assert host-owned replica state a fresh session lost.
                 transport.request_nowait(
@@ -482,7 +482,7 @@ def _start_replica(prefs) -> None:
             "errors": replica_apply.stats["apply_errors"],
             "unknown": replica_apply.stats["unknown_uuid"],
             # Everything else the replica knows and the host could not see
-            # (SYNC-AUDIT §4.2): who we are, what we want, what went wrong.
+            # (DESIGN-NOTES sync §4.2): who we are, what we want, what went wrong.
             "epoch": epoch,
             "want_resync": replica_apply.stats["want_resync"],
             "seq_fast": replica_apply.stats["seq_fast"],

@@ -39,7 +39,7 @@ def _dump():
 
 
 if os.environ.get("QCB_SMOKE_LOCAL_EDIT"):
-    # 12 s in: edit the replica by hand (SYNC-AUDIT A9). The host must be told.
+    # 12 s in: edit the replica by hand (DESIGN-NOTES sync A9). The host must be told.
     def _local_edit():
         o = bpy.data.objects.get("Probe")
         if o is not None:

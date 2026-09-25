@@ -164,7 +164,7 @@ def setup():
     _new_mesh_obj("CovVParentTarget")
     # object to receive light linking
     _new_mesh_obj("CovLLTarget")
-    # a geometry-nodes simulation zone: its bake is RNA-invisible (CACHES.md)
+    # a geometry-nodes simulation zone: its bake is RNA-invisible (DESIGN-NOTES caches)
     with ops_ctx():
         bpy.ops.mesh.primitive_cube_add(size=1, location=(6, 0, 0))
     sim = bpy.context.active_object; sim.name = "CovSim"

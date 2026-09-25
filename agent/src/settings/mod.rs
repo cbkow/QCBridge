@@ -1,5 +1,5 @@
 //! The settings window (`qcbridge-agent --settings`): the tray's UI, as
-//! decided 2026-09-24 (CONTROL-AUDIT.md §8). One native window, its own
+//! decided 2026-09-24 (DESIGN-NOTES agent §8). One native window, its own
 //! process, attached to the running agent as a control client. Every
 //! value shown is the agent's: a field commits through `set_config` and
 //! the `config` event that answers is what the field then shows.

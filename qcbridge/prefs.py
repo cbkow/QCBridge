@@ -491,7 +491,7 @@ class QCBridgePreferences(AddonPreferences):
     path_mappings: CollectionProperty(type=QCB_PathMapping)
     active_mapping_index: IntProperty(default=0)
 
-    # Simulation caches (CACHES.md §4 B): a disk cache lives in
+    # Simulation caches (DESIGN-NOTES caches §4 B): a disk cache lives in
     # //blendcache_<file>/, which the replica's temp copy can never share.
     # With a root on the mapped volume the host externalizes every unbaked
     # point cache there BEFORE it is baked, and a bake on the host is a

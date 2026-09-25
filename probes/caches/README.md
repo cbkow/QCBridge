@@ -1,6 +1,6 @@
 # Cache probes
 
-The measurements behind `CACHES.md`. Headless Blender 5.2, macOS; each probe
+The measurements behind DESIGN-NOTES caches. Headless Blender 5.2, macOS; each probe
 runs a "host" half and a "replica" half in **separate processes**, because a
 same-process test cannot show what crosses a `libraries.write` or a full
 copy.

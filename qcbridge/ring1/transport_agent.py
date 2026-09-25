@@ -108,7 +108,7 @@ def pack_cold(header: dict, payload: bytes) -> bytes:
 
 def cold_parts(header: dict, payload) -> list:
     """The cold body as buffers the link writes in turn — no concatenation
-    of a 4 MiB chunk on the main thread (SYNC-AUDIT D4)."""
+    of a 4 MiB chunk on the main thread (DESIGN-NOTES sync D4)."""
     head = json.dumps(header, separators=(",", ":")).encode("utf-8")
     return [_PEER, struct.pack(">I", len(head)), head, payload]
 
@@ -452,7 +452,7 @@ class _AgentLink(_FrameLink):
     def _read_exact(self, n: int):
         """One preallocated buffer, filled in place; returns a memoryview.
         Handlers slice it without copying, and a blob chunk reaches the
-        reassembler as a view of this buffer (SYNC-AUDIT D4)."""
+        reassembler as a view of this buffer (DESIGN-NOTES sync D4)."""
         buf = bytearray(n)
         view = memoryview(buf)
         got = 0

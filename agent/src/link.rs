@@ -47,7 +47,7 @@ pub enum Out {
 /// Two queues toward the addon: `tx` for cold frames (bounded, so a slow
 /// addon pushes back on QUIC) and `prio_tx` for control, acks and events,
 /// drained first by the writer — a pong must not wait behind a 4 MiB chunk
-/// and trip the host's 3 s liveness window (SYNC-AUDIT B4).
+/// and trip the host's 3 s liveness window (DESIGN-NOTES sync B4).
 pub struct Link {
     pub tx: mpsc::Sender<Out>,
     prio_tx: mpsc::Sender<Out>,

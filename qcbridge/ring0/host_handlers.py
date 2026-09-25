@@ -56,7 +56,7 @@ _lc_memo: tuple[float, dict] = (0.0, {})
 def _layer_collections():
     """collection session_uid → LayerCollection, for the active view layer.
     Memoised for 50 ms: build_snapshot asked once per collection, an O(n²)
-    main-thread walk on collection-heavy scenes (SYNC-AUDIT D6)."""
+    main-thread walk on collection-heavy scenes (DESIGN-NOTES sync D6)."""
     global _lc_memo
     now = time.monotonic()
     if now - _lc_memo[0] < 0.05:
@@ -95,7 +95,7 @@ class HostSync:
         self.transport = transport
         self.paused_fn = paused_fn
         self.mappings = list(mappings)
-        # Shared cache root (CACHES.md §4 B): unbaked point caches become
+        # Shared cache root (DESIGN-NOTES caches §4 B): unbaked point caches become
         # external files under it, so the replica reads the same frames.
         self.cache_root = os.path.abspath(bpy.path.abspath(cache_root)) if cache_root else ""
         self.cache_note = ""
@@ -103,7 +103,7 @@ class HostSync:
         self._boot_outbox: list[tuple[dict, bytes]] = []
         # Tier-2 blobs mid-flight under backpressure, per uuid: the next
         # tick resumes from the chunk that was refused instead of
-        # re-serializing and restarting from chunk 0 (SYNC-AUDIT B3). A
+        # re-serializing and restarting from chunk 0 (DESIGN-NOTES sync B3). A
         # newer escalation of the same uuid replaces the entry.
         self._t2_outbox: dict[str, list[tuple[dict, bytes]]] = {}
         self.sent_boot = 0
@@ -183,7 +183,7 @@ class HostSync:
         the owning object; the flush diff sees "~pcache" change and
         escalates to tier 2. That partial blend carries a memory cache's
         frames but not the baked flag, and an unbaked cache is re-simulated
-        on a frame jump (probed 2026-09-23, CACHES.md) — so what crosses is
+        on a frame jump (probed 2026-09-23, DESIGN-NOTES caches) — so what crosses is
         inert. Hence bake_note and the nag for a Force Resync."""
         now = time.monotonic()
         for obj in bpy.data.objects:
@@ -196,7 +196,7 @@ class HostSync:
                 if old is not None and len(old) >= 4:
                     # A bake appearing/disappearing needs tier 3: the frames
                     # in the tier-2 partial arrive unbaked and are not read
-                    # on a frame jump (CACHES.md §2). Settings still resend
+                    # on a frame jump (DESIGN-NOTES caches §2). Settings still resend
                     # via the "~pcache" escalation; the bake itself waits on
                     # a manual Force Resync (resync stays manual, decision #8).
                     old_on = {row[0] for row in old[3] if row[1]}
@@ -248,7 +248,7 @@ class HostSync:
     def _touch_ready(self, uuid: str, now: float) -> None:
         """A sweep-detected change is already coalesced by the sweep cadence;
         it flushes on this very tick instead of waiting a debounce window
-        (the sweep runs before the drain — SYNC-AUDIT C2)."""
+        (the sweep runs before the drain — DESIGN-NOTES sync C2)."""
         self.debounce.touch(uuid, now - DEBOUNCE_S)
 
     def reset_for_new_file(self) -> None:
@@ -324,7 +324,7 @@ class HostSync:
                     # A material/image edit pings every Mesh wearing it with
                     # a shading-only update. The mesh did not change; the
                     # material reports on its own ID. Resending the whole
-                    # mesh per slider tick was SYNC-AUDIT D7.
+                    # mesh per slider tick was DESIGN-NOTES sync D7.
                     continue
                 uuid = identity.ensure_uuid(db, self.registry)
                 self._uuid_to_db[uuid] = db
@@ -338,7 +338,7 @@ class HostSync:
                 ):
                     # A simulation-zone / Bake-node bake (or its delete) is
                     # exactly one geometry update on the object and nothing
-                    # the snapshot can diff (CACHES.md §2): resend the object
+                    # the snapshot can diff (DESIGN-NOTES caches §2): resend the object
                     # — the packed bake rides the blob and is used.
                     tier = Tier.T2
                 if _DEBUG:
@@ -496,7 +496,7 @@ class HostSync:
             if _DEBUG:
                 print(f"qcb escalate T2 {db.name}", flush=True)
             # The shadow already advanced past these tier-1 changes; if the
-            # blob is refused (Scene) they must still go out (SYNC-AUDIT A2).
+            # blob is refused (Scene) they must still go out (DESIGN-NOTES sync A2).
             self._flush_t2(uuid, snapshot, fallback=diff["changes"])
             return
         self._send_t1(uuid, db, diff["changes"])
@@ -631,7 +631,7 @@ class HostSync:
         snapshot = snapshot if snapshot is not None else build_snapshot(db)
         self.shadow.diff_and_update(uuid, snapshot)
         # The digest covers the blob AND the point-cache signature: a bake
-        # changes is_baked, which libraries.write does not carry (CACHES.md
+        # changes is_baked, which libraries.write does not carry (DESIGN-NOTES caches
         # finding 4), so the post-bake blob is byte-identical to the
         # pre-bake one — and the replica needs that resend to rescan.
         digest = self._blob_digest(db, data, snapshot)
@@ -715,7 +715,7 @@ class HostSync:
     def _externalize_caches(self) -> None:
         """Point caches without an external path get one under the shared
         cache root — BEFORE they are baked, because Blender does not migrate
-        frames on conversion (CACHES.md §2 finding 6). Baked caches are left
+        frames on conversion (DESIGN-NOTES caches §2 finding 6). Baked caches are left
         alone and counted so the panel can say "re-bake to share"."""
         if not self.cache_root:
             return
@@ -807,7 +807,7 @@ def _is_syncable_id(db: bpy.types.ID) -> bool:
     return isinstance(
         db, (bpy.types.Mesh, bpy.types.Curve, bpy.types.NodeTree,
              bpy.types.Action, bpy.types.Lattice, bpy.types.Armature,
-             # 2026-09-23 (COVERAGE.md): edits to these used to be invisible
+             # 2026-09-23 (DESIGN-NOTES coverage): edits to these used to be invisible
              bpy.types.Image, bpy.types.MetaBall, bpy.types.Volume,
              bpy.types.Curves, bpy.types.PointCloud, bpy.types.LightProbe,
              bpy.types.GreasePencil, bpy.types.Texture,
@@ -837,7 +837,7 @@ _DIGEST_SKIP = {"rna_type", "name", "type", "show_expanded", "is_active", "point
 def _digest_value(value):
     if isinstance(value, (bpy.types.Texture, bpy.types.ParticleSettings)):
         # Settings datablocks that only ever ride as a dependency: a change
-        # INSIDE them must re-ship the owner (COVERAGE.md cause 5).
+        # INSIDE them must re-ship the owner (DESIGN-NOTES coverage cause 5).
         return ("id", value.session_uid, _settings_digest(value, 1))
     if isinstance(value, bpy.types.ID):
         return ("id", value.session_uid)  # identity, rename-proof
@@ -943,7 +943,7 @@ _BBONE_PROPS = (
 def _animated_bones(obj) -> frozenset:
     """Bones whose transforms come from the action (or NLA strips): their
     matrix_basis changes on every scrub and says nothing the action does
-    not already carry (SYNC-AUDIT D1). Manually posed bones are not here."""
+    not already carry (DESIGN-NOTES sync D1). Manually posed bones are not here."""
     anim = obj.animation_data
     if anim is None:
         return frozenset()
@@ -1050,7 +1050,7 @@ def _object_sweep_vector(obj: bpy.types.Object) -> tuple:
         obj.name,  # renames fire no depsgraph event; name-keyed setters
                    # (@scene_camera) die on stale names without this
         # Cosmetic/instancing/visibility toggles whose depsgraph events are
-        # not relied on (COVERAGE.md): cheap to sample, so sample them.
+        # not relied on (DESIGN-NOTES coverage): cheap to sample, so sample them.
         obj.display_type, obj.show_in_front, obj.instance_type,
         obj.instance_collection.name if obj.instance_collection else "",
         obj.visible_camera, obj.is_holdout, obj.is_shadow_catcher,
@@ -1133,7 +1133,7 @@ _BAKE_NODE_IDS = {"GeometryNodeSimulationOutput", "GeometryNodeBake"}
 def _has_bake_nodes(obj) -> bool:
     """A NODES modifier whose tree (one level of groups deep) has a
     simulation zone or a Bake node: its bake changes no RNA the diff can see
-    (mod.bakes is RNA-invisible, CACHES.md), only the evaluated geometry."""
+    (mod.bakes is RNA-invisible, DESIGN-NOTES caches), only the evaluated geometry."""
     for m in obj.modifiers:
         ng = getattr(m, "node_group", None)
         if ng is None:
@@ -1219,7 +1219,7 @@ def build_snapshot(db: bpy.types.ID) -> dict:
         ]
         snapshot["~pcache"] = _pcache_signature(db)
         # The datablock under the object and its material slots: a swap
-        # changes no tracked path, so it is structure (SYNC-AUDIT A4). The
+        # changes no tracked path, so it is structure (DESIGN-NOTES sync A4). The
         # blob carries the new data/materials as dependencies.
         snapshot["~data"] = None if db.data is None else [
             type(db.data).__name__, db.data.session_uid]
@@ -1331,7 +1331,7 @@ def _nodes_signature(node_tree) -> list:
     settings (a Math node's operation, a Mapping type, an Image Texture's
     image and its image_user), and ColorRamp stops. A change escalates the
     owning material/world to tier 2 on its own — previously it crossed only
-    as a side effect of the Mesh wearing it being resent (SYNC-AUDIT A1/D7)."""
+    as a side effect of the Mesh wearing it being resent (DESIGN-NOTES sync A1/D7)."""
     sig = []
     for node in node_tree.nodes:
         entry = [node.name, node.bl_idname, node.mute, _settings_digest(node, 1)]

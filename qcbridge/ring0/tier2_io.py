@@ -40,7 +40,7 @@ _COLLECTIONS = (
     ("actions", bpy.types.Action),
     ("lattices", bpy.types.Lattice),
     ("armatures", bpy.types.Armature),
-    # Added 2026-09-23 (COVERAGE.md inventory): types that used to cross only
+    # Added 2026-09-23 (DESIGN-NOTES coverage inventory): types that used to cross only
     # as a new object's data and never again.
     ("metaballs", bpy.types.MetaBall),
     ("volumes", bpy.types.Volume),
@@ -71,7 +71,7 @@ def serialize(db: bpy.types.ID, compress: bool = True) -> bytes | None:
         return None
     # An object in edit mode keeps its edits in the edit-mesh until it
     # leaves the mode; libraries.write would ship the pre-edit datablock
-    # (SYNC-AUDIT D2). Flush the edit-mesh into the datablock first.
+    # (DESIGN-NOTES sync D2). Flush the edit-mesh into the datablock first.
     edit_obj = getattr(bpy.context, "edit_object", None)
     if edit_obj is not None and edit_obj.data == db:
         try:

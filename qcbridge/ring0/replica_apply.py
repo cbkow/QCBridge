@@ -61,14 +61,14 @@ stats = {
     "seq_fast": 0,     # fast lane (tier-1 deltas, tombstones)
     "parked": 0,       # fast messages waiting for their blob to apply
     # Edits made ON the replica: nothing forbids them and the host will
-    # never overwrite one unless it changes that same property (SYNC-AUDIT
+    # never overwrite one unless it changes that same property (DESIGN-NOTES sync
     # A9). Heuristic count — an update on a stamped datablock we did not
     # touch recently, outside a frame change and outside a blob's wake.
     "local_edits": 0,
     "last_local_edit": "",
     # Baked disk caches with no external path: their blendcache_<name>/ dir
     # belongs to the host's file name, which this machine never had
-    # (CACHES.md §2) — frozen at rest with every flag green.
+    # (DESIGN-NOTES caches §2) — frozen at rest with every flag green.
     "frozen_caches": 0,
 }
 
@@ -371,7 +371,7 @@ def _apply_t1(header: dict, payload: bytes) -> None:
             if path.startswith("@"):
                 # View-layer / pointer state a later blob will not carry and
                 # the host will not resend (its shadow already has it):
-                # keep it to re-apply after apply_blob (SYNC-AUDIT A5).
+                # keep it to re-apply after apply_blob (DESIGN-NOTES sync A5).
                 _at_state.setdefault(header["uuid"], {})[path] = value
         except Exception as exc:
             stats["apply_errors"] += 1
@@ -466,7 +466,7 @@ def _count_frozen_caches() -> int:
     """Baked disk caches with no external path. `is_baked` is serialized
     state, not a filesystem check: the frames are in a blendcache_ dir named
     after the HOST's file, which does not exist here, and the flag stops
-    Blender from simulating either (probed 2026-09-23, CACHES.md §2)."""
+    Blender from simulating either (probed 2026-09-23, DESIGN-NOTES caches §2)."""
     n = 0
     try:
         # Blender keeps a non-external disk cache in //blendcache_<stem>/;

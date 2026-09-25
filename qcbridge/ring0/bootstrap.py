@@ -105,7 +105,7 @@ def _iter_object_paths(obj):
     """(struct, attribute) pairs for the cache/bake paths a modifier keeps:
     external point caches, geometry-nodes bake directories, fluid caches.
     None of these is in a bpy.data path collection, so localize_paths never
-    saw them (CACHES.md §4 D)."""
+    saw them (DESIGN-NOTES caches §4 D)."""
     for m in obj.modifiers:
         pc = getattr(m, "point_cache", None)
         if pc is not None and (pc.use_external or pc.filepath):
@@ -131,7 +131,7 @@ def _iter_object_paths(obj):
 def localize_object_paths(objects, local_dir: str, mappings) -> tuple[int, int, int]:
     """Same rule as localize_paths, for the paths that live on modifiers.
     Reassigning PointCache.filepath makes Blender rescan the directory and
-    set is_baked from what is there (CACHES.md §2 finding 5) — but a rescan
+    set is_baked from what is there (DESIGN-NOTES caches §2 finding 5) — but a rescan
     does not re-run the modifier, so if any cache was touched the current
     frame is re-applied: the replica is usually already sitting on the frame
     the host wants judged (measured 2026-09-23, run_smoke_cache)."""
