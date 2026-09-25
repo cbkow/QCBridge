@@ -47,6 +47,10 @@ pub enum Event {
     PeerUp,
     PeerDown,
     Goodbye,
+    /// The host's Blender attached to its agent: the host is in a session.
+    SessionOn,
+    /// The host's Blender left its agent (Stop Session, or Blender quit).
+    SessionOff,
     AddonDetached,
     ChildExited,
     ManualStart,
@@ -63,6 +67,9 @@ pub struct Lifecycle {
     log_dir: PathBuf,
     child: Mutex<Option<Child>>,
     pub peer_up: AtomicBool,
+    /// The host is in a session (its addon attached to its agent). Blender
+    /// here is launched for this, and closed once it ends (2026-09-25).
+    pub session_on: AtomicBool,
     pub tx: mpsc::UnboundedSender<Event>,
     pub status: Arc<Mutex<String>>,
 }
@@ -74,10 +81,15 @@ impl PeerObserver for Lifecycle {
     }
     fn peer_down(&self, _reason: String) {
         self.peer_up.store(false, Relaxed);
+        self.session_on.store(false, Relaxed); // a lost link ends the session
         let _ = self.tx.send(Event::PeerDown);
     }
     fn goodbye(&self) {
         let _ = self.tx.send(Event::Goodbye);
+    }
+    fn session(&self, on: bool) {
+        self.session_on.store(on, Relaxed);
+        let _ = self.tx.send(if on { Event::SessionOn } else { Event::SessionOff });
     }
 }
 
@@ -89,6 +101,7 @@ impl Lifecycle {
             cfg, link, local_port, secret, log_dir,
             child: Mutex::new(None),
             peer_up: AtomicBool::new(false),
+            session_on: AtomicBool::new(false),
             tx, status,
         });
         (me, rx)
@@ -117,7 +130,7 @@ impl Lifecycle {
             (c.blender_path.clone(), c.blender_args.clone(), c.kiosk)
         });
         if path.trim().is_empty() {
-            self.set_status("connected (Blender supervision off)");
+            self.set_status("host in session (Blender supervision off)");
             return;
         }
         // Blender's console output goes to blender.log beside agent.toml,
@@ -190,12 +203,18 @@ impl Lifecycle {
         });
     }
 
+    /// Blender on this machine follows the host's *session*, not the agent
+    /// link (chris, 2026-09-25): it is launched when the host's Blender
+    /// attaches to its agent and starts a session, and closed — after the
+    /// configured grace, kiosk and all — when that session ends, the host's
+    /// Blender quits, the host says goodbye, or the link drops. Two paired
+    /// agents with nobody in Blender keep no Blender open here.
     pub async fn run(self: Arc<Self>, mut rx: mpsc::UnboundedReceiver<Event>) {
-        let mut idle_deadline: Option<tokio::time::Instant> = None;
-        let mut wanted = false; // a host wants Blender up
+        let mut close_deadline: Option<tokio::time::Instant> = None;
+        let mut wanted = false; // a host session wants Blender up
         loop {
             let sleep = async {
-                match idle_deadline {
+                match close_deadline {
                     Some(t) => tokio::time::sleep_until(t).await,
                     None => std::future::pending::<()>().await,
                 }
@@ -203,43 +222,58 @@ impl Lifecycle {
             let event = tokio::select! {
                 e = rx.recv() => match e { Some(e) => e, None => return },
                 _ = sleep => {
-                    idle_deadline = None;
-                    if !self.peer_up.load(Relaxed) {
+                    close_deadline = None;
+                    if !self.session_on.load(Relaxed) {
                         wanted = false;
                         self.close_blender();
-                        self.set_status("idle");
+                        self.set_status(if self.peer_up.load(Relaxed) { "host connected, no session" } else { "listening" });
                     }
                     continue;
                 }
             };
+            // The session ended one way or another: leave Blender up for the
+            // grace (a host restarting its session within it finds a warm
+            // Blender), then close it. 0 closes at once.
+            let end_session = |me: &Arc<Self>, close_deadline: &mut Option<tokio::time::Instant>, why: &str| {
+                if !me.blender_running() {
+                    me.set_status(if me.peer_up.load(Relaxed) { "host connected, no session" } else { "listening" });
+                    return;
+                }
+                let grace = me.cfg.with(|c| c.idle_secs);
+                if grace == 0 {
+                    *close_deadline = Some(tokio::time::Instant::now());
+                    me.set_status(&format!("{why}, closing Blender"));
+                } else {
+                    if close_deadline.is_none() {
+                        *close_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(grace));
+                    }
+                    me.set_status(&format!("{why}, closing Blender in {grace}s"));
+                }
+            };
             match event {
                 Event::PeerUp => {
-                    idle_deadline = None;
+                    if !self.session_on.load(Relaxed) {
+                        self.set_status("host connected, no session");
+                    }
+                }
+                Event::SessionOn => {
+                    close_deadline = None;
                     wanted = true;
-                    self.set_status("host connected");
+                    self.set_status("host in session");
                     self.spawn_blender();
                 }
-                Event::PeerDown => {
-                    // Read live: an edited idle_secs now takes effect on the
-                    // next peer-down instead of never.
-                    let idle = self.cfg.with(|c| c.idle_secs);
-                    if idle > 0 && idle_deadline.is_none() {
-                        idle_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(idle));
-                    }
-                    self.set_status(if self.blender_running() { "host gone, Blender warm" } else { "listening" });
-                }
-                Event::Goodbye => {
-                    idle_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(30));
-                    self.set_status("host ended session");
-                }
+                Event::SessionOff => end_session(&self, &mut close_deadline, "host ended session"),
+                Event::PeerDown => end_session(&self, &mut close_deadline, "host gone"),
+                Event::Goodbye => end_session(&self, &mut close_deadline, "host ended session"),
                 Event::AddonDetached => {}
                 Event::ChildExited => {
-                    if wanted && self.peer_up.load(Relaxed) {
+                    if wanted && self.session_on.load(Relaxed) && self.peer_up.load(Relaxed) {
                         self.set_status("Blender exited, relaunching");
                         tokio::time::sleep(Duration::from_secs(3)).await;
                         self.spawn_blender();
                     } else {
-                        self.set_status("listening");
+                        close_deadline = None;
+                        self.set_status(if self.peer_up.load(Relaxed) { "host connected, no session" } else { "listening" });
                     }
                 }
                 Event::ManualStart => {
@@ -248,7 +282,7 @@ impl Lifecycle {
                 }
                 Event::ManualStop => {
                     wanted = false;
-                    idle_deadline = None;
+                    close_deadline = None;
                     self.close_blender();
                 }
                 Event::Shutdown => {

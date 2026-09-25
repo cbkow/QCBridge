@@ -377,7 +377,7 @@ impl App {
                 ui.label("Close Blender after");
                 ui.horizontal(|ui| {
                     self.number_field(ui, "idle_secs", |d| &mut d.idle_secs, true);
-                    ui.label("seconds without a sender (0 = never)");
+                    ui.label("seconds after the sender's session ends (0 = at once)");
                 });
                 ui.end_row();
             }

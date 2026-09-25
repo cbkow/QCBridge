@@ -44,6 +44,11 @@ pub trait PeerObserver: Send + Sync {
     fn peer_down(&self, reason: String);
     /// Replica: the host said goodbye (sniffed from the control lane).
     fn goodbye(&self);
+    /// Replica: the host's Blender addon attached to (true) or left (false)
+    /// its agent — the host is in a session, or not. Sent by the host agent
+    /// on the control lane (2026-09-25); Blender on the replica follows
+    /// this, not the agent link.
+    fn session(&self, _on: bool) {}
 }
 
 pub struct Ctx {
@@ -58,6 +63,9 @@ pub struct Ctx {
     pub control_rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
     pub cold_rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
     pub fast_rx: tokio::sync::Mutex<mpsc::Receiver<Bytes>>,
+    /// Host: whether the Blender addon is attached — the session signal the
+    /// control lane carries to the replica. Set by the status ticker.
+    pub addon_session: tokio::sync::watch::Sender<bool>,
     pub video_src: Arc<VideoSource>,
     pub video_sink: Arc<VideoSink>,
     /// The role's observer (a replica's Blender lifecycle, a host's pin
@@ -85,6 +93,7 @@ impl Ctx {
             control_rx: tokio::sync::Mutex::new(control_rx),
             cold_rx: tokio::sync::Mutex::new(cold_rx),
             fast_rx: tokio::sync::Mutex::new(fast_rx),
+            addon_session: tokio::sync::watch::channel(false).0,
             video_src, video_sink,
             observer: Mutex::new(observer),
             last_stats: Mutex::new(serde_json::Value::Null),
@@ -111,6 +120,35 @@ impl PeerObserver for NoObserver {
     fn peer_up(&self, _fp: Option<String>) {}
     fn peer_down(&self, _reason: String) {}
     fn goodbye(&self) {}
+}
+
+/// The host agent's session signal on the control lane. Shaped like the
+/// addon's control messages so an old replica that forwards it to its addon
+/// sees an unknown kind and ignores it.
+pub fn agent_session_msg(on: bool) -> String {
+    format!("{{\"kind\":\"agent-session\",\"on\":{on}}}")
+}
+
+pub fn parse_agent_session(payload: &[u8]) -> Option<bool> {
+    const TAG: &[u8] = b"\"kind\":\"agent-session\"";
+    if !payload.windows(TAG.len()).any(|w| w == TAG) {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    v.get("on").and_then(|b| b.as_bool())
+}
+
+#[cfg(test)]
+mod agent_session_tests {
+    use super::*;
+
+    #[test]
+    fn the_session_message_round_trips_and_other_messages_are_left_alone() {
+        assert_eq!(parse_agent_session(agent_session_msg(true).as_bytes()), Some(true));
+        assert_eq!(parse_agent_session(agent_session_msg(false).as_bytes()), Some(false));
+        assert_eq!(parse_agent_session(br#"{"kind": "goodbye"}"#), None);
+        assert_eq!(parse_agent_session(br#"{"kind":"hello","token":"x"}"#), None);
+    }
 }
 
 fn lane_body(peer: u8, payload: &[u8]) -> Bytes {
@@ -587,24 +625,46 @@ async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Resu
         let ctx = ctx.clone();
         tasks.spawn(async move {
             let mut rx = ctx.control_rx.lock().await;
-            while let Some(body) = rx.recv().await {
-                send_msg(&mut control_send, &body.slice(1..)).await?;
+            // The host tells the replica whether its Blender is in a session,
+            // as an agent-level message on the control lane: once at lane
+            // start, then on every change. The replica's Blender lifecycle
+            // follows this, not the link (2026-09-25).
+            let mut session = ctx.addon_session.subscribe();
+            if ctx.is_host() {
+                let on = *session.borrow_and_update();
+                send_msg(&mut control_send, agent_session_msg(on).as_bytes()).await?;
             }
-            Ok(())
+            loop {
+                tokio::select! {
+                    body = rx.recv() => match body {
+                        Some(body) => send_msg(&mut control_send, &body.slice(1..)).await?,
+                        None => { crate::log!("[lanes] control-send: addon channel closed"); return Ok(()) }
+                    },
+                    changed = session.changed(), if ctx.is_host() => {
+                        if changed.is_err() { crate::log!("[lanes] control-send: session flag gone"); return Ok(()) }
+                        let on = *session.borrow_and_update();
+                        send_msg(&mut control_send, agent_session_msg(on).as_bytes()).await?;
+                    }
+                }
+            }
         });
     }
     {
         let ctx = ctx.clone();
         tasks.spawn(async move {
             while let Some(payload) = recv_msg(&mut control_recv).await? {
-                if !ctx.is_host()
-                    && payload.len() < 512
-                    && payload.windows(17).any(|w| w == b"\"kind\":\"goodbye\"")
-                {
-                    ctx.observer().goodbye();
+                if !ctx.is_host() && payload.len() < 512 {
+                    if let Some(on) = parse_agent_session(&payload) {
+                        ctx.observer().session(on);
+                        continue; // the agent's own message; not for the addon
+                    }
+                    if payload.windows(17).any(|w| w == b"\"kind\":\"goodbye\"") {
+                        ctx.observer().goodbye();
+                    }
                 }
                 ctx.link.frame(T_CONTROL, lane_body(0, &payload)).await;
             }
+            crate::log!("[lanes] control-recv: stream ended");
             Ok(())
         });
     }

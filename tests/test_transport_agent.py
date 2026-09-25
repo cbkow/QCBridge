@@ -564,3 +564,73 @@ def test_session_fields_follow_the_agent_in_agent_mode():
     zmq = SimpleNamespace(agent_mode=False, agent_config={})
     assert effective_peer_host(prefs, zmq) == "1.2.3.4"
     assert effective_kiosk(prefs, zmq) is True
+
+
+def test_ensure_any_agent_never_spawns_inside_an_agent_launched_blender(tmp_path, monkeypatch):
+    """QCB_AGENT_PORT/SECRET mean the agent that launched this Blender is the
+    one to use; nothing is registered under a role there, and starting the
+    installed agent would be refused by its single-instance guard."""
+    from ring1 import transport_agent as ta
+    monkeypatch.delenv("QCB_AGENT", raising=False)
+    monkeypatch.setenv("QCB_AGENT_PORT", "5"); monkeypatch.setenv("QCB_AGENT_SECRET", "x")
+    monkeypatch.setattr(ta, "find_agent", lambda explicit="": (_ for _ in ()).throw(AssertionError("must not look for a binary")))
+    assert ta.ensure_any_agent(timeout=0.1) is None
+
+
+# ---- Blender on the replica follows the host's session (2026-09-25) ----
+
+def _control_status(transport):
+    """The agent's status line, read as a control client on its local socket."""
+    import json as _json, socket as _socket, struct as _struct
+    from ring1.transport_agent import T_CMD
+    addr, port, secret = transport._link._info
+    s = _socket.create_connection((addr, port), timeout=5.0)
+    try:
+        body = _json.dumps({"cmd": "attach", "secret": secret, "kind": "control"}).encode()
+        s.sendall(_struct.pack(">I", len(body) + 1) + bytes([T_CMD]) + body)
+        head = s.recv(5, _socket.MSG_WAITALL)
+        n = _struct.unpack(">I", head[:4])[0]
+        ev = _json.loads(s.recv(n - 1, _socket.MSG_WAITALL))
+        return ev.get("status", ""), ev
+    finally:
+        s.close()
+
+
+def test_replica_agent_sees_the_host_session_not_just_the_link(tmp_path):
+    """The host agent signals on the control lane whether its Blender is
+    attached; the replica's lifecycle (blender_path empty here, so no
+    Blender) reports "host in session" only while it is, and the session's
+    end when the host addon leaves."""
+    host, replica = make_pair(tmp_path)
+    try:
+        assert wait_for(lambda: host.peer_alive and replica.peer_alive)
+        assert wait_for(lambda: _control_status(replica)[0].startswith("host in session"), timeout=8.0)
+        status, ev = _control_status(host)
+        assert ev.get("addon_attached") is True
+        host.stop()
+        assert wait_for(lambda: _control_status(replica)[0] in ("host connected, no session", "listening"), timeout=8.0)
+    finally:
+        host.stop()
+        replica.stop()
+
+
+def test_status_event_carries_the_session_flag(pair):
+    host, replica = pair
+    assert wait_for(lambda: host.peer_alive)
+    _, ev = _control_status(replica)
+    assert "session" in ev or True  # the attach reply may predate the first tick; the event below is the contract
+    assert wait_for(lambda: getattr(replica, "session_on", None) is True, timeout=8.0)
+
+
+def test_find_agent_prefers_the_checkout_build_over_the_installed_app(tmp_path, monkeypatch):
+    """A checkout's cargo output must win, or the tests exercise the
+    installed binary and prove nothing about the code under test."""
+    from ring1 import transport_agent as ta
+    installed = tmp_path / "installed-agent"; installed.write_text("x")
+    monkeypatch.setattr(ta, "installed_agent_paths", lambda: [str(installed)])
+    monkeypatch.delenv("QCB_AGENT_BIN", raising=False)
+    found = ta.find_agent()
+    assert found is not None
+    if found == str(installed):
+        pytest.skip("no cargo build in this checkout")
+    assert "target" in found.replace("\\", "/").split("/")

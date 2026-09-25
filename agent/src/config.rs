@@ -50,11 +50,15 @@ pub struct Config {
     pub video_port: u16,
     /// Local socket for the addon (0 = pick a free port).
     pub local_port: u16,
-    /// Replica: Blender binary and extra args; launched when a host connects.
+    /// Replica: Blender binary and extra args; launched when the host's
+    /// Blender starts a session (not when the agents merely pair).
     pub blender_path: String,
     pub blender_args: Vec<String>,
     pub kiosk: bool,
-    /// Replica: close Blender this long after the host goes away (0 = never).
+    /// Replica: close Blender this many seconds after the host's session
+    /// ends — Stop Session, its Blender quitting, or a lost link (0 = at
+    /// once). A host that restarts its session inside the grace finds a
+    /// warm Blender.
     pub idle_secs: u64,
     /// Show the tray icon (false = headless, for tests and services).
     pub tray: bool,
@@ -93,7 +97,7 @@ impl Default for Config {
             blender_path: default_blender_path(),
             blender_args: Vec::new(),
             kiosk: true,
-            idle_secs: 300,
+            idle_secs: 20,
             tray: true,
             name: String::new(),
             discovery: "direct".into(),

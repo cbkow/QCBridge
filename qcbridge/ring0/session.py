@@ -513,6 +513,21 @@ def _start_replica(prefs) -> None:
         kiosk.prepare_viewport()
     _start_pixel_path(prefs)
 
+    # The host's session, as the agent reports it (2026-09-25): when it ends
+    # this machine gets its UI back at once, without waiting for the agent
+    # to close Blender after its grace. Kiosk re-engages with the next
+    # project the host sends (on_project_loaded).
+    def _session_watch():
+        if state["role"] != "REPLICA" or state.get("transport") is not transport:
+            return None
+        if not getattr(transport, "session_on", True) and kiosk.active():
+            kiosk.exit_now()
+            state["note"] = "host session ended"
+        return 0.5
+
+    if getattr(transport, "agent_mode", False):
+        bpy.app.timers.register(_session_watch, first_interval=0.5, persistent=True)
+
 
 def _replica_srt_url(prefs) -> str:
     """The listen URL is generated — nobody types SRT URLs. srt_url stays as

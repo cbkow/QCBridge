@@ -130,6 +130,13 @@ impl RoleRuntime {
             .or_else(|| self.host_obs.as_ref().map(|h| h.up.load(Relaxed)))
             .unwrap_or(false)
     }
+    /// Replica: the host is in a session. Host: its own addon is attached
+    /// (which is what it tells the replica).
+    fn session_on(&self) -> bool {
+        self.lifecycle.as_ref().map(|l| l.session_on.load(Relaxed))
+            .or_else(|| self.host_obs.as_ref().map(|h| h.link.attached.load(Relaxed)))
+            .unwrap_or(false)
+    }
 }
 
 /// Build the runtime for the role in the config. Registers the local socket
@@ -519,19 +526,30 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
     {
         let a = agent.clone();
         std::thread::Builder::new().name("status-ticker".into()).spawn(move || {
-            let mut last = (String::new(), false, false);
+            let mut last = (String::new(), false, false, false);
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                if a.link.control_clients() == 0 {
+                // The host's session signal to the replica: its addon is
+                // attached. Kept here so one place reads the flag.
+                let attached = a.link.attached.load(Relaxed);
+                a.ctx.addon_session.send_if_modified(|v| if *v != attached { *v = attached; true } else { false });
+                // The addon reads these too (the replica's kiosk follows the
+                // session flag), not only the control clients.
+                if a.link.control_clients() == 0 && !attached {
                     continue;
                 }
-                let now = (
-                    a.status.lock().unwrap().clone(),
-                    a.link.attached.load(Relaxed),
-                    a.role.lock().unwrap().peer_up(),
-                );
+                // One take of the role lock: two `a.role.lock()` temporaries
+                // in a single tuple expression both live to its end, and a
+                // std mutex is not re-entrant — the ticker deadlocked on its
+                // first tick holding the lock, and every attach and command
+                // behind it (2026-09-25).
+                let (peer_up, session_on) = {
+                    let r = a.role.lock().unwrap();
+                    (r.peer_up(), r.session_on())
+                };
+                let now = (a.status.lock().unwrap().clone(), attached, peer_up, session_on);
                 if now != last {
-                    a.link.event_try(json!({"event": "status", "status": now.0, "addon_attached": now.1, "peer_up": now.2}));
+                    a.link.event_try(json!({"event": "status", "status": now.0, "addon_attached": now.1, "peer_up": now.2, "session": now.3}));
                     last = now;
                 }
             }

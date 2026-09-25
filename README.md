@@ -51,7 +51,9 @@ Windows will warn once; it installs to `Program Files\QCBridge` with
 Start-menu entries). There is no autostart: the extension starts the
 installed agent when a session needs it, and the tray's Settings… window
 (or the button in Blender's preferences) is where the role, token,
-receiver and shared folder are set.
+receiver and shared folder are set. The replica launches Blender when the
+host's Blender starts a session, and closes it (kiosk and all) shortly after
+that session ends — a paired link on its own keeps no Blender open.
 
 Running it from a checkout instead: build the agent (`cargo build --release`
 in `agent/`; `agent/packaging/macos/build-app.sh` and `build-pkg.sh` make

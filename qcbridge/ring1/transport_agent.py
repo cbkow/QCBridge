@@ -72,25 +72,33 @@ def installed_agent_paths() -> list[str]:
 
 def find_agent(explicit: str = "") -> str | None:
     """Explicit path → QCB_AGENT_BIN → a binary bundled next to the addon →
-    the installed app → the agent crate's cargo output (dev checkouts,
-    release before debug)."""
+    in a checkout, the agent crate's freshest cargo output → the installed
+    app.
+
+    The cargo output comes before the installed app on purpose (2026-09-25):
+    with the PKG installed, the old order had the contract tests and the
+    smokes exercising the installed binary while every edit went into
+    target/ — they passed and proved nothing, the trap the paragraph below
+    already recorded once for the release/debug order. An installed
+    extension has no target/ beside it, so the product path is unchanged."""
     exe = "qcbridge-agent.exe" if sys.platform == "win32" else "qcbridge-agent"
     here = Path(__file__).resolve()
     repo = here.parents[2]
     candidates = [explicit, os.environ.get("QCB_AGENT_BIN", ""), str(here.parents[1] / "bin" / exe)]
-    candidates += installed_agent_paths()
-    for path in candidates:
-        if path and os.path.isfile(path):
-            return path
     # Dev checkouts: whichever cargo profile was built most recently. A fixed
     # release-before-debug order once had the contract tests exercising a
-    # stale release binary while every hand check ran the fresh debug one —
-    # the tests passed and proved nothing.
+    # stale release binary while every hand check ran the fresh debug one.
     builds = [
         str(repo / "agent" / "target" / prof / exe) for prof in ("release", "debug")
     ]
     builds = [b for b in builds if os.path.isfile(b)]
-    return max(builds, key=os.path.getmtime) if builds else None
+    if builds:
+        candidates.append(max(builds, key=os.path.getmtime))
+    candidates += installed_agent_paths()
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
 
 
 def pack_cold(header: dict, payload: bytes) -> bytes:
@@ -282,6 +290,11 @@ def ensure_any_agent(timeout: float = 6.0) -> str | None:
     if role is not None:
         return role
     if os.environ.get("QCB_AGENT", "") == "spawn":
+        return None
+    if os.environ.get("QCB_AGENT_PORT") and os.environ.get("QCB_AGENT_SECRET"):
+        # A Blender the agent launched: that agent is ours already, and
+        # agent_launch set the role. Starting another here would only be
+        # refused by the single-instance guard — with a dialog on Windows.
         return None
     binary = find_agent()
     if binary is None:
@@ -846,6 +859,9 @@ class ReplicaTransportAgent:
         self.fingerprint = ""        # our certificate SHA-256 — show it for pairing
         self.link_note = ""
         self.video_state = "off"
+        # The host is in a session, as the agent reports it (2026-09-25): the
+        # replica's kiosk follows this, and so does the agent's Blender.
+        self.session_on = True
         self.stats: dict = {}
         self.agent_config: dict = {}
         self.peers: list = []
@@ -953,6 +969,8 @@ class ReplicaTransportAgent:
             elif name == "config":
                 self.agent_config = dict(event.get("config") or self.agent_config)
                 self._stash_reply(event)
+            elif name == "status" and "session" in event:
+                self.session_on = bool(event.get("session"))
             elif name == "peers":
                 self.peers = list(event.get("peers") or [])
                 self.peers_sources = list(event.get("sources") or [])

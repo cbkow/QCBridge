@@ -86,6 +86,19 @@ macOS it stays out of the Dock and the menu bar while open, like the tray
 it belongs to (2026-09-25: winit had been making it a regular app for as
 long as the window was up).
 
+**Blender on the replica follows the host's session, not the link
+(2026-09-25).** Two paired agents used to be reason enough for the
+replica to launch Blender and keep it, in kiosk, for as long as the link
+stood. Now the host agent tells the replica on the control lane whether
+its own Blender is attached — the host is in a session — and the replica
+launches Blender for that alone. When the session ends (Stop Session,
+the host's Blender quitting, a goodbye, or the link dropping) the
+replica's Blender leaves kiosk and is closed after the grace in *Close
+Blender after* (default 20 s, 0 = at once; it was 300 s and "0 = never");
+a host that restarts its session inside the grace finds it warm. The
+status line and the `status` event say which it is ("host connected, no
+session" / "host in session").
+
 **Installers.** The agent ships as *QCBridge Agent.app* in a signed,
 notarized package on macOS and as an Inno Setup installer on Windows;
 the extension zip carries no binaries and starts the installed agent
