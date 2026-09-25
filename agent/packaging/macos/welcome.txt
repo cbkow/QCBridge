@@ -1,0 +1,3 @@
+QCBridge Agent is the menu-bar app the QC Bridge Blender extension pairs through. It installs into /Applications/QCBridge.
+
+After installing, open QCBridge Agent once: its menu-bar icon has a Settings… window where you set this machine's role (send or receive), the session token, the receiver to pair with, and the shared storage folder. The Blender extension finds the agent by itself.

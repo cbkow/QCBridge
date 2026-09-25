@@ -1,0 +1,12 @@
+#!/bin/bash
+# QCBridge Agent installer — preinstall (runs as root, before the payload).
+# Stop a running agent so Installer never writes into a mapped bundle,
+# and replace rather than merge: the pkg is the single source of what is
+# under /Applications/QCBridge. Per-user config, token and logs are not
+# touched (~/Library/Application Support/QCBridge, the login keychain).
+pkill -x qcbridge-agent 2>/dev/null || true
+sleep 1
+pkill -9 -x qcbridge-agent 2>/dev/null || true
+rm -rf "/Applications/QCBridge/QCBridge Agent.app" \
+       "/Applications/QCBridge/Uninstall QCBridge Agent.command"
+exit 0

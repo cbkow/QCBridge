@@ -504,3 +504,12 @@ def test_transport_environment_and_preference_win(tmp_path, monkeypatch):
     monkeypatch.setenv("QCB_TRANSPORT", "agent")
     monkeypatch.setenv("QCB_AGENT", "spawn")
     assert transport_kind("replica") == "agent"             # env wins even when spawning
+
+
+def test_ensure_agent_never_spawns_under_the_test_harness(tmp_path):
+    """QCB_AGENT=spawn means the tests own their agents; ensure_agent must
+    stay out of the way and report nothing to start."""
+    from ring1.transport_agent import ensure_agent, installed_agent_paths
+    assert ensure_agent("host") is False
+    paths = installed_agent_paths()
+    assert all(os.path.isabs(p) for p in paths)

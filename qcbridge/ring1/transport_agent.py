@@ -59,13 +59,27 @@ _PEER = b"\x00"    # one peer today; the byte keeps several replicas possible
 _TICK = 0.05
 
 
+def installed_agent_paths() -> list[str]:
+    """Where the installers put the agent (2026-09-24): the PKG's app
+    bundle on macOS, the Inno installer's folder on Windows."""
+    if sys.platform == "darwin":
+        return ["/Applications/QCBridge/QCBridge Agent.app/Contents/MacOS/qcbridge-agent"]
+    if sys.platform == "win32":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        return [os.path.join(pf, "QCBridge", "qcbridge-agent.exe")]
+    return []
+
+
 def find_agent(explicit: str = "") -> str | None:
     """Explicit path → QCB_AGENT_BIN → a binary bundled next to the addon →
-    the agent crate's cargo output (dev checkouts, release before debug)."""
+    the installed app → the agent crate's cargo output (dev checkouts,
+    release before debug)."""
     exe = "qcbridge-agent.exe" if sys.platform == "win32" else "qcbridge-agent"
     here = Path(__file__).resolve()
     repo = here.parents[2]
-    for path in (explicit, os.environ.get("QCB_AGENT_BIN", ""), str(here.parents[1] / "bin" / exe)):
+    candidates = [explicit, os.environ.get("QCB_AGENT_BIN", ""), str(here.parents[1] / "bin" / exe)]
+    candidates += installed_agent_paths()
+    for path in candidates:
         if path and os.path.isfile(path):
             return path
     # Dev checkouts: whichever cargo profile was built most recently. A fixed
@@ -205,6 +219,41 @@ def agent_socket_info(role: str) -> tuple[str, int, str] | None:
 def use_agent(role: str) -> bool:
     """True when an agent for this role is reachable without spawning one."""
     return os.environ.get("QCB_AGENT", "") != "spawn" and agent_socket_info(role) is not None
+
+
+def ensure_agent(role: str, timeout: float = 6.0) -> bool:
+    """The product path since 2026-09-24: no autostart, so a session that
+    finds no agent registered starts the installed one — its own process,
+    tray and all, outliving Blender — and waits for it to register. Only
+    from session start, never from a draw. False when there is nothing to
+    start, or the tests own their agents (QCB_AGENT=spawn)."""
+    if os.environ.get("QCB_AGENT", "") == "spawn":
+        return False
+    role = role.lower()
+    if agent_socket_info(role) is not None:
+        return True
+    binary = find_agent()
+    if binary is None:
+        return False
+    try:
+        if sys.platform == "win32":
+            flags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen([binary], creationflags=flags, close_fds=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen([binary], start_new_session=True, close_fds=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        print(f"qcbridge: could not start the agent at {binary}: {exc}", flush=True)
+        return False
+    print(f"qcbridge: started the agent ({binary})", flush=True)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if agent_socket_info(role) is not None:
+            return True
+        time.sleep(0.1)
+    print("qcbridge: the agent did not register in time", flush=True)
+    return False
 
 
 def transport_kind(role: str, pref: str = "") -> str:

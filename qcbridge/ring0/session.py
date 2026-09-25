@@ -128,9 +128,23 @@ def running() -> bool:
     return state["role"] is not None
 
 
+def _start_agent_if_needed(prefs) -> None:
+    """Agent mode is the default; with no autostart, the installed agent
+    is started here when none is registered for this role. A zmq
+    preference or QCB_TRANSPORT=zmq leaves it alone."""
+    from ..ring1 import transport_agent
+
+    env = os.environ.get("QCB_TRANSPORT", "").strip().lower()
+    pref = str(getattr(prefs, "transport", "") or "").strip().lower()
+    if env == "zmq" or pref == "zmq":
+        return
+    transport_agent.ensure_agent(str(getattr(prefs, "role", "HOST") or "HOST"))
+
+
 def start(prefs) -> str:
     if running():
         return "already running"
+    _start_agent_if_needed(prefs)
     state["epoch"] = _uuid.uuid4().hex
     state["paused"] = False
     state["peer_epoch"] = None
