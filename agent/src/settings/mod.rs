@@ -32,6 +32,18 @@ pub fn run(cfg_path: PathBuf) -> Result<()> {
             .with_inner_size([900.0, 800.0])
             .with_min_inner_size([600.0, 480.0]),
         centered: true,
+        // macOS: the window belongs to a menu-bar app. winit sets the
+        // process to a Regular app by default (a Dock tile and an app menu
+        // for as long as the window is open, overriding the bundle's
+        // LSUIElement); Accessory keeps it out of the Dock while the
+        // window still comes to the front (2026-09-25).
+        #[cfg(target_os = "macos")]
+        event_loop_builder: Some(Box::new(|b| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            b.with_activation_policy(ActivationPolicy::Accessory)
+                .with_activate_ignoring_other_apps(true)
+                .with_default_menu(false);
+        })),
         ..Default::default()
     };
     eframe::run_native(

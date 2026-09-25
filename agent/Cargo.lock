@@ -3039,6 +3039,7 @@ dependencies = [
  "toml 0.8.2",
  "tray-icon",
  "windows-sys 0.61.2",
+ "winit",
  "zstd",
 ]
 

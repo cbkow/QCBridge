@@ -81,7 +81,10 @@ Windows machine pairs with a Mac the mapping row for that folder forms
 by itself from what each side named (the table stays visible to check
 or correct; custom folders under Advanced) — the stream cap and scale,
 and the diagnostics. The window is its own process attached
-to the agent beside Blender, so nothing it does disturbs a session.
+to the agent beside Blender, so nothing it does disturbs a session. On
+macOS it stays out of the Dock and the menu bar while open, like the tray
+it belongs to (2026-09-25: winit had been making it a regular app for as
+long as the window was up).
 
 **Installers.** The agent ships as *QCBridge Agent.app* in a signed,
 notarized package on macOS and as an Inno Setup installer on Windows;

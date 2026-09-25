@@ -91,6 +91,7 @@ windows-sys = { version = "0.61", features = [
 # token. 0.10 is the copy tao/cocoa already bring in; adds no packages.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
+winit = { version = "0.30", default-features = false }  # the activation policy of the settings window (same winit eframe uses)
 
 [profile.release]
 debug = 1
