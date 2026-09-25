@@ -33,6 +33,7 @@ chmod 755 "$ROOT/Uninstall QCBridge Agent.command"
 cp "$SRC/scripts/preinstall" "$STAGE/scripts/preinstall"
 chmod 755 "$STAGE/scripts/preinstall"
 cp "$SRC/welcome.txt" "$STAGE/resources/welcome.txt"
+cp "$AGENT/../LICENSE" "$STAGE/resources/LICENSE"
 
 # Every bundle pkgbuild finds is pinned non-relocatable, so Installer can
 # never redirect the payload onto a same-identifier bundle elsewhere (a

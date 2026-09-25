@@ -13,6 +13,7 @@
         <os-version min="13.0"/>
     </allowed-os-versions>
     <welcome file="welcome.txt" mime-type="text/plain"/>
+    <license file="LICENSE" mime-type="text/plain"/>
     <choices-outline>
         <line choice="default">
             <line choice="com.qcbridge.agent"/>
