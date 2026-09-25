@@ -611,6 +611,14 @@ class QCB_PT_main(Panel):
         else:
             layout.prop(prefs, "role", text="Role")
         layout.label(text=f"Status: {session.status_text()}")
+        # A receiving machine's Blender is the agent's: launched when the
+        # host starts a session, closed when it ends (2026-09-25). Nothing
+        # to start or stop here — the panel is status, plus the way to get
+        # the UI back by hand.
+        if agent_mode and _agent_role_label(prefs).startswith("Receive"):
+            label = "Exit Minimal Mode" if kiosk.active() else "Minimal Mode"
+            layout.operator("qcbridge.kiosk_toggle", text=label, icon="FULLSCREEN_ENTER")
+            return
         if session.running():
             layout.operator("qcbridge.session_stop", icon="PAUSE")
             if prefs.role == "HOST":
