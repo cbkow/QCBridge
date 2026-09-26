@@ -2,7 +2,7 @@
 # notarize.sh — submit a .pkg (or the .app) to Apple's notary service with
 # the keychain profile QCView's release flow already uses, wait, staple.
 #
-#   agent/packaging/macos/notarize.sh dist/QCBridge-Agent-0.2.0-arm64.pkg
+#   agent/packaging/macos/notarize.sh dist/QCBridge-Agent-0.2.1-arm64.pkg
 #
 # The profile holds an app-specific password (created once with
 # `xcrun notarytool store-credentials QCView`); nothing secret is here.

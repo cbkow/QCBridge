@@ -6,6 +6,17 @@ matching versions on **both machines**: the ends now tell each other their
 version at connect, and the panel warns if they don't match. Mismatched ends
 mostly work, but they degrade in confusing ways — update both.
 
+## 0.2.1 — 2026-09-26
+
+**The macOS agent no longer puts a tile in the Dock.** The bundle has always
+asked to be a menu-bar app (`LSUIElement`), but the tray's event loop (tao)
+sets its own activation policy when the app finishes launching, and its
+default is a Regular app: a Dock tile and an app menu alongside the
+menu-bar icon, and focus taken from whatever was in front. The tray loop now
+asks for the Accessory policy and no longer activates on launch, the same
+fix the settings window got on 2026-09-25 for winit. Extension and agent
+both say 0.2.1; install both.
+
 ## 0.2.0 — unreleased (the agent line, merged to `main` 2026-09-23)
 
 The number is set — extension and agent both say 0.2.0 — but it ships only

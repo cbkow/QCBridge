@@ -763,7 +763,7 @@ mod tray {
     }
 
     pub fn run(agent: Arc<Agent>, runtime: tokio::runtime::Runtime) -> Result<()> {
-        let event_loop = EventLoopBuilder::new().build();
+        let mut event_loop = EventLoopBuilder::new().build();
         let menu = Menu::new();
         let status_item = MenuItem::new("starting", false, None);
         let info_item = MenuItem::new(
@@ -821,6 +821,19 @@ mod tray {
         let mut last_is_host = agent.cfg.is_host();
         let mut last_tooltip = String::new();
         let mut last_mode = mode0;
+        // macOS: tao applies its own activation policy in
+        // applicationDidFinishLaunching, and its default is Regular — a Dock
+        // tile and an app menu, overriding the bundle's LSUIElement (the
+        // 0.2.0 build showed both a menu-bar icon and a Dock icon). Accessory
+        // is the menu-bar app the plist asks for; the second call keeps a
+        // login-item launch from taking focus off whatever is in front.
+        // The settings window's winit loop already does the same (settings/mod.rs).
+        #[cfg(target_os = "macos")]
+        {
+            use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+            event_loop.set_activation_policy(ActivationPolicy::Accessory);
+            event_loop.set_activate_ignoring_other_apps(false);
+        }
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::WaitUntil(std::time::Instant::now() + std::time::Duration::from_millis(500));
             if let TaoEvent::NewEvents(tao::event::StartCause::Init) = event {
