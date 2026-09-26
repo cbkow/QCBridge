@@ -17,12 +17,11 @@ asks for the Accessory policy and no longer activates on launch, the same
 fix the settings window got on 2026-09-25 for winit. Extension and agent
 both say 0.2.1; install both.
 
-## 0.2.0 — unreleased (the agent line, merged to `main` 2026-09-23)
+## 0.2.0 — 2026-09-25 (the agent line, merged to `main` 2026-09-23)
 
-The number is set — extension and agent both say 0.2.0 — but it ships only
-with the coordinated release once Windows is verified. Everything below has
-run on macOS, both roles on one machine, with the suites in `smokes/`; the
-Windows pass is in progress.
+Extension and agent both say 0.2.0; released together once the Windows
+pass was done. Everything below has run on macOS and Windows, both roles,
+with the suites in `smokes/`.
 
 **Agent mode is the default whenever an agent is registered** on the
 machine for the session's role (2026-09-23): a plain launch of Blender lands
