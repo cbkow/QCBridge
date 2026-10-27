@@ -16,6 +16,7 @@ from bpy.props import (
 from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
 
 from .ring0 import kiosk, session
+from .ring1 import colour_state as _cs
 
 PIXEL_SOURCES = [
     ("readback", "Viewport readback (default)",
@@ -319,6 +320,9 @@ class QCB_OT_open_qcview(Operator):
         except OSError as exc:
             self.report({"ERROR"}, f"could not launch QCView: {exc}")
             return {"CANCELLED"}
+        errors = [text for lv, _, text in (session.state.get("cm_mismatches") or []) if lv == "error"]
+        if errors:
+            self.report({"WARNING"}, "colour: " + errors[0].lstrip("⚠ "))
         return {"FINISHED"}
 
 
@@ -607,6 +611,35 @@ class QCBridgePreferences(AddonPreferences):
         col.operator("qcbridge.mapping_remove", icon="REMOVE", text="")
 
 
+def _draw_colour(layout) -> None:
+    """Colour awareness (2026-10-27): what each end runs, side by side, and
+    every way they disagree — in red, not in a footnote. Both roles draw it;
+    the host column is the host's block wherever it came from."""
+    st = session.state
+    host_cm = st.get("cm") if st.get("role") == "HOST" else st.get("peer_cm")
+    rep_cm = st.get("peer_cm") if st.get("role") == "HOST" else st.get("cm")
+    box = layout.box()
+    head = box.row()
+    head.label(text="Colour", icon="COLOR")
+    split = box.split(factor=0.34)
+    labels, hcol, rcol = split.column(), split.column(), split.column()
+    labels.label(text="")
+    hcol.label(text="Host")
+    rcol.label(text="Replica")
+    for label, hval, rval in session.colour_rows():
+        labels.label(text=label)
+        hcol.label(text=hval)
+        rcol.label(text=rval)
+    rows = list(st.get("cm_mismatches") or [])
+    rows += [r for r in _cs.self_notes(host_cm) if r not in rows]
+    if st.get("role") == "HOST" and not rep_cm and st.get("peer_caps") is not None:
+        pass  # the mismatch list already carries the "no colour state" row
+    for level, _key, text in rows:
+        row = box.row()
+        row.alert = level == "error"
+        row.label(text=text, icon={"error": "ERROR", "warn": "ERROR", "info": "INFO"}[level])
+
+
 class QCB_PT_main(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -635,6 +668,7 @@ class QCB_PT_main(Panel):
             layout.operator("qcbridge.kiosk_toggle", text=label, icon="FULLSCREEN_ENTER")
             return
         if session.running():
+            _draw_colour(layout)
             layout.operator("qcbridge.session_stop", icon="PAUSE")
             if prefs.role == "HOST":
                 label = "Resume Sync" if session.state["paused"] else "Pause Sync"

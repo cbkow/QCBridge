@@ -177,3 +177,14 @@ def test_hello_and_reply_caps_are_additive():
     assert "fast_ack" in h["caps"]
     assert "fast_ack" in protocol.REPLICA_CAPS
     assert protocol.check_hello(h, "tok") == (True, "")
+
+
+def test_hello_carries_colour_state():
+    """2026-10-27: the colour-state block rides the hello; absent it is an
+    empty dict and the hello still validates (older ends)."""
+    h = protocol.make_hello("tok", "e1", "5.2.2", cm={"v": 1, "working": {"name": "Linear Rec.709"}})
+    assert h["cm"]["working"]["name"] == "Linear Rec.709"
+    assert "cm" in protocol.HOST_CAPS and "cm" in protocol.REPLICA_CAPS
+    bare = protocol.make_hello("tok", "e1", "5.2.2")
+    assert bare["cm"] == {}
+    assert protocol.check_hello(bare, "tok") == (True, "")

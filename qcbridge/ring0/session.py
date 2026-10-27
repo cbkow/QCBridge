@@ -16,7 +16,8 @@ import bpy
 from ..ring1 import liveness, pathmap, protocol, toolbox
 from ..ring1.stream_params import StreamParams
 from ..ring1.transport import TransportConfig
-from . import engine_qcb, host_handlers, host_hot, kiosk, overlay, pixel_path, replica_apply
+from ..ring1 import colour_state as _cs
+from . import colour_state, engine_qcb, host_handlers, host_hot, kiosk, overlay, pixel_path, replica_apply
 
 
 
@@ -89,7 +90,27 @@ state = {
     "peer_stream": {},     # host: the replica's stream descriptor from hello
     "shot_mode": False,    # host: replica holds the fitted camera frame
     "peer_addon": None,    # peer's addon version ("" = pre-0.1.5 peer)
+    # Colour awareness (2026-10-27, DESIGN-NOTES pixels colour state): this
+    # end's block, the peer's, and what they say about each other.
+    "cm": {},
+    "peer_cm": {},
+    "cm_mismatches": [],
 }
+
+
+def _recompute_mismatches() -> None:
+    host_cm = state.get("cm") if state.get("role") == "HOST" else state.get("peer_cm")
+    rep_cm = state.get("peer_cm") if state.get("role") == "HOST" else state.get("cm")
+    state["cm_mismatches"] = _cs.mismatches(host_cm, rep_cm)
+
+
+def colour_rows() -> list[tuple[str, str, str]]:
+    """(label, host value, replica value) for the panel's two columns."""
+    host_cm = state.get("cm") if state.get("role") == "HOST" else state.get("peer_cm")
+    rep_cm = state.get("peer_cm") if state.get("role") == "HOST" else state.get("cm")
+    h = _cs.summary_rows(host_cm)
+    r = dict(_cs.summary_rows(rep_cm))
+    return [(label, value, r.get(label, "—")) for label, value in h]
 
 
 def _addon_version() -> str:
@@ -202,7 +223,7 @@ def stop() -> None:
     state.update(
         role=None, transport=None, peer_epoch=None, note="", sync=None,
         prefs=None, ffmpeg_note="", peer_stream={}, shot_mode=False,
-        peer_addon=None,
+        peer_addon=None, cm={}, peer_cm={}, cm_mismatches=[],
         # Cleared here or a session stopped mid-resolve leaves it True and
         # every later _start_pixel_path returns at the guard: sync works,
         # the stream never starts again.
@@ -313,6 +334,7 @@ def _start_host(prefs) -> None:
             # Main thread (a timer): the secret as of now, so a slow attach
             # or a token set meanwhile is picked up by the next hello.
             hello_secret, _ = _secrets(prefs, transport)
+            colour_state.refresh("HOST")  # main thread: our colour state as of now
             hello = protocol.make_hello(
                 hello_secret, state["epoch"], bpy.app.version_string,
                 addon_version=_addon_version(),
@@ -320,6 +342,7 @@ def _start_host(prefs) -> None:
                 seq_fast=getattr(sync, "seq_fast", 0) if sync else 0,
                 mappings=pathmap.rows_to_wire(mappings),
                 shared_root=_shared_root_card(transport),
+                cm=state.get("cm"),
             )
             pending["req"] = transport.request_nowait(hello)
             pending["sent_at"] = now
@@ -332,6 +355,8 @@ def _start_host(prefs) -> None:
                 _adopt_pair_row(transport, _shared_root_card(transport), reply.get("shared_root") or {})
                 state["peer_addon"] = reply.get("addon", "")
                 state["peer_caps"] = tuple(reply.get("caps") or ())
+                state["peer_cm"] = reply.get("cm") or {}
+                _recompute_mismatches()
                 state["note"] = "connected"
                 state["resync_policy"].reset()
                 # Fresh handshake = fresh epoch pairing → full bootstrap
@@ -369,6 +394,7 @@ def _start_host(prefs) -> None:
 
     # Peer transitions arrive on the IO thread: flag them, act on the tick.
     flags = {"lost": False, "reconnect": False}
+    cm_clock = {"t": 0.0}
 
     def _on_peer(alive: bool) -> None:
         if not alive:
@@ -397,6 +423,20 @@ def _start_host(prefs) -> None:
             _arm_handshake("replica restarted — re-syncing", new_epoch=True)
             return 0.25
         _mirror_paths_from_agent(prefs, transport)  # a tray/window edit shows up in the panel
+        # Colour state: ours re-read once a second (bpy fields; the OCIO
+        # parts are cached), pushed when it changed; the replica's rides
+        # the pong and is re-compared when its digest moves.
+        now_cm = _time.monotonic()
+        if now_cm - cm_clock["t"] >= 1.0:
+            cm_clock["t"] = now_cm
+            if colour_state.refresh("HOST"):
+                _recompute_mismatches()
+                if not pending["armed"] and "cm" in (state.get("peer_caps") or ()):
+                    transport.request_nowait({"kind": "cm", "cm": state["cm"]})
+        peer_cm = status.get("cm")
+        if isinstance(peer_cm, dict) and peer_cm.get("digest") and peer_cm.get("digest") != (state.get("peer_cm") or {}).get("digest"):
+            state["peer_cm"] = peer_cm
+            _recompute_mismatches()
         sync = state.get("sync")
         if sync is not None and not pending["armed"]:
             caps = state.get("peer_caps") or ()
@@ -459,7 +499,11 @@ def _start_replica(prefs) -> None:
     # Captured now (main thread) so the IO-thread handler touches no bpy.
     # No passphrase here: both ends derive it from the shared token, so the
     # secret never crosses the wire.
-    stream_params = StreamParams.from_prefs(prefs)
+    colour_state.refresh("REPLICA")  # main thread: the working space the wire leaves from
+    # The helper converts from THIS replica's working space (never assumed
+    # Rec.709 — DESIGN-NOTES pixels working space); the descriptor says
+    # which, and whether it was read from the config or assumed.
+    stream_params = StreamParams.from_prefs(prefs).with_working((state.get("cm") or {}).get("working"))
     state["stream_params"] = stream_params
     stream_info = {
         "enabled": bool(getattr(prefs, "enable_stream", True)),
@@ -489,6 +533,8 @@ def _start_replica(prefs) -> None:
                     replica_apply.notify_new_session(msg.get("seq", 0), msg.get("seq_fast", 0))
                 state["peer_epoch"] = msg.get("epoch")
                 state["peer_addon"] = msg.get("addon", "")
+                state["peer_cm"] = msg.get("cm") or {}
+                _recompute_mismatches()  # pure dict work: fine on the IO thread
                 state["note"] = "host connected"
             return {
                 "kind": "hello_reply", "ok": ok, "reason": reason,
@@ -498,7 +544,13 @@ def _start_replica(prefs) -> None:
                 # What this replica can do beyond the protocol number
                 # (additive; an older host ignores it).
                 "caps": list(protocol.REPLICA_CAPS),
+                # Our colour state (plain dict filled on the main thread).
+                "cm": state.get("cm") or {},
             }
+        if msg.get("kind") == "cm":
+            state["peer_cm"] = msg.get("cm") or {}
+            _recompute_mismatches()
+            return {"kind": "cm_ack", "cm": state.get("cm") or {}}
         if msg.get("kind") == "goodbye":
             replica_apply.notify_host_goodbye()  # flag only; handled on tick
             state["note"] = "host ended session"
@@ -555,11 +607,23 @@ def _start_replica(prefs) -> None:
             "pixel": pixel_path.status(),
             "ffmpeg": state.get("ffmpeg_note", ""),
             "readback": engine_qcb.status(),
+            # Our colour state, so the host re-compares when it changes.
+            "cm": state.get("cm") or {},
         }
     )
     transport.start()  # agent mode: returns once attached, so the mirror is in
     state["transport"] = transport
     state["note"] = "listening"
+
+    def _cm_watch():
+        if state["transport"] is not transport:
+            return None
+        if not replica_apply.applying():   # never read the scene mid-bootstrap
+            if colour_state.refresh("REPLICA"):
+                _recompute_mismatches()
+        return 2.0
+
+    bpy.app.timers.register(_cm_watch, first_interval=2.0, persistent=True)
     _push_paths_to_agent(prefs, transport)
     _mirror_paths_from_agent(prefs, transport)
     own_rows["rows"] = _effective_mappings(prefs, transport)
@@ -617,9 +681,12 @@ def _replica_srt_url(prefs) -> str:
     # listen_timeout: with no viewer, ffmpeg sits in the SRT listen with its
     # input pipe unread, the helper blocks on that pipe and neither notices
     # Blender dying — an orphan mux kept the port (found 2026-10-27). A
-    # listen that gives up every 10 s lets the pair cycle and die cleanly;
-    # the supervisor respawns it at once while Blender lives.
-    return f"srt://{bind}:{prefs.srt_port}?mode=listener&latency={latency_us}&listen_timeout=10000000"
+    # listen that gives up lets the pair cycle and die cleanly; the
+    # supervisor relistens at once while Blender lives. 30 s, not 10: every
+    # relisten is a gap a viewer can connect into and fail ("Input/output
+    # error"), and with 10 s the gaps came every 17 s (found the same day,
+    # the "dead stream" — DESIGN-NOTES pixels viewer rejoin).
+    return f"srt://{bind}:{prefs.srt_port}?mode=listener&latency={latency_us}&listen_timeout=30000000"
 
 
 def _start_pixel_path(prefs) -> None:
@@ -775,6 +842,8 @@ def on_project_loaded() -> None:
         return
     if _effective_kiosk(prefs, state.get("transport")):
         kiosk.enter(first=False)
+    if colour_state.refresh("REPLICA"):  # the scene just changed under us
+        _recompute_mismatches()
     _start_pixel_path(prefs)
 
 
@@ -816,21 +885,20 @@ def qcview_deep_link() -> str:
         "qcview://stream?url=" + urllib.parse.quote(url, safe="")
         + "&name=" + urllib.parse.quote(f"Live · {name}")
     )
-    # 0.3: the wire and the view transform QCView should apply, from the
-    # host scene (DESIGN-NOTES pixels wire). An older QCView ignores them.
+    # 0.3: the wire and the host's colour state, by name (DESIGN-NOTES
+    # pixels wire + colour state): the working space the wire was converted
+    # from, the host's config kind, display device, view, look, exposure,
+    # gamma, and whether the two ends agree. Nothing assumed, nothing
+    # inferred — QCView follows these or says what it cannot. An older
+    # QCView ignores what it does not know.
     stream = state.get("peer_stream") or {}
     if stream.get("source", "screen") == "readback" and stream.get("format"):
-        fmt = stream["format"]
-        scene = bpy.context.scene
-        vs, ds = scene.view_settings, scene.display_settings
-        q = {
-            "wire": f"{fmt.get('transfer', 'pq')}-{fmt.get('primaries', 'bt2020')}-{int(fmt.get('anchor_nits', 100))}",
-            "input": "linear-rec709",
-            "view": vs.view_transform, "look": vs.look,
-            "exposure": f"{vs.exposure:.4g}", "gamma": f"{vs.gamma:.4g}",
-            "display": ds.display_device,
-        }
-        link += "".join(f"&{k}={urllib.parse.quote(str(v), safe='')}" for k, v in q.items())
+        host_cm = state.get("cm") or {}
+        if not host_cm.get("digest"):
+            colour_state.refresh("HOST")   # poll() calls this before a session's first tick
+            host_cm = state.get("cm") or {}
+        q = _cs.deep_link_params(host_cm, state.get("peer_cm"), stream["format"])
+        link += "".join(f"&{k}={urllib.parse.quote(str(v), safe='')}" for k, v in q.items() if v != "")
     return link
 
 
@@ -898,6 +966,19 @@ def _replica_overlay_text() -> str:
         bits.append("⟳ resync requested")
     if stats["unmapped_paths"]:
         bits.append(f"⚠ {stats['unmapped_paths']} unmapped paths")
+    # Colour awareness: what this replica renders through, and where the
+    # host disagrees (the host panel has the long form).
+    cm = state.get("cm") or {}
+    if cm:
+        view = (cm.get("view") or {}).get("transform") or "?"
+        device = (cm.get("display") or {}).get("device") or "?"
+        ws = (cm.get("working") or {}).get("name") or "?"
+        bits.append(f"{view} · {device} · {ws}")
+    for lv, key, _text in state.get("cm_mismatches") or []:
+        if lv == "error" and key == "config":
+            bits.append("⚠ host config differs")
+        elif lv == "error" and key == "working":
+            bits.append("⚠ host working space differs")
     if stats["frozen_caches"]:
         bits.append(f"⚠ {stats['frozen_caches']} frozen disk caches")
     if stats["last_error"]:
@@ -913,6 +994,9 @@ def status_text() -> str:
     transport = state["transport"]
     alive = "●" if (transport and transport.peer_alive) else "○"
     bits = [f"{state['role'].lower()} {alive}", state["note"], _version_warning()]
+    n_cm = sum(1 for lv, _, _ in (state.get("cm_mismatches") or []) if lv != "info")
+    if n_cm:
+        bits.append(f"⚠ {n_cm} colour mismatch{'es' if n_cm != 1 else ''}")
     sync_ = state.get("sync")
     if sync_ is not None and getattr(sync_, "sync_errors", 0):
         bits.append(

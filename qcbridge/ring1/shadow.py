@@ -157,6 +157,16 @@ TRACKED: dict[str, tuple[str, ...]] = {
         "view_settings.exposure",
         "view_settings.gamma",
         "display_settings.display_device",
+        # 2026-10-27 colour awareness: the rest of the Color Management panel
+        # follows too (5.2 fields; absent on an older Blender → skipped). The
+        # curve points themselves do not ride (the curve mapping is a struct,
+        # not a scalar) — the panel says so.
+        "display_settings.emulation",
+        "view_settings.use_curve_mapping",
+        "view_settings.use_white_balance",
+        "view_settings.white_balance_temperature",
+        "view_settings.white_balance_tint",
+        "view_settings.use_hdr_view",
         "unit_settings.system",
         "unit_settings.scale_length",
         "unit_settings.length_unit",

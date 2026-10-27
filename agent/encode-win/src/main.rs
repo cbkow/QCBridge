@@ -46,6 +46,11 @@ use windows::core::{Interface, PCSTR, PCWSTR, Result};
 
 // ------------------------------------------------------------ options ----
 
+/// Working space → linear BT.2020, row-major (wire_format rows). The add-on
+/// computes it from the replica's OCIO config (colour_state.working_to_2020);
+/// this default is Blender's own working space, Linear Rec.709.
+const M_709_TO_2020: [f32; 9] = [0.6274, 0.3293, 0.0433, 0.0691, 0.9195, 0.0114, 0.0164, 0.0880, 0.8956];
+
 struct Opts {
     shm: String,
     fps: u32,
@@ -53,10 +58,21 @@ struct Opts {
     gop: u32,
     cpu: bool,
     selftest: Option<String>,
+    matrix: [f32; 9],
+}
+
+fn parse_matrix(text: &str) -> Option<[f32; 9]> {
+    let vals: Vec<f32> = text.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+    if vals.len() != 9 {
+        return None;
+    }
+    let mut m = [0f32; 9];
+    m.copy_from_slice(&vals);
+    Some(m)
 }
 
 fn parse_args() -> Opts {
-    let mut o = Opts { shm: String::new(), fps: 30, mbps: 50, gop: 30, cpu: false, selftest: None };
+    let mut o = Opts { shm: String::new(), fps: 30, mbps: 50, gop: 30, cpu: false, selftest: None, matrix: M_709_TO_2020 };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -66,6 +82,13 @@ fn parse_args() -> Opts {
             "--gop" => o.gop = it.next().and_then(|v| v.parse().ok()).unwrap_or(30),
             "--cpu" => o.cpu = true,
             "--selftest" => o.selftest = it.next(),
+            "--matrix" => match it.next().as_deref().and_then(parse_matrix) {
+                Some(m) => o.matrix = m,
+                None => {
+                    eprintln!("--matrix needs nine comma-separated floats");
+                    std::process::exit(2);
+                }
+            },
             other => {
                 eprintln!("unknown arg {other}");
                 std::process::exit(2);
@@ -73,7 +96,7 @@ fn parse_args() -> Opts {
         }
     }
     if o.shm.is_empty() && o.selftest.is_none() {
-        eprintln!("usage: qcb-encode-win --shm NAME [--fps N] [--bitrate M] [--gop G] [--cpu] | --selftest vectors.json");
+        eprintln!("usage: qcb-encode-win --shm NAME [--fps N] [--bitrate M] [--gop G] [--cpu] [--matrix r0c0,...,r2c2] | --selftest vectors.json");
         std::process::exit(2);
     }
     o
@@ -351,7 +374,7 @@ fn make_gpu() -> Result<Gpu> {
 // Mac's Metal kernels: rows in the ring are bottom-up (Blender's
 // framebuffer order), so picture row y reads source row h-1-y.
 const HLSL: &str = r#"
-cbuffer P : register(b0) { uint w; uint h; uint pad0; uint pad1; };
+cbuffer P : register(b0) { uint w; uint h; uint pad0; uint pad1; float4 m0; float4 m1; float4 m2; };
 Texture2D<float4> src : register(t0);
 
 struct VSOut { float4 pos : SV_Position; };
@@ -362,9 +385,9 @@ VSOut vs_main(uint id : SV_VertexID) {
     return o;
 }
 
-static const float3x3 M709_2020 = float3x3(0.6274, 0.3293, 0.0433,
-                                           0.0691, 0.9195, 0.0114,
-                                           0.0164, 0.0880, 0.8956);
+// m0..m2 are the ROWS of the working space -> BT.2020 matrix, as the
+// add-on sends them (wire_format rows); float3x3(r0, r1, r2) is row-major.
+static float3x3 wire_matrix() { return float3x3(m0.xyz, m1.xyz, m2.xyz); }
 
 float pq(float lin) {
     float L = clamp(lin * (100.0 / 10000.0), 0.0, 1.0);   // scene 1.0 = 100 nit
@@ -373,7 +396,7 @@ float pq(float lin) {
 }
 
 float3 rgbp(uint x, uint y) {
-    float3 c = max(mul(M709_2020, src.Load(int3(x, h - 1 - y, 0)).rgb), 0.0);
+    float3 c = max(mul(wire_matrix(), src.Load(int3(x, h - 1 - y, 0)).rgb), 0.0);
     return float3(pq(c.r), pq(c.g), pq(c.b));
 }
 
@@ -480,7 +503,7 @@ fn make_p010(gpu: &Gpu, w: u32, h: u32, usage: D3D11_USAGE, bind: u32, cpu: u32)
 }
 
 impl GpuConverter {
-    fn new(gpu: &Gpu, w: u32, h: u32) -> Result<Self> {
+    fn new(gpu: &Gpu, w: u32, h: u32, matrix: [f32; 9]) -> Result<Self> {
         let td = D3D11_TEXTURE2D_DESC {
             Width: w,
             Height: h,
@@ -499,9 +522,16 @@ impl GpuConverter {
         let mut srv = None;
         unsafe { gpu.device.CreateShaderResourceView(&src, None, Some(&mut srv))? };
         let srv = srv.unwrap();
-        let consts = [w, h, 0u32, 0u32];
+        let mut consts = [0u32; 16];
+        consts[0] = w;
+        consts[1] = h;
+        for r in 0..3 {
+            for c in 0..3 {
+                consts[4 + r * 4 + c] = matrix[r * 3 + c].to_bits();
+            }
+        }
         let bd = D3D11_BUFFER_DESC {
-            ByteWidth: 16,
+            ByteWidth: 64,
             Usage: D3D11_USAGE_IMMUTABLE,
             BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
             CPUAccessFlags: 0,
@@ -608,11 +638,11 @@ fn pq(lin: f32) -> f32 {
 }
 
 #[inline]
-fn rgbp(px: &[f32]) -> (f32, f32, f32) {
+fn rgbp(px: &[f32], m: &[f32; 9]) -> (f32, f32, f32) {
     let (r, g, b) = (px[0], px[1], px[2]);
-    let r2 = (0.6274 * r + 0.3293 * g + 0.0433 * b).max(0.0);
-    let g2 = (0.0691 * r + 0.9195 * g + 0.0114 * b).max(0.0);
-    let b2 = (0.0164 * r + 0.0880 * g + 0.8956 * b).max(0.0);
+    let r2 = (m[0] * r + m[1] * g + m[2] * b).max(0.0);
+    let g2 = (m[3] * r + m[4] * g + m[5] * b).max(0.0);
+    let b2 = (m[6] * r + m[7] * g + m[8] * b).max(0.0);
     (pq(r2), pq(g2), pq(b2))
 }
 
@@ -623,7 +653,7 @@ fn luma(e: (f32, f32, f32)) -> f32 {
 
 /// Convert on the CPU into `y` (w×h words) and `c` (w/2×h/2 pairs), rows
 /// top-down, 16-bit words MSB-aligned.
-fn convert_cpu(pixels: *const u8, bpr: usize, w: usize, h: usize, y_plane: &mut [u16], y_pitch: usize, c_plane: &mut [u16], c_pitch: usize) {
+fn convert_cpu(pixels: *const u8, bpr: usize, w: usize, h: usize, y_plane: &mut [u16], y_pitch: usize, c_plane: &mut [u16], c_pitch: usize, m: &[f32; 9]) {
     let src = unsafe { std::slice::from_raw_parts(pixels, bpr * h) };
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(32);
     let pair_rows = h / 2;
@@ -647,7 +677,7 @@ fn convert_cpu(pixels: *const u8, bpr: usize, w: usize, h: usize, y_plane: &mut 
                         let yrow = &mut yc[(2 * pr + dy) * y_pitch..(2 * pr + dy) * y_pitch + w];
                         for x in 0..w {
                             let px: &[f32] = unsafe { std::slice::from_raw_parts(srcrow.as_ptr().add(x * 16) as *const f32, 4) };
-                            let e = rgbp(px);
+                            let e = rgbp(px, m);
                             let yy = luma(e);
                             let code = (876.0 * yy + 64.0).round().clamp(64.0, 940.0) as u16;
                             yrow[x] = code << 6;
@@ -659,7 +689,7 @@ fn convert_cpu(pixels: *const u8, bpr: usize, w: usize, h: usize, y_plane: &mut 
                             let srow = h - 1 - (y0 + dy);
                             for dx in 0..2 {
                                 let px: &[f32] = unsafe { std::slice::from_raw_parts(src.as_ptr().add(srow * bpr + (2 * cx + dx) * 16) as *const f32, 4) };
-                                let e = rgbp(px);
+                                let e = rgbp(px, m);
                                 let yy = luma(e);
                                 cb += (e.2 - yy) / 1.8814;
                                 cr += (e.0 - yy) / 1.4746;
@@ -684,16 +714,17 @@ struct CpuConverter {
     staging: ID3D11Texture2D,
     outputs: Vec<ID3D11Texture2D>,
     next: usize,
+    matrix: [f32; 9],
 }
 
 impl CpuConverter {
-    fn new(gpu: &Gpu, w: u32, h: u32) -> Result<Self> {
+    fn new(gpu: &Gpu, w: u32, h: u32, matrix: [f32; 9]) -> Result<Self> {
         let staging = make_p010(gpu, w, h, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_WRITE.0 as u32)?;
         let mut outputs = Vec::new();
         for _ in 0..4 {
             outputs.push(make_p010(gpu, w, h, D3D11_USAGE_DEFAULT, 0, 0)?);
         }
-        Ok(Self { w, h, staging, outputs, next: 0 })
+        Ok(Self { w, h, staging, outputs, next: 0, matrix })
     }
 
     fn convert(&mut self, gpu: &Gpu, pixels: *const u8, bpr: usize) -> Result<ID3D11Texture2D> {
@@ -706,7 +737,7 @@ impl CpuConverter {
         // P010 mapped: h rows of luma, then h/2 rows of interleaved Cb/Cr.
         let y_plane = unsafe { std::slice::from_raw_parts_mut(base, pitch_words * h) };
         let c_plane = unsafe { std::slice::from_raw_parts_mut(base.add(pitch_words * h), pitch_words * (h / 2)) };
-        convert_cpu(pixels, bpr, w, h, y_plane, pitch_words, c_plane, pitch_words);
+        convert_cpu(pixels, bpr, w, h, y_plane, pitch_words, c_plane, pitch_words, &self.matrix);
         unsafe { ctx.Unmap(&self.staging, 0) };
         let tex = self.outputs[self.next].clone();
         self.next = (self.next + 1) % self.outputs.len();
@@ -724,9 +755,9 @@ enum Converter {
 }
 
 impl Converter {
-    fn new(gpu: &Gpu, w: u32, h: u32, force_cpu: bool) -> Result<Self> {
+    fn new(gpu: &Gpu, w: u32, h: u32, force_cpu: bool, matrix: [f32; 9]) -> Result<Self> {
         if !force_cpu && p010_render_targets_supported(gpu) {
-            match GpuConverter::new(gpu, w, h) {
+            match GpuConverter::new(gpu, w, h, matrix) {
                 Ok(c) => {
                     log(format!("converter: GPU (P010 render targets) {w}x{h}"));
                     return Ok(Converter::Gpu(c));
@@ -737,7 +768,7 @@ impl Converter {
             log("P010 render targets unsupported; CPU fallback");
         }
         log(format!("converter: CPU {w}x{h}"));
-        Ok(Converter::Cpu(CpuConverter::new(gpu, w, h)?))
+        Ok(Converter::Cpu(CpuConverter::new(gpu, w, h, matrix)?))
     }
     fn convert(&mut self, gpu: &Gpu, pixels: *const u8, bpr: usize) -> Result<ID3D11Texture2D> {
         match self {
@@ -757,6 +788,24 @@ fn selftest(path: &str, force_cpu: bool) -> ! {
     // A tiny JSON reader is not worth a dependency: the fixture is numbers
     // in nested arrays with known keys, parsed with a hand-rolled scanner.
     let input = json_array3(&text, "\"input\"");
+    // The fixture names the working space it was encoded from; a helper
+    // that ignored --matrix would still pass the Rec.709 vectors.
+    let matrix: [f32; 9] = match json_array2f(&text, "\"matrix\"") {
+        Some(rows) if rows.len() == 3 && rows.iter().all(|r| r.len() == 3) => {
+            let mut m = [0f32; 9];
+            for (r, row) in rows.iter().enumerate() {
+                m[r * 3..r * 3 + 3].copy_from_slice(row);
+            }
+            m
+        }
+        _ => M_709_TO_2020,
+    };
+    let ws = text.find("\"working_space\"").map(|i| {
+        let rest = &text[i + 15..];
+        let q1 = rest.find('"').map(|j| j + 1).unwrap_or(0);
+        let q2 = rest[q1..].find('"').map(|j| q1 + j).unwrap_or(q1);
+        rest[q1..q2].to_string()
+    }).unwrap_or_else(|| "Linear Rec.709".to_string());
     let y_exp = json_array2(&text, "\"y\"");
     let cb_exp = json_array2(&text, "\"cb\"");
     let cr_exp = json_array2(&text, "\"cr\"");
@@ -777,7 +826,7 @@ fn selftest(path: &str, force_cpu: bool) -> ! {
         log(format!("selftest: D3D11 device: {e}"));
         std::process::exit(3)
     });
-    let mut conv = Converter::new(&gpu, w as u32, h as u32, force_cpu).unwrap_or_else(|e| {
+    let mut conv = Converter::new(&gpu, w as u32, h as u32, force_cpu, matrix).unwrap_or_else(|e| {
         log(format!("selftest: converter: {e}"));
         std::process::exit(3)
     });
@@ -811,12 +860,47 @@ fn selftest(path: &str, force_cpu: bool) -> ! {
     check(h, &cb_exp, 2, 0);
     check(h, &cr_exp, 2, 1);
     unsafe { gpu.context.Unmap(&read, 0) };
-    log(format!("selftest {w}x{h}: mismatches={mismatches} max_err={max_err}"));
+    log(format!("selftest {w}x{h} [{ws}]: mismatches={mismatches} max_err={max_err}"));
     std::process::exit(if mismatches == 0 { 0 } else { 1 })
 }
 
 /// Numbers of the first JSON array following `key`, flattened into rows:
 /// `[[a,b],[c,d]]` -> two rows. Enough for the fixture; not a JSON parser.
+/// Float rows of the first 2-D array following `key` (the fixture's `matrix`).
+fn json_array2f(text: &str, key: &str) -> Option<Vec<Vec<f32>>> {
+    let start = text.find(key).map(|i| i + key.len())?;
+    let mut rows = Vec::new();
+    let mut row: Vec<f32> = Vec::new();
+    let mut num = String::new();
+    let mut depth = 0;
+    for ch in text[start..].chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                if !num.is_empty() {
+                    row.push(num.parse::<f32>().ok()?);
+                    num.clear();
+                }
+                depth -= 1;
+                if depth == 1 {
+                    rows.push(std::mem::take(&mut row));
+                } else if depth == 0 {
+                    break;
+                }
+            }
+            ',' => {
+                if !num.is_empty() {
+                    row.push(num.parse::<f32>().ok()?);
+                    num.clear();
+                }
+            }
+            c if c.is_ascii_digit() || c == '-' || c == '.' || c == 'e' || c == 'E' || c == '+' => num.push(c),
+            _ => {}
+        }
+    }
+    Some(rows)
+}
+
 fn json_array2(text: &str, key: &str) -> Vec<Vec<i64>> {
     let start = text.find(key).map(|i| i + key.len()).expect("fixture key");
     let mut rows = Vec::new();
@@ -1177,7 +1261,7 @@ fn ring_loop(opts: &Opts, shared: Arc<Shared>) -> Result<()> {
                     if session != (w, h) {
                         // A new size: a converter and an encoder session for it.
                         // The old encoder thread ends when its channel closes.
-                        conv = Some(Converter::new(&gpu, w, h, opts.cpu)?);
+                        conv = Some(Converter::new(&gpu, w, h, opts.cpu, opts.matrix)?);
                         let (enc, _manager) = make_encoder(&gpu, w, h, opts)?;
                         let (tx, rx) = std::sync::mpsc::sync_channel::<Frame>(4);
                         let enc_shared = shared.clone();

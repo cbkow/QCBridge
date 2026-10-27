@@ -29,6 +29,11 @@ except ImportError:  # file-imported by tests with qcbridge/ on sys.path
     from ring1.stream_params import StreamParams
 
 _RESTART_BACKOFF = 2.0
+_last_argv: list[str] = []   # the helper command line last spawned (smokes read it)
+
+
+def last_argv() -> list[str]:
+    return list(_last_argv)
 
 # The encode helper: shared-memory ring -> PQ/BT.2020 P010/x420 on the GPU
 # -> hardware HEVC Main10, Annex-B with AUDs on stdout. Same lookup as the
@@ -208,13 +213,19 @@ def _supervise_native(cap_cmd_fn, mux_cmd: list[str], log_path: Path) -> None:
     the mux exits when the SRT viewer leaves (one viewer per listener), the
     helper when the ring is retired (exit 7: a bigger ring under a new
     name, which `cap_cmd_fn()` returns on the respawn) or Blender is gone."""
-    global _proc, _cap_proc, _status
+    global _proc, _cap_proc, _status, _last_argv
+    outdated = {"strip_matrix": False}   # an old helper rejects --matrix (exit 2 at once)
     while not _stop.is_set():
         cap_cmd = cap_cmd_fn()
         if not cap_cmd:
             _status = "waiting for the frame ring"
             _stop.wait(_RESTART_BACKOFF / 4)
             continue
+        if outdated["strip_matrix"] and "--matrix" in cap_cmd:
+            i = cap_cmd.index("--matrix")
+            cap_cmd = cap_cmd[:i] + cap_cmd[i + 2:]
+        spawned_at = time.monotonic()
+        _last_argv = list(cap_cmd)
         with open(log_path, "ab") as log:
             log.write(f"\n--- spawn (readback) {time.ctime()} ---\n".encode())
             log.flush()
@@ -245,6 +256,7 @@ def _supervise_native(cap_cmd_fn, mux_cmd: list[str], log_path: Path) -> None:
                 t.start()
             while not _stop.is_set() and _proc.poll() is None and _cap_proc.poll() is None:
                 _stop.wait(0.25)
+            mux_exited_first = _proc.poll() is not None and _cap_proc.poll() is None
             for child in (_proc, _cap_proc):
                 if child.poll() is None:
                     child.terminate()
@@ -256,8 +268,23 @@ def _supervise_native(cap_cmd_fn, mux_cmd: list[str], log_path: Path) -> None:
                 t.join(timeout=2.0)
         if _stop.is_set():
             break
+        if (_cap_proc.returncode == 2 and time.monotonic() - spawned_at < 1.0
+                and "--matrix" in cap_cmd and not outdated["strip_matrix"]):
+            # A helper from before the working-space matrix: it exits 2 on
+            # the unknown flag. Run it the old way (Rec.709 assumed) and say
+            # so — the panel shows this status.
+            outdated["strip_matrix"] = True
+            with open(log_path, "ab") as log:
+                log.write(b"\n--- helper rejects its arguments (predates --matrix?): respawning without it ---\n")
+            _status = "encoder helper outdated — rebuild (wire assumes Linear Rec.709)"
+            continue
         _status = f"stream ended (mux {_proc.returncode}, encoder {_cap_proc.returncode}) — restarting"
-        _stop.wait(_RESTART_BACKOFF / 4)  # a viewer leaving is the normal case; be back before the next one
+        # The mux leaving on its own — a viewer gone, or the listen timed out
+        # with nobody there — is the normal case: relisten at once, no gap
+        # for the next viewer to fall into. The backoff is for the helper
+        # dying (a crash loop would otherwise spin).
+        if _cap_proc.returncode is not None and _cap_proc.returncode != 0 and mux_exited_first is False:
+            _stop.wait(_RESTART_BACKOFF / 4)
     _status = "off"
 
 

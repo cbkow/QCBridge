@@ -8,6 +8,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "qcbridge")
 from ring1 import wire_format as wf  # noqa: E402
 
 FIXTURE = pathlib.Path(__file__).resolve().parent / "fixtures" / "pq_vectors.json"
+FIXTURE_P3 = pathlib.Path(__file__).resolve().parent / "fixtures" / "pq_vectors_p3.json"
+# Linear DCI-P3 D65 → CIE XYZ D65: the second fixture's working space, far
+# enough from Rec.709 that a helper ignoring --matrix, or transposing it,
+# fails (2026-10-27 colour awareness).
+M_P3_TO_XYZ = ((0.4865709, 0.2656677, 0.1982173), (0.2289746, 0.6917385, 0.0792869), (0.0, 0.0451134, 1.0439444))
 
 
 def test_pq_anchor_and_endpoints():
@@ -62,14 +67,41 @@ def test_tile_chroma_is_the_2x2_average_and_fixture_is_current():
     _, dcb, dcr = wf.quantize(0.0, sum(cbs) / 4, sum(crs) / 4)
     assert out["cb"][0][0] == dcb and out["cr"][0][0] == dcr
     assert wf.plane_word(1023) == 0xFFC0 and wf.plane_word(64) == 64 << 6
-    # the 16×16 selftest vectors: a ramp with saturated corners
+    # the 16×16 selftest vectors: a ramp with saturated corners, encoded
+    # from Linear Rec.709 (Blender's own working space) and from Linear
+    # DCI-P3 D65 — each fixture names its working space and carries its
+    # working → BT.2020 matrix, which the helpers' --selftest must apply.
+    from ring1 import colour_state as cs
     vec = [[(((i + j) % 16) / 15.0 * 2.0, (i / 15.0) ** 2, (j / 15.0) * 0.5) for i in range(16)] for j in range(16)]
     vec[0][0] = (1e6, 0.0, 0.0); vec[15][15] = (0.0, 0.0, 1e6)
-    expect = {"anchor_nits": wf.ANCHOR_NITS, "input": vec, "planes": wf.encode_tile(vec)}
-    if FIXTURE.exists():
-        assert json.loads(FIXTURE.read_text()) == json.loads(json.dumps(expect)), (
-            "wire_format changed: delete the fixture to regenerate and rebuild the helpers' selftest"
-        )
+    m_p3 = cs.working_to_2020(M_P3_TO_XYZ)
+    for path, name, matrix in ((FIXTURE, "Linear Rec.709", wf.M_709_TO_2020), (FIXTURE_P3, "Linear DCI-P3 D65", m_p3)):
+        expect = {"anchor_nits": wf.ANCHOR_NITS, "working_space": name, "matrix": cs.matrix_rows(matrix),
+                  "input": vec, "planes": wf.encode_tile(vec, matrix)}
+        if path.exists():
+            assert json.loads(path.read_text()) == json.loads(json.dumps(expect)), (
+                "wire_format changed: delete the fixture to regenerate and rebuild the helpers' selftest"
+            )
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(expect))
+    # a transposed matrix must not pass: the fixtures are sensitive to it
+    mt = tuple(tuple(m_p3[j][i] for j in range(3)) for i in range(3))
+    assert wf.encode_tile(vec, mt)["y"] != wf.encode_tile(vec, m_p3)["y"]
+
+
+def test_matrix_is_a_parameter_and_the_arg_round_trips():
+    assert wf.rgb_to_2020(1.0, 0.0, 0.0) == wf.rgb709_to_2020(1.0, 0.0, 0.0)
+    ident = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    assert wf.rgb_to_2020(0.2, 0.5, 0.9, ident) == (0.2, 0.5, 0.9)
+    assert wf.encode_pixel(1.0, 0.0, 0.0, ident) != wf.encode_pixel(1.0, 0.0, 0.0)
+    text = wf.matrix_arg(wf.M_709_TO_2020)
+    assert text.count(",") == 8
+    back = wf.parse_matrix_arg(text)
+    assert all(abs(back[i][j] - wf.M_709_TO_2020[i][j]) < 1e-6 for i in range(3) for j in range(3))
+    try:
+        wf.parse_matrix_arg("1,2,3")
+    except ValueError:
+        pass
     else:
-        FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-        FIXTURE.write_text(json.dumps(expect))
+        raise AssertionError("short matrix accepted")

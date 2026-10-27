@@ -34,6 +34,16 @@ struct Opts {
     var mbps = 50
     var gop = 30
     var selftest: String? = nil
+    // Working space → linear BT.2020, nine row-major floats (wire_format
+    // rows). The add-on computes it from the replica's OCIO config
+    // (colour_state.working_to_2020); the default is Blender's own working
+    // space, Linear Rec.709 (wire_format.M_709_TO_2020).
+    var matrix: [Float] = [0.6274, 0.3293, 0.0433, 0.0691, 0.9195, 0.0114, 0.0164, 0.0880, 0.8956]
+}
+
+func parseMatrix(_ text: String) -> [Float]? {
+    let vals = text.split(separator: ",").compactMap { Float($0.trimmingCharacters(in: .whitespaces)) }
+    return vals.count == 9 ? vals : nil
 }
 
 func parseArgs() -> Opts {
@@ -46,13 +56,19 @@ func parseArgs() -> Opts {
         case "--bitrate": o.mbps = Int(it.next() ?? "50") ?? 50
         case "--gop": o.gop = Int(it.next() ?? "30") ?? 30
         case "--selftest": o.selftest = it.next()
+        case "--matrix":
+            guard let m = parseMatrix(it.next() ?? "") else {
+                FileHandle.standardError.write("--matrix needs nine comma-separated floats\n".data(using: .utf8)!)
+                exit(2)
+            }
+            o.matrix = m
         default:
             FileHandle.standardError.write("unknown arg \(a)\n".data(using: .utf8)!)
             exit(2)
         }
     }
     if o.shm.isEmpty && o.selftest == nil {
-        FileHandle.standardError.write("usage: qcb-encode-mac --shm NAME [--fps N] [--bitrate M] [--gop G] | --selftest vectors.json\n".data(using: .utf8)!)
+        FileHandle.standardError.write("usage: qcb-encode-mac --shm NAME [--fps N] [--bitrate M] [--gop G] [--matrix r0c0,...,r2c2] | --selftest vectors.json\n".data(using: .utf8)!)
         exit(2)
     }
     return o
@@ -151,12 +167,17 @@ let shaderSource = """
 #include <metal_stdlib>
 using namespace metal;
 
-struct Params { uint w; uint h; uint bpr; uint off; };
+// m0..m2 are the ROWS of the working space -> BT.2020 matrix (wire_format
+// rows, as the add-on sends them); MSL's float3x3(c0, c1, c2) takes
+// columns, so the matrix is rebuilt transposed below. The P3 selftest
+// fixture catches a mix-up (the Rec.709 rows are too near identity to).
+struct Params { uint w; uint h; uint bpr; uint off; float4 m0; float4 m1; float4 m2; };
 
-// Columns of the linear Rec.709 -> BT.2020 matrix (wire_format.M_709_TO_2020 rows).
-constant float3x3 M709_2020 = float3x3(float3(0.6274, 0.0691, 0.0164),
-                                       float3(0.3293, 0.9195, 0.0880),
-                                       float3(0.0433, 0.0114, 0.8956));
+inline float3x3 wire_matrix(constant Params& p) {
+    return float3x3(float3(p.m0.x, p.m1.x, p.m2.x),
+                    float3(p.m0.y, p.m1.y, p.m2.y),
+                    float3(p.m0.z, p.m1.z, p.m2.z));
+}
 
 inline float pq(float lin) {
     // scene 1.0 = 100 nit (wire_format.ANCHOR_NITS)
@@ -169,7 +190,7 @@ inline float pq(float lin) {
 // (Blender's framebuffer order), so row y of the picture is ring row h-1-y.
 inline float3 rgbp(device const uchar* ring, constant Params& p, uint x, uint y) {
     device const float4* row = (device const float4*)(ring + p.off + (p.h - 1 - y) * p.bpr);
-    float3 c = max(M709_2020 * row[x].rgb, float3(0.0));
+    float3 c = max(wire_matrix(p) * row[x].rgb, float3(0.0));
     return float3(pq(c.r), pq(c.g), pq(c.b));
 }
 
@@ -212,6 +233,8 @@ final class Converter {
     var textureCache: CVMetalTextureCache?
     var pool: CVPixelBufferPool?
     var poolW = 0, poolH = 0
+    // Working space -> BT.2020 rows (Opts.matrix); the kernels read it per dispatch.
+    var matrix: [Float] = [0.6274, 0.3293, 0.0433, 0.0691, 0.9195, 0.0114, 0.0164, 0.0880, 0.8956]
 
     init() {
         guard let dev = MTLCreateSystemDefaultDevice(), let q = dev.makeCommandQueue() else {
@@ -263,10 +286,12 @@ final class Converter {
         guard let ytex = texture(pb, plane: 0, format: .r16Unorm, w: width, h: height),
               let ctex = texture(pb, plane: 1, format: .rg16Unorm, w: width / 2, h: height / 2),
               let cmd = queue.makeCommandBuffer(), let enc = cmd.makeComputeCommandEncoder() else { return nil }
-        var params = (UInt32(width), UInt32(height), UInt32(bpr), UInt32(offset))
+        let m = matrix
+        var params = (UInt32(width), UInt32(height), UInt32(bpr), UInt32(offset),
+                      m[0], m[1], m[2], Float(0), m[3], m[4], m[5], Float(0), m[6], m[7], m[8], Float(0))
         enc.setComputePipelineState(lumaPipe)
         enc.setBuffer(buffer, offset: 0, index: 0)
-        enc.setBytes(&params, length: 16, index: 1)
+        enc.setBytes(&params, length: 64, index: 1)
         enc.setTexture(ytex, index: 0)
         let tg = MTLSize(width: 16, height: 16, depth: 1)
         enc.dispatchThreadgroups(MTLSize(width: (width + 15) / 16, height: (height + 15) / 16, depth: 1), threadsPerThreadgroup: tg)
@@ -294,6 +319,12 @@ func selftest(_ path: String, conv: Converter) -> Never {
           let yExp = planes["y"] as? [[Int]], let cbExp = planes["cb"] as? [[Int]], let crExp = planes["cr"] as? [[Int]] else {
         log("selftest: cannot read \(path)"); exit(2)
     }
+    // The fixture names the working space it was encoded from; a helper
+    // that ignored --matrix would still pass the Rec.709 vectors.
+    if let rows = json["matrix"] as? [[Double]], rows.count == 3, rows.allSatisfy({ $0.count == 3 }) {
+        conv.matrix = rows.flatMap { $0.map { Float($0) } }
+    }
+    let ws = (json["working_space"] as? String) ?? "Linear Rec.709"
     let h = input.count, w = input[0].count
     let bpr = ((w * 16) + 255) / 256 * 256
     let bytes = ((bpr * h) + PAGE - 1) / PAGE * PAGE
@@ -329,7 +360,7 @@ func selftest(_ path: String, conv: Converter) -> Never {
     check(0, yExp, 1, 0)
     check(1, cbExp, 2, 0)
     check(1, crExp, 2, 1)
-    log("selftest \(w)x\(h): mismatches=\(mismatches) max_err=\(maxErr)")
+    log("selftest \(w)x\(h) [\(ws)]: mismatches=\(mismatches) max_err=\(maxErr)")
     exit(mismatches == 0 ? 0 : 1)
 }
 
@@ -486,6 +517,7 @@ func encode(_ pb: CVPixelBuffer) {
 // ------------------------------------------------------------ main loop --
 
 let conv = Converter()
+conv.matrix = opts.matrix
 if let path = opts.selftest { selftest(path, conv: conv) }
 
 guard let ring = Ring(name: opts.shm) else { exit(5) }

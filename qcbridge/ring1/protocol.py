@@ -145,19 +145,26 @@ def token_fingerprint(token: str) -> str:
 #   delta_resync — t2 meta carries a digest, boots a scene digest; the
 #               replica keeps an inventory, answers `manifest_req`, accepts
 #               `manifest` batches, and a cold "resync_end" ends a delta.
-HOST_CAPS = ("fast_ack", "delta_resync")
-REPLICA_CAPS = ("fast_ack", "batch_apply", "delta_resync")
+#   cm        — the colour-state block rides the hello / hello_reply / pong
+#               and a `cm` control message refreshes it (DESIGN-NOTES
+#               pixels colour state, 2026-10-27).
+HOST_CAPS = ("fast_ack", "delta_resync", "cm")
+REPLICA_CAPS = ("fast_ack", "batch_apply", "delta_resync", "cm")
 
 
 def make_hello(
     token: str, epoch: str, blender_version: str, addon_version: str = "",
     seq: int = 0, seq_fast: int = 0, mappings: list | None = None,
-    shared_root: dict | None = None,
+    shared_root: dict | None = None, cm: dict | None = None,
 ) -> dict:
     return {
         "kind": "hello",
         "caps": list(HOST_CAPS),
         "token": token,
+        # The host's colour state (ring1/colour_state.py): config identity,
+        # working space, display, view, look… so the replica can say where
+        # the two ends disagree. Additive: an older replica ignores it.
+        "cm": dict(cm or {}),
         # The host's path-mapping rows (wire dicts), so the replica can
         # localize with the host's table alone (2026-09-24). Absent from an
         # older host: the replica uses only its own rows, as before.

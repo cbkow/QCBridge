@@ -30,6 +30,28 @@ by three preferences: bitrate, stream width and frame rate; the camera
 frame is fitted to the stream width in Shot Mode, so the resolution no
 longer depends on the replica's screen.
 
+**Both ends know their colour setup and say when it differs.** Each
+Blender reads its own colour management through PyOpenColorIO — the
+config it runs (by identity, never by path), its working space and
+matrix, display device, view transform, look, exposure, gamma, white
+balance, curves, the HDR view, engine and viewport sampling — and tells
+the other end. The host panel shows the two side by side with every
+disagreement in red: different configs, a different working space, a
+view or display the replica does not have, white balance or curves QCView
+cannot reproduce, a non-sRGB display device Blender shows as raw codes.
+The wire is converted from the replica's real working space, not an
+assumed Rec.709; the encoder helpers take the matrix on their command
+line and their selftest covers a Linear P3 working space too. The
+`qcview://stream` link names the host's config, working space, display
+device, view and look so QCView follows them by name (QCView 2.6.3).
+
+**A viewer can join a stream at any time.** The SRT listener used to give
+up every 10 s with nobody connected and relisten after a pause; a viewer
+connecting into the pause failed with "Input/output error" and a session
+could look dead. The listen now waits 30 s and the pair relistens with no
+pause when a viewer leaves; the pixel smoke kills a reader hard and
+expects the next one to connect.
+
 **A dropped tier-1 frame no longer costs a bootstrap.** The replica
 reports how far it has applied each lane and where the first hole is;
 the host re-asserts the datablocks it sent from the hole on (full tier-1

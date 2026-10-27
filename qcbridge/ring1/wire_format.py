@@ -1,5 +1,7 @@
-"""The wire format, as one pure-Python reference: scene-linear Rec.709 →
-BT.2020 → PQ (scene 1.0 = ANCHOR_NITS) → BT.2020 non-constant-luminance
+"""The wire format, as one pure-Python reference: scene-linear (the OCIO
+config's working space — Linear Rec.709 in Blender's own config, but a
+parameter here since 2026-10-27, never an assumption) → BT.2020 by the
+working space's matrix → PQ (scene 1.0 = ANCHOR_NITS) → BT.2020 non-constant-luminance
 Y'CbCr, 10-bit limited range, 4:2:0 by 2×2 average (DESIGN-NOTES pixels
 wire). The helpers' kernels (Metal on macOS, HLSL/SIMD on Windows) mirror
 this; `tests/test_wire_format.py` pins the numbers and writes the vectors
@@ -23,7 +25,11 @@ C1 = 0.8359375
 C2 = 18.8515625
 C3 = 18.6875
 
-# Linear Rec.709 (D65) → linear BT.2020 (D65).
+# Linear Rec.709 (D65) → linear BT.2020 (D65): the matrix for Blender's own
+# working space, and the default everywhere a matrix is a parameter. The
+# replica computes the real one from its OCIO config
+# (ring1/colour_state.working_to_2020) and hands it to the helper as
+# `--matrix`; QCView never sees it — the wire is BT.2020 either way.
 M_709_TO_2020 = (
     (0.6274, 0.3293, 0.0433),
     (0.0691, 0.9195, 0.0114),
@@ -47,11 +53,28 @@ C_MIN, C_MAX = 64, 960
 C_MID = 512
 
 
-def rgb709_to_2020(r: float, g: float, b: float) -> tuple[float, float, float]:
+def rgb_to_2020(r: float, g: float, b: float, matrix=M_709_TO_2020) -> tuple[float, float, float]:
+    """Linear working space → linear BT.2020 by `matrix` (rows), clamped ≥ 0."""
     out = []
-    for row in M_709_TO_2020:
+    for row in matrix:
         out.append(max(0.0, row[0] * r + row[1] * g + row[2] * b))
     return out[0], out[1], out[2]
+
+
+def rgb709_to_2020(r: float, g: float, b: float) -> tuple[float, float, float]:
+    return rgb_to_2020(r, g, b, M_709_TO_2020)
+
+
+def matrix_arg(matrix) -> str:
+    """The helper's `--matrix` value: nine row-major floats, comma-separated."""
+    return ",".join("%.7g" % float(v) for row in matrix for v in row)
+
+
+def parse_matrix_arg(text: str):
+    vals = [float(v) for v in text.split(",")]
+    if len(vals) != 9:
+        raise ValueError("matrix needs nine values, got %d" % len(vals))
+    return tuple(tuple(vals[i * 3:i * 3 + 3]) for i in range(3))
 
 
 def rgb2020_to_709(r: float, g: float, b: float) -> tuple[float, float, float]:
@@ -100,9 +123,9 @@ def dequantize(dy: int, dcb: int, dcr: int) -> tuple[float, float, float]:
     return (dy - 64.0) / 876.0, (dcb - 512.0) / 896.0, (dcr - 512.0) / 896.0
 
 
-def encode_pixel(r: float, g: float, b: float) -> tuple[float, float, float]:
-    """Scene-linear Rec.709 → (Y', Cb, Cr) floats, before quantization."""
-    r2, g2, b2 = rgb709_to_2020(r, g, b)
+def encode_pixel(r: float, g: float, b: float, matrix=M_709_TO_2020) -> tuple[float, float, float]:
+    """Scene-linear (working space, by `matrix`) → (Y', Cb, Cr) floats, before quantization."""
+    r2, g2, b2 = rgb_to_2020(r, g, b, matrix)
     return ycbcr(pq_oetf(r2), pq_oetf(g2), pq_oetf(b2))
 
 
@@ -111,7 +134,7 @@ def decode_pixel(y: float, cb: float, cr: float) -> tuple[float, float, float]:
     return rgb2020_to_709(pq_eotf(rp), pq_eotf(gp), pq_eotf(bp))
 
 
-def encode_tile(rgb: list[list[tuple[float, float, float]]]) -> dict:
+def encode_tile(rgb: list[list[tuple[float, float, float]]], matrix=M_709_TO_2020) -> dict:
     """A small frame (rows of (r,g,b) scene-linear) → 10-bit planes as the
     helper must produce them: `y` (h×w codes), `cb`/`cr` (h/2×w/2 codes, the
     2×2 average of per-pixel chroma — centre siting). Codes are 0..1023; the
@@ -124,7 +147,7 @@ def encode_tile(rgb: list[list[tuple[float, float, float]]]) -> dict:
     crf = [[0.0] * w for _ in range(h)]
     for j in range(h):
         for i in range(w):
-            y, cb, cr = encode_pixel(*rgb[j][i])
+            y, cb, cr = encode_pixel(*rgb[j][i], matrix=matrix)
             yc[j][i] = quantize(y, 0.0, 0.0)[0]
             cbf[j][i], crf[j][i] = cb, cr
     cbc = [[0] * (w // 2) for _ in range(h // 2)]

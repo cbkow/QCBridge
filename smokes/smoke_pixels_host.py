@@ -62,6 +62,8 @@ def dump():
                    "viewer_url": session.viewer_url(), "deep_link": session.qcview_deep_link(),
                    "peer_stream": session.state.get("peer_stream"),
                    "peer_status": getattr(session.state["transport"], "peer_status", {}),
+                   "cm_host": session.state.get("cm"), "cm_replica": session.state.get("peer_cm"),
+                   "cm_mismatches": session.state.get("cm_mismatches"),
                    **results}, f, indent=1)
     _atomic_replace(tmp, os.path.join(OUT, "host.json"))
 

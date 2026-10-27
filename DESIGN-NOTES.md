@@ -145,9 +145,9 @@ on the GPU and encodes HEVC Main10; ffmpeg only muxes to SRT.
   object). Blender-side cost at 1440p: 2.3 ms read + 1 ms publish (Metal),
   16 + 2.5 ms (GL); 10-minute soaks flat on both machines.
 - **wire.** HEVC Main10 4:2:0, PQ with scene 1.0 = 100 nit, BT.2020
-  container (709→2020 before the curve; tags bt2020 / smpte2084 /
-  bt2020nc, limited range, pinned in the mux with `hevc_metadata`), view
-  transform in QCView. On a denoised AgX scene at equal NVENC bitrate: PQ
+  container (working space → 2020 before the curve, by the matrix below;
+  tags bt2020 / smpte2084 / bt2020nc, limited range, pinned in the mux
+  with `hevc_metadata`), view transform in QCView. On a denoised AgX scene at equal NVENC bitrate: PQ
   in a 2020 container 43.2 dB / dE 0.77 at 30 Mbps against 38.9 for the
   same curve in a 709 container; a 10-bit display-referred AgX stream
   43.4 dB at 53 Mbps; the 0.2 line's 8-bit stream 39.0 dB / dE 1.37 at
@@ -161,6 +161,43 @@ on the GPU and encodes HEVC Main10; ffmpeg only muxes to SRT.
 - **probe.** The parity strip is stamped into the published float frame
   (black 0.0, ones 10.0 scene-linear: above the reader's threshold after
   PQ) at the overlay's old geometry; the host reader is unchanged.
+- **working space.** The framebuffer is scene-linear in the OCIO config's
+  `scene_linear` role — Linear Rec.709 in Blender's own config, but a fact
+  of whichever config this Blender loaded (a studio config may say
+  otherwise), never an assumption (2026-10-27). The replica reads the
+  role through PyOpenColorIO, which ships inside Blender's Python, takes
+  its matrix to CIE XYZ D65 off the three primaries, and hands the helper
+  working → BT.2020 as nine numbers (`--matrix`); the descriptor says
+  which space and whether it was read or, without PyOpenColorIO, assumed.
+  Two selftest fixtures: Rec.709 and Linear P3 — the second fails a helper
+  that ignores or transposes the matrix, which the near-identity Rec.709
+  rows let through.
+- **colour state.** Each end reads its own colour management — config
+  identity (cache ID, file, kind; never the path), working space and
+  matrix, display device and its primaries, emulation, view, look,
+  exposure, gamma, white balance, curves, HDR view, engine and viewport
+  sampling — into one block (`ring1/colour_state.py`) that rides the hello,
+  the hello reply, the pong and a `cm` message on change. The host panel
+  shows both columns and every disagreement in red: the two ends may run
+  different configs, and then the synced scene's numbers mean different
+  colours. The `qcview://stream` link carries the host's block by name so
+  QCView follows the host's view for the host's display device or says
+  what it cannot (QCView docs: qcbridge-blender). Measured with the studio
+  config: Blender 5.2.2 on macOS writes a Rec.2020 or Display P3 device's
+  codes straight into its sRGB-tagged window, so the artist on such a
+  device sees a muted picture (red 0.72/0.36/0.23 for AgX-sRGB's
+  0.86/0.22/0.13) and the panel says so.
+- **viewer rejoin.** The mux's SRT listener takes one viewer; when that
+  viewer leaves the mux exits and the pair is respawned at once, no
+  backoff (the backoff is for a dying helper). The listen itself gives up
+  after 30 s with nobody there so an orphaned pair dies on its own — at
+  10 s the relistens came every 17 s and a viewer landing in a gap failed
+  with "Input/output error" (found 2026-10-27). The pixel smoke kills a
+  reader hard and expects the next within 45 s, then one more after an
+  idle. `smokes/run_harness_colour.sh` measures the whole path on a still
+  scene: wire vs Blender's linear render (PSNR > 30 dB, dE mean < 1 —
+  viewport vs final render bottoms near 34 dB), QCView's picture vs the
+  host's view for the host's display (dE mean < 1.5, p99 < 4).
 
 ## Caches
 

@@ -17,11 +17,15 @@ sys.path.insert(0, os.path.join(OUT, "pysite"))
 from qcbridge.ring0 import engine_qcb, pixel_path, replica_apply, session  # noqa: E402
 
 prefs = SimpleNamespace(
-    role="REPLICA", replica_address="", bind_address="127.0.0.1",
+    # QCB_SMOKE_BIND=0.0.0.0 lets a host on another machine pair with this
+    # replica (the colour harness's cross-machine run); the default keeps
+    # the smokes on loopback.
+    role="REPLICA", replica_address="", bind_address=os.environ.get("QCB_SMOKE_BIND", "127.0.0.1"),
     port_control=19990, port_hot=19991, port_cold=19992, token="smoketok",
     enable_stream=True, srt_port=19998, srt_url="", srt_latency_ms=120,
     pixel_source=os.environ.get("QCB_SMOKE_PIXEL_SOURCE", "readback"),
-    stream_bitrate_mbps=20, stream_width=int(os.environ.get("QCB_SMOKE_STREAM_WIDTH", "1280")),
+    stream_bitrate_mbps=int(os.environ.get("QCB_SMOKE_BITRATE", "20")),
+    stream_width=int(os.environ.get("QCB_SMOKE_STREAM_WIDTH", "1280")),
     stream_fps=30, ffmpeg_path="", replica_kiosk=False, path_mappings=[],
 )
 session.start(prefs)
@@ -34,7 +38,10 @@ def _dump():
          "readback": engine_qcb.status(),
          "pixel": pixel_path.status(),
          "ffmpeg": session.state.get("ffmpeg_note", ""),
-         "engine": bpy.context.scene.render.engine}
+         "engine": bpy.context.scene.render.engine,
+         "cm": session.state.get("cm"),
+         "cm_mismatches": session.state.get("cm_mismatches"),
+         "helper_argv": pixel_path.last_argv()}
     try:
         area = replica_apply._target_view()
         if area is not None:

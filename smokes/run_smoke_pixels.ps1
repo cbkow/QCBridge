@@ -119,7 +119,51 @@ checks["srt_size_matches_frame"] = ([probe.get("width"), probe.get("height")] in
                                     or (probe.get("width") == size_now[0] and 0 < (probe.get("height") or 0) <= size_now[0]))
 checks["replica_clean"] = r.get("stats", {}).get("apply_errors", 0) == 0 and r.get("stats", {}).get("gaps", 0) == 0
 deep = h.get("deep_link", "")
-checks["deep_link_carries_view"] = "wire=pq-bt2020-100" in deep and "view=AgX" in deep and "input=linear-rec709" in deep
+# 2026-10-27 colour awareness: the link names the wire, the working space the
+# wire was converted FROM, the host's config kind, display and view — by name.
+checks["deep_link_carries_view"] = ("wire=pq-bt2020-100" in deep and "view=AgX" in deep
+                                    and "input=Linear%20Rec.709" in deep and "display=sRGB" in deep
+                                    and "config=blender" in deep and "cm_ok=1" in deep)
+cm_h, cm_r = h.get("cm_host") or {}, h.get("cm_replica") or {}
+checks["cm_exchanged"] = (bool(cm_h.get("digest")) and bool(cm_r.get("digest"))
+                          and cm_h.get("role") == "HOST" and cm_r.get("role") == "REPLICA"
+                          and not [m for m in (h.get("cm_mismatches") or []) if m[0] == "error"])
+fmt_w = ((h.get("peer_stream") or {}).get("format") or {}).get("working") or {}
+m709 = [[0.6274, 0.3293, 0.0433], [0.0691, 0.9195, 0.0114], [0.0164, 0.0880, 0.8956]]
+checks["wire_matrix_advertised"] = (fmt_w.get("name") == "Linear Rec.709" and fmt_w.get("assumed") is False
+                                    and all(abs(fmt_w["to_bt2020"][a][b] - m709[a][b]) < 2e-3 for a in range(3) for b in range(3)))
+argv = r.get("helper_argv") or []
+checks["helper_argv_has_matrix"] = "--matrix" in argv and argv[argv.index("--matrix") + 1].count(",") == 8
+
+# Viewer rejoin (2026-10-27, the "dead stream"): a viewer reads 3 s and dies
+# hard; the next viewer must connect within 25 s. Then the listener must
+# still take a viewer after sitting idle past the old 10 s listen timeout.
+def srt_caller_ok(secs):
+    try:
+        subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-probesize", "300000",
+                        "-analyzeduration", "1000000", "-i", url, "-frames:v", "1", "-f", "null", "-"],
+                       timeout=secs, check=True, capture_output=True)
+        return True
+    except Exception:
+        return False
+ffmpeg = "ffmpeg"   # on PATH, as the probe's ffprobe
+rejoin = False
+if url and ffmpeg:
+    reader = subprocess.Popen([ffmpeg, "-hide_banner", "-loglevel", "error", "-probesize", "300000",
+                               "-analyzeduration", "1000000", "-i", url, "-t", "3", "-f", "null", "-"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(3.0)
+    reader.kill(); reader.wait()
+    # An idle, converged stream is ~0.3 Mbps, so a caller's 300 KB probe
+    # alone takes ~8 s: give each attempt 20 s, the rejoin 45 s in all.
+    t0 = time.time()
+    while time.time() - t0 < 45 and not rejoin:
+        rejoin = srt_caller_ok(20)
+        if not rejoin:
+            time.sleep(1.0)
+    checks["viewer_rejoin"] = rejoin
+    time.sleep(16.0)   # idle past the old listen timeout
+    checks["listener_survives_idle"] = srt_caller_ok(20)
 verdict = {"pass": all(checks.values()), "checks": checks, "readback": rb, "probe": probe,
            "pixel": r.get("pixel"), "ffmpeg": r.get("ffmpeg"), "deep_link": deep}
 json.dump(verdict, open(f"{S}/verdict.json", "w"), indent=1)

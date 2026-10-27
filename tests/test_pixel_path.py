@@ -54,3 +54,12 @@ def test_helper_lookup_honours_the_env(monkeypatch, tmp_path):
     fake.write_bytes(b"")
     monkeypatch.setenv("QCB_PIXEL_HELPER", str(fake))
     assert pixel_path.find_encode_helper() == str(fake)
+
+
+def test_readback_pipeline_carries_the_working_matrix():
+    from ring1 import colour_state as cs
+    params = StreamParams(bitrate_mbps=40, width=2560, fps=25).with_working(
+        {"name": "Linear Rec.709", "to_xyz": cs.matrix_rows(cs.M_709_TO_XYZ), "assumed": False})
+    cap, _mux = pixel_path.build_encode_pipeline("qcb-encode-mac", "ffmpeg", params, "qcb-7-1", URL, "secret123456")
+    assert cap[:9] == ["qcb-encode-mac", "--shm", "qcb-7-1", "--fps", "25", "--bitrate", "40", "--gop", "25"]
+    assert cap[9] == "--matrix" and cap[10].count(",") == 8
