@@ -21,7 +21,7 @@ prefs = SimpleNamespace(
     role="REPLICA", replica_address="", bind_address="127.0.0.1",
     port_control=19990, port_hot=19991, port_cold=19992, token="benchtok",
     enable_stream=False, srt_port=19998, srt_url="", srt_latency_ms=120,
-    encoder_rung="hevc_10_420_100", ffmpeg_path="", replica_kiosk=False,
+    pixel_source="readback", stream_bitrate_mbps=50, stream_width=2560, stream_fps=30, ffmpeg_path="", replica_kiosk=False,
     path_mappings=[],
 )
 session.start(prefs)

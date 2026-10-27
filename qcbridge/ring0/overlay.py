@@ -1,9 +1,10 @@
-"""Burn-in status overlay — the honesty principle, in-band.
+"""Status overlay on the replica's own display — the honesty principle.
 
 POST_PIXEL drawing survives show_overlays=False (verified 2026-07-24, the
-magenta-canary run), so this travels inside the captured stream and is
-visible in any receiver. The beauty window may be behind, never silently
-wrong.
+magenta-canary run). Since 0.3 the stream is read back from the engine
+BEFORE overlays draw, so this text is for whoever stands at the replica;
+the viewer gets the same facts from the host panel, and the parity probe
+strip is stamped into the published frame by ring0/frame_ring.
 """
 
 from __future__ import annotations
@@ -22,12 +23,6 @@ _FONT_SIZE = 16
 
 _handle = None
 _status_fn: Callable[[], str] | None = None
-_probe_stamp: tuple[float, int] | None = None
-
-
-def set_probe(t_host: float, seq: int) -> None:
-    global _probe_stamp
-    _probe_stamp = (t_host, seq)
 
 
 def _quads(rects):
@@ -45,33 +40,9 @@ def _draw_rects(shader, rects, color) -> None:
     batch.draw(shader)
 
 
-def _draw_probe_strip() -> None:
-    """Parity probe strip, bottom-left of the region just above the status
-    text (the top is under the header when not in kiosk): opaque black
-    backdrop one block wide on every side, white blocks for 1-bits."""
-    region = bpy.context.region
-    if _probe_stamp is None or region is None:
-        return
-    b = probe.BLOCK_PX
-    bits = probe.encode_bits(*_probe_stamp)
-    x = b  # backdrop starts at the region edge
-    y0 = 48 + b  # clears the status text box (y 4..~36)
-    y1 = y0 + b
-    backdrop = [(0, y0 - b, x + len(bits) * b + b, y1 + b)]
-    ones = [
-        (x + i * b, y0, x + (i + 1) * b, y1) for i, bit in enumerate(bits) if bit
-    ]
-    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-    shader.bind()
-    gpu.state.blend_set("NONE")
-    _draw_rects(shader, backdrop, (0.0, 0.0, 0.0, 1.0))
-    _draw_rects(shader, ones, (1.0, 1.0, 1.0, 1.0))
-
-
 def _draw() -> None:
     if _status_fn is None:
         return
-    _draw_probe_strip()
     text = _status_fn()
     if not text:
         return
@@ -109,8 +80,7 @@ def enable(status_fn: Callable[[], str]) -> None:
 
 
 def disable() -> None:
-    global _handle, _status_fn, _probe_stamp
-    _probe_stamp = None
+    global _handle, _status_fn
     if _handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_handle, "WINDOW")
         _handle = None

@@ -32,7 +32,7 @@ def _dev_prefs():
         token="",  # the agent keeps it; the attach reply carries the derivations
         enable_stream=os.environ.get("QCB_AGENT_STREAM", "1") == "1",
         srt_port=9998, srt_url="", srt_latency_ms=60,
-        encoder_rung="hevc_10_420_50", ffmpeg_path="",
+        pixel_source="readback", stream_bitrate_mbps=50, stream_width=2560, stream_fps=30, ffmpeg_path="",
         replica_kiosk=os.environ.get("QCB_AGENT_KIOSK", "1") == "1",
         path_mappings=[], transport="agent",
     )

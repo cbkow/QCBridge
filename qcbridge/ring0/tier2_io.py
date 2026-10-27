@@ -87,12 +87,18 @@ def serialize(db: bpy.types.ID, compress: bool = True) -> bytes | None:
 
 
 def apply_blob(
-    data: bytes, blob_tag: str, mappings, local_project_dir: str = ""
+    data: bytes, blob_tag: str, mappings, local_project_dir: str = "",
+    uuid_map: dict | None = None,
 ) -> tuple[str, int]:
     """Append-load a tier-2/3 partial blend and swap it in.
 
     Returns (primary_name, errors). Indivisible by design — the caller labels
     it in the burn-in overlay while it runs.
+
+    `uuid_map` — the replica's uuid → datablock map, when the caller keeps
+    one: pairing reads it instead of scanning every collection per loaded
+    datablock (O(loaded × scene) otherwise), and it is updated in place so
+    the next blob of the same batch pairs against this blob's arrivals.
     """
     path = Path(tempfile.gettempdir()) / f"qcb-in-{blob_tag}.blend"
     path.write_bytes(data)
@@ -126,7 +132,16 @@ def apply_blob(
     pairs = []
     for new_db, intended_name in loaded:
         uuid = new_db.get(UUID_PROP)
-        old_db = _find_by_uuid(uuid, exclude=new_db) if uuid else None
+        old_db = None
+        if uuid and uuid_map is not None:
+            old_db = uuid_map.get(uuid)
+            try:
+                if old_db is not None and (old_db == new_db or old_db.get(UUID_PROP) != uuid):
+                    old_db = None  # stale entry (or the arrival itself, after a rebuild)
+            except ReferenceError:
+                old_db = None
+        if old_db is None and uuid:
+            old_db = _find_by_uuid(uuid, exclude=new_db)
         if old_db is None:
             # plain iteration: bpy_prop_collection.get() has raised
             # SystemError here on freshly-appended state (observed 5.2)
@@ -172,6 +187,10 @@ def apply_blob(
             except Exception:
                 errors += 1
         primary_name = primary_name or new_db.name
+        if uuid_map is not None:
+            stamped = new_db.get(UUID_PROP)
+            if stamped:
+                uuid_map[stamped] = new_db
     # Shape-key post-pass: a Key arrives implicitly with its owner (it
     # cannot be listed in data_to — no shape_keys namespace, probed 5.2) as
     # a "<name>.001" copy, while the replica's previous Key is orphaned by

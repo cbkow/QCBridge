@@ -237,12 +237,16 @@ def apply_mainfile(
     unmapped += u
     errors += e
     # The scene's cycles.device arrived as the HOST set it (it's scene
-    # state) — this machine is the GPU box, always render on the GPU.
+    # state) — this machine is the GPU box, always render on the GPU. And
+    # the host's Cycles is our subclass here, at 1:1 viewport pixels
+    # (DESIGN-NOTES pixels).
+    from . import engine_qcb
     for scene in bpy.data.scenes:
         try:
             scene.cycles.device = "GPU"
         except AttributeError:
             pass  # cycles addon absent
+        engine_qcb.adopt_scene(scene)
     kiosk.prepare_viewport()
     kiosk.reassert()  # open_mainfile killed any in-flight kiosk steps
     return errors, unmapped, local_dir

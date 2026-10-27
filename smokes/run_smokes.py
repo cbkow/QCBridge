@@ -213,7 +213,10 @@ def pair(bl: str, work: str, replica_py: str, host_py: str, replica_env=None, ho
 
 
 def suite_smoke(bl: str, work: str) -> int:
-    r, h = pair(bl, work, os.path.join(HERE, "smoke_replica.py"), os.path.join(HERE, "smoke_host.py"))
+    # QCB_TEST_HOLD_COLD_MS: hold a batch so the six-blob burst of check 22
+    # (batch_apply_once) accumulates into one apply, as run_smoke.sh does.
+    r, h = pair(bl, work, os.path.join(HERE, "smoke_replica.py"), os.path.join(HERE, "smoke_host.py"),
+                replica_env={"QCB_TEST_HOLD_COLD_MS": "1000"})
     try:
         return run_python(os.path.join(HERE, "smoke_poller.py"), work)
     finally:
@@ -326,20 +329,28 @@ def suite_reconnect(bl: str, work: str) -> int:
             os.remove(os.path.join(work, "replica.json"))
         except OSError:
             pass
-        r2 = start_replica("b", {"QCB_TEST_DROP_FIRST_T1": "1", "QCB_SMOKE_LOCAL_EDIT": "1"})
+        r2 = start_replica("b", {"QCB_TEST_DROP_FIRST_T1": "1", "QCB_TEST_DROP_FIRST_T2": "1",
+                                 "QCB_SMOKE_LOCAL_EDIT": "1"})
         checks["rebootstrap_after_restart"] = wait_for(work, lambda hj, rj:
             rj.get("tag") == "b" and rj.get("stats", {}).get("bootstraps", 0) >= 1
             and rj.get("probe") is not None and hj.get("sent_boot", 0) >= 2, 60)
-        checks["auto_resync_after_gap"] = wait_for(work, lambda hj, rj:
-            hj.get("done") and rj.get("stats", {}).get("bootstraps", 0) >= 2
+        # a dropped tier-1 frame: a fast re-assert, no bootstrap (DESIGN-NOTES sync fast-ack)
+        checks["fast_reassert_after_gap"] = wait_for(work, lambda hj, rj:
+            rj.get("stats", {}).get("bootstraps", 0) == 1 and rj.get("stats", {}).get("resyncs", 0) >= 1
             and rj.get("probe") == [7.0, 3.0, 0.0], 60)
-        checks["host_counted_auto_resync"] = wait_for(work, lambda hj, rj:
-            hj.get("auto_resyncs", 0) >= 1, 5)
+        checks["host_counted_fast_resync"] = wait_for(work, lambda hj, rj:
+            hj.get("fast_resyncs", 0) >= 1 and hj.get("auto_resyncs", 0) == 0, 5)
         checks["flag_cleared_gap_kept"] = wait_for(work, lambda hj, rj:
             not rj.get("stats", {}).get("want_resync") and rj.get("stats", {}).get("gaps", 0) >= 1, 10)
+        # a dropped blob: a delta resync, no bootstrap (DESIGN-NOTES sync delta-resync)
+        checks["delta_resync_no_boot"] = wait_for(work, lambda hj, rj:
+            hj.get("done") and rj.get("stats", {}).get("bootstraps", 0) == 1
+            and hj.get("delta_resyncs", 0) >= 1 and hj.get("delta_t2", 0) >= 1, 60)
+        checks["delta_modifier_present"] = wait_for(work, lambda hj, rj:
+            rj.get("probe_mods") == ["Disp", "Disp2"] and not rj.get("stats", {}).get("want_resync"), 30)
         checks["local_edit_reported_to_host"] = wait_for(work, lambda hj, rj:
             hj.get("peer_status", {}).get("local_edits", 0) >= 1
-            and "Probe" in hj.get("peer_status", {}).get("last_local_edit", ""), 25)
+            and "Probe" in hj.get("peer_status", {}).get("last_local_edit", ""), 30)
     finally:
         stop([h, r2, r1])
     hj, rj = load_json(work, "host.json"), load_json(work, "replica.json")

@@ -6,6 +6,55 @@ matching versions on **both machines**: the ends now tell each other their
 version at connect, and the panel warns if they don't match. Mismatched ends
 mostly work, but they degrade in confusing ways — update both.
 
+## 0.3.0 — in progress (branch `0.3-zero-capture`)
+
+**No screen capture.** The replica's viewport leaves Blender from the
+inside: for Cycles the extension registers its own render engine, a
+subclass of Blender's Cycles that reads the engine's scene-linear pixels
+back right after it draws (bit-identical to stock Cycles on Metal), and
+for EEVEE and Workbench it renders the camera frame into an offscreen
+buffer at up to 15 Hz. Frames go through a shared-memory ring to a small
+encode helper (`qcb-encode-mac`, `qcb-encode-win`) that converts on the
+GPU and encodes HEVC Main10; ffmpeg only muxes to SRT. The display
+capture helpers, the Screen Recording permission on macOS and the
+"display = viewport" kiosk requirement are gone; `Pixel Source: screen`
+keeps the old path as a fallback. Both ends must be 0.3.
+
+**The stream is scene-referred.** 10-bit 4:2:0 PQ (scene 1.0 = 100 nit)
+in a BT.2020 container, so QCView applies the view transform — the
+`qcview://stream` link now carries the host scene's view, look, exposure
+and gamma. Measured on a denoised AgX scene: the same quality as the 0.2
+line's 100 Mbps 8-bit stream at a third of the bits, and 4 dB better than
+PQ in a 709 container (DESIGN-NOTES pixels). Encoder rungs are replaced
+by three preferences: bitrate, stream width and frame rate; the camera
+frame is fitted to the stream width in Shot Mode, so the resolution no
+longer depends on the replica's screen.
+
+**A dropped tier-1 frame no longer costs a bootstrap.** The replica
+reports how far it has applied each lane and where the first hole is;
+the host re-asserts the datablocks it sent from the hole on (full tier-1
+snapshots) instead of shipping the file. A refused tier-1 send used to
+lose its delta silently; it is kept now.
+
+**A dropped blob no longer costs a bootstrap either.** The replica keeps
+an inventory of what it holds; a hole on the cold lane is repaired by
+difference — only the datablocks that differ are resent — and the file
+goes again only when the scene's structure itself differs (DESIGN-NOTES
+sync delta-resync).
+
+**Local View follows.** Entering Local View on the host, and per-viewport
+collection isolation, reach the replica's viewport (agent transport;
+DESIGN-NOTES sync vis-signature).
+
+**A burst of blobs is one apply.** Every blob that has completed by a tick
+applies together, and the replica evaluates its scene once — six modifier
+edits at once used to restart Cycles six times (DESIGN-NOTES sync
+batch-apply). The pong carries the apply batches and evaluations.
+
+**Fixes.** Leaving kiosk no longer races the bootstrap's file load (a
+Blender crash on connect when the host's session flag blipped); the
+local-edit detector is no longer silenced by the 1 s view re-assert.
+
 ## 0.2.1 — 2026-09-26
 
 **The macOS agent no longer puts a tile in the Dock.** The bundle has always

@@ -69,3 +69,22 @@ def test_tracked_tables_cover_the_decided_set():
     assert "view_settings.view_transform" in scene
     assert "render.resolution_x" in scene
     assert "cycles.use_preview_denoising" in scene
+
+
+def test_get_and_restore_put_a_refused_delta_back():
+    s = ShadowStore()
+    assert s.get("u") is None
+    assert s.diff_and_update("u", {"location": [0, 0, 0]}) is None
+    old = s.get("u")
+    d = s.diff_and_update("u", {"location": [1, 0, 0]})
+    assert d["changes"] == [("location", [1, 0, 0])]
+    # the send was refused: without restore the next diff would be empty
+    assert s.diff_and_update("u", {"location": [1, 0, 0]})["changes"] == []
+    s.restore("u", old)
+    assert s.diff_and_update("u", {"location": [1, 0, 0]})["changes"] == [("location", [1, 0, 0])]
+    # restoring None forgets: first contact again
+    s.restore("u", None)
+    assert not s.known("u") and s.diff_and_update("u", {"location": [1, 0, 0]}) is None
+    # get() hands out a copy, never the live shadow
+    live = s.get("u"); live["location"] = [9, 9, 9]
+    assert s.diff_and_update("u", {"location": [1, 0, 0]})["changes"] == []

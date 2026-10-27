@@ -154,3 +154,26 @@ def test_hello_carries_the_shared_root_card():
     h = protocol.make_hello("s", "e", "5.2", shared_root={"path": "/Volumes/x", "os": "mac"})
     assert h["shared_root"] == {"path": "/Volumes/x", "os": "mac"}
     assert protocol.make_hello("s", "e", "5.2")["shared_root"] == {}
+
+
+def test_seq_tracker_remembers_the_first_hole():
+    t = protocol.SeqTracker()
+    assert t.first_missing is None
+    t.observe(1); t.observe(2)
+    assert not t.observe(5)
+    assert t.first_missing == 3            # the oldest unresolved hole
+    assert not t.observe(9)
+    assert t.first_missing == 3            # a later hole does not move it
+    t.clear_gap()
+    assert t.first_missing is None
+    assert not t.observe(12) and t.first_missing == 10
+    # a primed tracker (hello seeded last_seen) treats a lost first message as a hole too
+    t2 = protocol.SeqTracker(); t2.last_seen = 4
+    assert not t2.observe(6) and t2.first_missing == 5
+
+
+def test_hello_and_reply_caps_are_additive():
+    h = protocol.make_hello("tok", "ep", "5.2")
+    assert "fast_ack" in h["caps"]
+    assert "fast_ack" in protocol.REPLICA_CAPS
+    assert protocol.check_hello(h, "tok") == (True, "")

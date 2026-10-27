@@ -58,6 +58,109 @@ report.
 - **D6.** `build_snapshot`'s layer-collection walk is memoised for 50 ms.
 - **D7.** A shading-only update on a geometry type does not resend the
   mesh; `is_updated_geometry` is honoured.
+- **fast-ack.** The pong carries how far the fast lane has been applied
+  (not just seen) and where its first hole is. A hole on that lane alone
+  is repaired from the host's log of what left (`ring1/fastlog`): a full
+  tier-1 snapshot of each datablock named from the hole on, then a
+  `resync_end` — no bootstrap. The shadow used to advance at diff time and
+  a refused send silently lost the delta; it is restored on refusal. From
+  the Octane add-on's "advance the camera shadow only on echo".
+- **batch-apply.** Every blob that has completed by the tick applies in
+  that tick, and the per-batch work (uuid map, `@` re-apply, frozen-cache
+  count, parked releases) runs once; Blender evaluates once when the
+  timer returns. Six blobs in a burst used to cost six evaluations and six
+  Cycles restarts; they cost one (`smokes/run_smoke.sh` check 22). The
+  host marks a blob `more` when more tier-2 work is ready than its tick
+  budget, and the replica holds its batch 100 ms for the rest; the apply
+  budget per tick is a quarter second, because a burst split across ticks
+  costs an evaluation per piece (six 143 KB blobs took over 40 ms to apply
+  on the Windows box). From Octane's "evaluate once per push" flag.
+- **A9 quiet.** The local-edit detector's quiet window belongs to a frame
+  change, not to every hot apply: the 1 s view re-assert on a static host
+  used to silence it half of the time.
+- **delta-resync.** The replica keeps an inventory {uuid: digest} of the
+  blobs it applied; every t2 carries its digest, and what the host hashes
+  after a bootstrap (`_prime_hashes`) goes over in `manifest` batches on
+  the control lane, so the two inventories converge within the prime
+  window. A hole on the cold lane is then answered by difference
+  (`ring1/resync.plan_delta`): tombstones for what only the replica has,
+  blobs for what differs or it lacks, a verify pass for what the host has
+  not hashed, a full Scene tier-1 snapshot, "@" re-asserts, then a cold
+  `resync_end`. Scene STRUCTURE crosses only in the file, so a mismatch of
+  the structural scene digest (boot meta / Scene t1 `sd`) still means a
+  bootstrap. From Octane's engine-data cache keyed by name and hash.
+- **vis-signature.** Local View and per-viewport collection isolation live
+  on the SpaceView3D: no depsgraph event names them and no blob carries
+  them. The host samples a signature of its largest 3D view on the sweep
+  (`ring1/visview`) and sends it on the keyed hot lane, re-asserted every
+  second; the replica turns the difference between what it shows and what
+  the host shows into the operator calls (localview, local_view_set,
+  hide_collection). zmq has no keyed lane: not available there. From
+  Octane's visible-set signature for empty depsgraph batches.
+
+## Pixels
+
+How the viewport leaves the replica since 0.3 (the 2026-10-26/27 probe and
+overnight campaign; screen capture is the `pixel_source = screen` fallback
+only). Cycles: a Python RenderEngine subclassing the bundled
+`cycles.CyclesRender` under its own id (`QCB_CYCLES`) reads the engine's
+scene-linear pixels back from the active framebuffer inside `view_draw`.
+EEVEE and Workbench: a draw handler renders the camera frame into an
+offscreen buffer, linear, at most 15 times a second. Either way the frame
+goes to a shared-memory ring the encode helper reads; the helper converts
+on the GPU and encodes HEVC Main10; ffmpeg only muxes to SRT.
+
+- **readback.** The subclass IS Cycles: on Metal its viewport is
+  bit-identical to stock (PSNR > 100 dB, light linking included); on
+  Windows/GL it differs at the noise level only. `read_color` after
+  `super().view_draw()` returns the engine image alone — no overlays, no
+  view transform — so the stream is scene-referred and the view transform
+  is QCView's.
+- **rect.** In Shot Mode only the camera rectangle is read and published,
+  and the camera frame is fitted to at most `stream_width` px wide: the
+  stream's resolution is a preference, not the replica's screen.
+- **hash skip.** 70–90 % of viewport draws carry no new pixels (Cycles
+  re-blits its display texture); a blake2b over a strided centre window
+  skips them for 0.1 ms. When nothing changed for eight draws the readback
+  thins to one draw in four — Windows reads synchronously (18 ms at 1440p,
+  48 ms at 4K through GL), the Mac in 2–5 ms.
+- **startup black.** A fresh Cycles session reads back black for a few
+  seconds while kernels compile; black-and-unchanged at session start is
+  "not yet", never a frame.
+- **pixel size.** `render.preview_pixel_size` AUTOMATIC is the UI pixel
+  size: on a Retina Mac every Cycles viewport frame is rendered at half
+  resolution as 2x2 blocks. The replica forces 1 on every scene it adopts.
+- **offscreen.** `GPUOffScreen.draw_view3d` for EEVEE is a second,
+  single-sample render per call: 48–80 ms at 1440p on both machines,
+  within dE ~0.5 (p99 ~4) of the converged viewport. Workbench 0.3–1.4 ms.
+  Every offscreen is freed before quit or Blender crashes on exit.
+- **ring.** One block per Blender: a header page and three slots of
+  descriptor page + page-aligned pixels, rows padded to 256 bytes, a
+  seqlock per slot, `latest = (seq << 8) | slot`, `reader_claim` so the
+  writer steps over the reader's slot. Python has no fence: every control
+  word is one aligned 8-byte store and the helper re-checks the seqlock
+  after its copy, so weak ordering costs a retry, never a torn frame. A
+  taller frame retires the block and a new one is created under a new
+  name (a Windows section still held by the helper hands back the old
+  object). Blender-side cost at 1440p: 2.3 ms read + 1 ms publish (Metal),
+  16 + 2.5 ms (GL); 10-minute soaks flat on both machines.
+- **wire.** HEVC Main10 4:2:0, PQ with scene 1.0 = 100 nit, BT.2020
+  container (709→2020 before the curve; tags bt2020 / smpte2084 /
+  bt2020nc, limited range, pinned in the mux with `hevc_metadata`), view
+  transform in QCView. On a denoised AgX scene at equal NVENC bitrate: PQ
+  in a 2020 container 43.2 dB / dE 0.77 at 30 Mbps against 38.9 for the
+  same curve in a 709 container; a 10-bit display-referred AgX stream
+  43.4 dB at 53 Mbps; the 0.2 line's 8-bit stream 39.0 dB / dE 1.37 at
+  97 Mbps. 4:4:4 and 4:2:2 add nothing on AgX content; noisy (256-sample)
+  viewports score the same whatever the curve; saturated gamut-edge noise
+  (a spectral laser scene) is the known 4:2:0 corner at 22–25 dB on every
+  option. 10-bit PQ before any codec sits at 53–59 dB.
+- **idle floor.** A converged viewport stops producing; the helper re-sends
+  the last frame a few times a second so an SRT viewer joining a silent
+  stream is not left in its demuxer probe.
+- **probe.** The parity strip is stamped into the published float frame
+  (black 0.0, ones 10.0 scene-linear: above the reader's threshold after
+  PQ) at the overlay's old geometry; the host reader is unchanged.
 
 ## Caches
 

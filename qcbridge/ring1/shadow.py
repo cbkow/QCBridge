@@ -251,6 +251,20 @@ class ShadowStore:
     def forget(self, uuid: str) -> None:
         self._shadows.pop(uuid, None)
 
+    def get(self, uuid: str) -> dict[str, object] | None:
+        """A copy of the shadow (the peer's believed state), or None."""
+        shadow = self._shadows.get(uuid)
+        return dict(shadow) if shadow is not None else None
+
+    def restore(self, uuid: str, old: dict[str, object] | None) -> None:
+        """Put back what get() returned before a diff_and_update whose
+        delta never left (a refused send): the next diff must find the same
+        changes again, not an advanced shadow that believes they were sent."""
+        if old is None:
+            self._shadows.pop(uuid, None)
+        else:
+            self._shadows[uuid] = dict(old)
+
     def known(self, uuid: str) -> bool:
         return uuid in self._shadows
 

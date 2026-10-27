@@ -8,15 +8,19 @@ it works purely on strings captured at session start.
 from __future__ import annotations
 
 import os
+import time
 import uuid as _uuid
 
 import bpy
 
 from ..ring1 import liveness, pathmap, protocol, toolbox
+from ..ring1.stream_params import StreamParams
 from ..ring1.transport import TransportConfig
-from . import host_handlers, host_hot, kiosk, overlay, pixel_path, replica_apply
+from . import engine_qcb, host_handlers, host_hot, kiosk, overlay, pixel_path, replica_apply
 
 
+
+_SESSION_OFF_GRACE = 2.0  # s the host session must be off before the kiosk is left
 
 def _use_agent(prefs) -> bool:
     """Transport switch: QCB_TRANSPORT, then a `transport` pref, then the
@@ -187,6 +191,8 @@ def stop() -> None:
     replica_apply.stop()
     overlay.disable()
     if state["role"] == "REPLICA":
+        pixel_path.stop()      # the helper first: it holds the ring open
+        engine_qcb.stop()      # then the ring and the engine id (files never carry it)
         kiosk.exit_now()  # leave the machine with a usable UI
     else:
         kiosk.cancel()
@@ -325,6 +331,7 @@ def _start_host(prefs) -> None:
                 state["peer_stream"] = reply.get("stream") or {}
                 _adopt_pair_row(transport, _shared_root_card(transport), reply.get("shared_root") or {})
                 state["peer_addon"] = reply.get("addon", "")
+                state["peer_caps"] = tuple(reply.get("caps") or ())
                 state["note"] = "connected"
                 state["resync_policy"].reset()
                 # Fresh handshake = fresh epoch pairing → full bootstrap
@@ -391,11 +398,33 @@ def _start_host(prefs) -> None:
             return 0.25
         _mirror_paths_from_agent(prefs, transport)  # a tray/window edit shows up in the panel
         sync = state.get("sync")
-        if sync is not None and not pending["armed"] and state["resync_policy"].should_resync(
-            status, _time.monotonic()
-        ):
-            sync.send_bootstrap()
-            state["auto_resyncs"] = state.get("auto_resyncs", 0) + 1
+        if sync is not None and not pending["armed"]:
+            caps = state.get("peer_caps") or ()
+            delta_state = None
+            if (status.get("want_resync") and "delta_resync" in caps
+                    and status.get("gap_lane") in ("cold", "both", "unknown")):
+                delta_state = sync.delta_state(status)
+            verdict = state["resync_policy"].decide(
+                status, _time.monotonic(), caps, sync.fastlog.covers, delta_state
+            )
+            if verdict == "fast":
+                # A hole on the fast lane only: re-assert the datablocks
+                # named from the hole on, no bootstrap (DESIGN-NOTES sync fast-ack).
+                sync.resend_fast_window(status.get("fast_gap_at") or 0)
+                state["fast_resyncs"] = state.get("fast_resyncs", 0) + 1
+            elif verdict == "delta":
+                # A cold hole, inventories in hand: the difference, not the
+                # file (DESIGN-NOTES sync delta-resync).
+                plan = sync.plan_from_manifest(status)
+                if plan is None:
+                    sync.send_bootstrap()
+                    state["auto_resyncs"] = state.get("auto_resyncs", 0) + 1
+                else:
+                    sync.send_delta(plan)
+                    state["delta_resyncs"] = state.get("delta_resyncs", 0) + 1
+            elif verdict == "full":
+                sync.send_bootstrap()
+                state["auto_resyncs"] = state.get("auto_resyncs", 0) + 1
         return 0.25
 
     _arm_handshake(address_error or "connecting", new_epoch=False)
@@ -430,10 +459,17 @@ def _start_replica(prefs) -> None:
     # Captured now (main thread) so the IO-thread handler touches no bpy.
     # No passphrase here: both ends derive it from the shared token, so the
     # secret never crosses the wire.
+    stream_params = StreamParams.from_prefs(prefs)
+    state["stream_params"] = stream_params
     stream_info = {
         "enabled": bool(getattr(prefs, "enable_stream", True)),
         "port": prefs.srt_port,
         "latency_ms": getattr(prefs, "srt_latency_ms", 120),
+        # 0.3: what is on the wire (DESIGN-NOTES pixels wire) — additive;
+        # an older host ignores it, an older replica lacks it and the host
+        # reads that as the 0.2 screen stream.
+        "source": _pixel_source(prefs),
+        **stream_params.descriptor(),
     }
 
     our_version = _addon_version()  # captured: the handler runs on IO thread
@@ -459,6 +495,9 @@ def _start_replica(prefs) -> None:
                 "epoch": epoch, "stream": stream_info,
                 "shared_root": _shared_root_card(transport),
                 "addon": our_version,
+                # What this replica can do beyond the protocol number
+                # (additive; an older host ignores it).
+                "caps": list(protocol.REPLICA_CAPS),
             }
         if msg.get("kind") == "goodbye":
             replica_apply.notify_host_goodbye()  # flag only; handled on tick
@@ -472,6 +511,11 @@ def _start_replica(prefs) -> None:
                 float(msg.get("delta", 0.0)), reset=bool(msg.get("reset"))
             )
             return {"kind": "zoom_ack"}
+        if msg.get("kind") == "manifest_req":
+            return replica_apply.held_snapshot()  # a copy under the lock: IO-thread safe
+        if msg.get("kind") == "manifest":
+            replica_apply.notify_manifest(msg)  # merged on the tick
+            return {"kind": "manifest_ack"}
         return {"kind": "error", "error": f"unknown kind {msg.get('kind')!r}"}
 
     transport.set_request_handler(_handler)
@@ -487,6 +531,19 @@ def _start_replica(prefs) -> None:
             "want_resync": replica_apply.stats["want_resync"],
             "seq_fast": replica_apply.stats["seq_fast"],
             "parked": replica_apply.stats["parked"],
+            # Applied per lane and where the hole is (DESIGN-NOTES sync fast-ack).
+            "cold_applied": replica_apply.stats["cold_applied"],
+            "fast_applied": replica_apply.stats["fast_applied"],
+            "fast_gap_at": replica_apply.stats["fast_gap_at"],
+            "gap_lane": replica_apply.stats["gap_lane"],
+            "resyncs": replica_apply.stats["resyncs"],
+            "batches": replica_apply.stats["batches"],
+            "evaluations": replica_apply.stats["evaluations"],
+            "held_n": replica_apply.stats["held_n"],
+            "held_digest": replica_apply.stats["held_digest"],
+            "scene_digest": replica_apply.stats["scene_digest"],
+            "applied_t2": replica_apply.stats["applied_t2"],
+            "applied_t1": replica_apply.stats["applied_t1"],
             "bootstraps": replica_apply.stats["bootstraps"],
             "unmapped": replica_apply.stats["unmapped_paths"],
             "frozen": replica_apply.stats["frozen_caches"],
@@ -497,6 +554,7 @@ def _start_replica(prefs) -> None:
             # viewer can't connect without anyone remoting to the replica.
             "pixel": pixel_path.status(),
             "ffmpeg": state.get("ffmpeg_note", ""),
+            "readback": engine_qcb.status(),
         }
     )
     transport.start()  # agent mode: returns once attached, so the mirror is in
@@ -511,16 +569,36 @@ def _start_replica(prefs) -> None:
         kiosk.enter()
     else:
         kiosk.prepare_viewport()
+    if _pixel_source(prefs) == "readback" and getattr(prefs, "enable_stream", True):
+        # The frame ring and the engine first, so the helper has a ring to
+        # read when _start_pixel_path spawns it.
+        engine_qcb.start(stream_params.width, shot_fn=replica_apply.shot_mode_on,
+                         retire_cb=pixel_path.restart_ring)
     _start_pixel_path(prefs)
 
     # The host's session, as the agent reports it (2026-09-25): when it ends
     # this machine gets its UI back at once, without waiting for the agent
     # to close Blender after its grace. Kiosk re-engages with the next
     # project the host sends (on_project_loaded).
+    # The flag flaps during a normal connect ("host connected, no session"
+    # precedes "host in session" by under a second), and leaving kiosk
+    # rewrites screen regions — which crashed Blender inside ED_area_init
+    # when it landed on the same tick as the bootstrap's open_mainfile
+    # (smoke run 2026-10-27). Act on a session that has been OFF for a
+    # while, never on a blip, and never while a blob is being applied.
+    off_since = {"t": None}
+
     def _session_watch():
         if state["role"] != "REPLICA" or state.get("transport") is not transport:
             return None
-        if not getattr(transport, "session_on", True) and kiosk.active():
+        if getattr(transport, "session_on", True):
+            off_since["t"] = None
+            return 0.5
+        now = time.monotonic()
+        if off_since["t"] is None:
+            off_since["t"] = now
+        elif now - off_since["t"] >= _SESSION_OFF_GRACE and kiosk.active() \
+                and not replica_apply.applying():
             kiosk.exit_now()
             state["note"] = "host session ended"
         return 0.5
@@ -536,7 +614,12 @@ def _replica_srt_url(prefs) -> str:
         return prefs.srt_url
     bind = prefs.bind_address or "0.0.0.0"
     latency_us = getattr(prefs, "srt_latency_ms", 120) * 1000
-    return f"srt://{bind}:{prefs.srt_port}?mode=listener&latency={latency_us}"
+    # listen_timeout: with no viewer, ffmpeg sits in the SRT listen with its
+    # input pipe unread, the helper blocks on that pipe and neither notices
+    # Blender dying — an orphan mux kept the port (found 2026-10-27). A
+    # listen that gives up every 10 s lets the pair cycle and die cleanly;
+    # the supervisor respawns it at once while Blender lives.
+    return f"srt://{bind}:{prefs.srt_port}?mode=listener&latency={latency_us}&listen_timeout=10000000"
 
 
 def _start_pixel_path(prefs) -> None:
@@ -551,10 +634,11 @@ def _start_pixel_path(prefs) -> None:
         return
     state["pixel_resolving"] = True
     # bpy reads happen HERE, main thread; the worker gets plain strings.
+    params = state.get("stream_params") or StreamParams.from_prefs(prefs)
     args = (
-        prefs.ffmpeg_path, prefs.encoder_rung,
-        _replica_srt_url(prefs),
+        prefs.ffmpeg_path, _replica_srt_url(prefs),
         _secrets(prefs, state.get("transport"))[1],
+        params, _pixel_source(prefs), engine_qcb.ring_name(),
     )
     transport = state.get("transport")
 
@@ -565,7 +649,7 @@ def _start_pixel_path(prefs) -> None:
                 state["ffmpeg_note"] = f"stream OFF — ffmpeg {source}"
                 return
             state["ffmpeg_note"] = f"ffmpeg: {source}"
-            pixel_path.start(ffmpeg, args[1], args[2], args[3])
+            pixel_path.start(ffmpeg, args[1], args[2], params=args[3], source=args[4], ring_name=args[5])
         finally:
             state["pixel_resolving"] = False
 
@@ -591,6 +675,10 @@ def _effective_mappings(prefs, transport) -> list[pathmap.PathMapping]:
     if getattr(transport, "agent_mode", False) and cfg.get("path_mappings"):
         return pathmap.rows_from_wire(cfg["path_mappings"])
     return _prefs_mappings(prefs)
+
+
+def _pixel_source(prefs) -> str:
+    return "screen" if getattr(prefs, "pixel_source", "readback") == "screen" else "readback"
 
 
 def _effective_kiosk(prefs, transport) -> bool:
@@ -724,10 +812,26 @@ def qcview_deep_link() -> str:
     if not url:
         return ""
     name = bpy.path.basename(bpy.data.filepath) or "Blender"
-    return (
+    link = (
         "qcview://stream?url=" + urllib.parse.quote(url, safe="")
         + "&name=" + urllib.parse.quote(f"Live · {name}")
     )
+    # 0.3: the wire and the view transform QCView should apply, from the
+    # host scene (DESIGN-NOTES pixels wire). An older QCView ignores them.
+    stream = state.get("peer_stream") or {}
+    if stream.get("source", "screen") == "readback" and stream.get("format"):
+        fmt = stream["format"]
+        scene = bpy.context.scene
+        vs, ds = scene.view_settings, scene.display_settings
+        q = {
+            "wire": f"{fmt.get('transfer', 'pq')}-{fmt.get('primaries', 'bt2020')}-{int(fmt.get('anchor_nits', 100))}",
+            "input": "linear-rec709",
+            "view": vs.view_transform, "look": vs.look,
+            "exposure": f"{vs.exposure:.4g}", "gamma": f"{vs.gamma:.4g}",
+            "display": ds.display_device,
+        }
+        link += "".join(f"&{k}={urllib.parse.quote(str(v), safe='')}" for k, v in q.items())
+    return link
 
 
 def shot_mode_toggle() -> str:

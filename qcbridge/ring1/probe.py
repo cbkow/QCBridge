@@ -16,7 +16,6 @@ Blocks are large on purpose: they must survive 4:2:0 HEVC at any rung.
 Knobs (environment, read once at session start):
   QCB_PROBE=1          stamp hot packets / draw the strip
   QCB_HOT_HZ=60        host hot-sampler rate (default 30)
-  QCB_CAPTURE_FPS=60   replica capture rate (default 30)
   QCB_PROBE_ORBIT=45   host view orbit, degrees/second (0 = off)
 """
 
@@ -43,10 +42,6 @@ def enabled() -> bool:
 
 def hot_hz() -> float:
     return max(1.0, _env_float("QCB_HOT_HZ", 30.0))
-
-
-def capture_fps() -> int:
-    return max(1, int(_env_float("QCB_CAPTURE_FPS", 30.0)))
 
 
 def orbit_deg_per_s() -> float:

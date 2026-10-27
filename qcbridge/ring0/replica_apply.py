@@ -12,13 +12,14 @@ from __future__ import annotations
 import collections
 import os
 import json
+import threading
 import time
 
 import bpy
 from mathutils import Matrix
 
-from ..ring1 import merge, protocol
-from . import bootstrap, kiosk, overlay, pixel_path, tier2_io
+from ..ring1 import merge, protocol, resync, visview
+from . import bootstrap, engine_qcb, kiosk, overlay, pixel_path, tier2_io
 from .identity import UUID_PROP
 
 _DEBUG = bool(os.environ.get("QCB_DEBUG"))
@@ -38,6 +39,8 @@ _SCANNED_COLLECTIONS = (
 _transport = None
 _last_hot: bytes | None = None
 _last_hot_applied = 0.0
+_last_vis_raw: bytes | None = None   # keyed hot "vis": Local View / isolation
+_last_vis_applied = 0.0
 _REASSERT_S = 1.0
 _last_frame_apply = 0.0
 _last_redraw_poke = 0.0
@@ -60,12 +63,29 @@ stats = {
     "want_resync": False,
     "seq_fast": 0,     # fast lane (tier-1 deltas, tombstones)
     "parked": 0,       # fast messages waiting for their blob to apply
+    # Applied (not just seen) per lane, and where the first hole is, so the
+    # host can repair the right lane: a fast hole is re-asserted from
+    # `fast_gap_at` (DESIGN-NOTES sync fast-ack), a cold one bootstraps.
+    "cold_applied": 0,
+    "fast_applied": 0,
+    "fast_gap_at": None,
+    "gap_lane": "",      # "", "cold", "fast", "both", "unknown"
+    "resyncs": 0,        # repairs that ended without a bootstrap
+    # The inventory (DESIGN-NOTES sync delta-resync): what this replica holds,
+    # by digest, so a cold hole is repaired by difference, not by file.
+    "held_n": 0,
+    "held_digest": "",
+    "scene_digest": "",
     # Edits made ON the replica: nothing forbids them and the host will
     # never overwrite one unless it changes that same property (DESIGN-NOTES sync
     # A9). Heuristic count — an update on a stamped datablock we did not
     # touch recently, outside a frame change and outside a blob's wake.
     "local_edits": 0,
     "last_local_edit": "",
+    # Apply batches and depsgraph evaluations, so a smoke can assert that a
+    # burst of blobs costs one evaluation (DESIGN-NOTES sync batch-apply).
+    "batches": 0,
+    "evaluations": 0,
     # Baked disk caches with no external path: their blendcache_<name>/ dir
     # belongs to the host's file name, which this machine never had
     # (DESIGN-NOTES caches §2) — frozen at rest with every flag green.
@@ -75,6 +95,10 @@ stats = {
 # Test hook: drop the first tier-1 message after start, to exercise the
 # gap → want_resync → bootstrap path without a lossy network.
 _TEST_DROP_FIRST_T1 = bool(os.environ.get("QCB_TEST_DROP_FIRST_T1"))
+# ... and the first tier-2 blob (every chunk of it), for the cold-lane gap →
+# delta resync path.
+_TEST_DROP_FIRST_T2 = bool(os.environ.get("QCB_TEST_DROP_FIRST_T2"))
+_test_drop_t2_id: str | None = None
 
 _merger = merge.LaneMerger()
 _uuid_map: dict[str, bpy.types.ID] = {}
@@ -90,9 +114,27 @@ _GEOMETRY_TYPES = (bpy.types.Mesh, bpy.types.Curve, bpy.types.Curves, bpy.types.
                    bpy.types.Volume, bpy.types.MetaBall, bpy.types.GreasePencil, bpy.types.Lattice)
 _BLOB_GRACE = 3.0
 _FRAME_GRACE = 0.5
-_pending_t2_seq: int | None = None  # cold seq of the blob's last chunk
-_pending_t2: tuple[dict, bytes] | None = None  # applied on the NEXT tick so
-                                               # the "⟳ applying" label gets a redraw first
+# Completed blobs waiting to apply: (header, blob, cold seq). Applied on the
+# NEXT tick so the "⟳ applying" label gets a redraw first, and applied
+# TOGETHER: every blob that has completed by then goes in one tick, and
+# Blender evaluates the depsgraph once when the timer returns — N blobs on
+# N ticks used to cost N evaluations and N Cycles restarts (DESIGN-NOTES
+# sync batch-apply; Octane's "evaluate once per batch" flag). A bootstrap
+# is always a batch of its own.
+_pending_blobs: collections.deque = collections.deque()
+_pending_last_at = 0.0        # when the newest waiting blob completed
+_pending_more = False         # the newest blob said a burst is still coming
+_BATCH_MAX = 16               # completed blobs held before cold pulls pause
+# Keep applying while under this, once started. Generous on purpose: a
+# burst split across ticks costs an evaluation and a Cycles restart per
+# piece, which dwarfs a quarter second of applying (six 143 KB blobs took
+# over 40 ms on the Windows box and came out as two batches).
+_BATCH_BUDGET_S = 0.25
+_BURST_WAIT_S = 0.10          # hold for the rest of a burst the host announced ("more")
+# Test hook: hold a batch until no blob has completed for this long, so a
+# burst from the host accumulates into one apply whatever the machine's
+# serialize pace (smoke check 22).
+_TEST_HOLD_COLD_S = float(os.environ.get("QCB_TEST_HOLD_COLD_MS", "0")) / 1000.0
 _mappings: list = []
 _project_dir_local = ""  # mapped-local project dir from the last bootstrap —
                          # tier-2 arrivals resolve their relative paths against it
@@ -114,6 +156,7 @@ _shot = {
     "fit_zoom": None,
     "saved_pp": None,    # (show_passepartout, alpha) to restore on exit
     "restore": False,
+    "fit_region": None,  # (w, h) of the region the fit was measured in
 }
 
 
@@ -176,6 +219,10 @@ def _camera_border(area, rv3d):
     return (max(xs) - min(xs), max(ys) - min(ys), region.width, region.height)
 
 
+def shot_mode_on() -> bool:
+    return bool(_shot["on"])
+
+
 def _service_shot(area) -> None:
     space = area.spaces.active
     rv3d = space.region_3d
@@ -206,11 +253,22 @@ def _service_shot(area) -> None:
         if not cam.data.show_passepartout or cam.data.passepartout_alpha < 1.0:
             cam.data.show_passepartout = True
             cam.data.passepartout_alpha = 1.0
+    region = next((r for r in area.regions if r.type == "WINDOW"), None)
+    if region is not None and (region.width, region.height) != _shot.get("fit_region"):
+        # The region changed size since the fit (a kiosk relayout, a window
+        # resize): the frame scaled with it, past the stream width. Measure
+        # again once a redraw has landed.
+        if _shot.get("fit_region") is not None and not _shot["fit_pending"]:
+            _shot["fit_pending"] = True
+            _shot["measure_at"] = now + 0.3
+        _shot["fit_region"] = (region.width, region.height)
     if _shot["fit_pending"] and now >= _shot["measure_at"]:
         border = _camera_border(area, rv3d)
         if border is not None and border[0] > 1 and border[1] > 1:
             bw, bh, rw, rh = border
-            scale = min(rw / bw, rh / bh)
+            # Fit to the region AND to the stream width: the camera frame is
+            # the frame the encoder reads, so this IS the stream resolution.
+            scale = min(rw / bw, rh / bh, engine_qcb.stream_width() / bw)
             fitted = _fac_to_zoom(_zoom_to_fac(rv3d.view_camera_zoom) * scale)
             _shot["fit_zoom"] = max(-30.0, min(600.0, fitted))
             _shot["fit_pending"] = False
@@ -328,6 +386,9 @@ def _write_rna(db, path: str, value) -> None:
         # the dotted-path split below for that same reason.
         db[json.loads(path[1:-1])] = value
         return
+    if path == "render.engine":
+        # The host's Cycles is our Cycles subclass here (DESIGN-NOTES pixels).
+        value = engine_qcb.map_engine(value)
     if "." in path:
         parent_path, attr = path.rsplit(".", 1)
         parent = db.path_resolve(parent_path)
@@ -348,9 +409,15 @@ def _note_touched(uuid: str) -> None:
     _touched[uuid] = time.monotonic()
 
 
-def _quiet(seconds: float) -> None:
-    global _quiet_until
-    _quiet_until = max(_quiet_until, time.monotonic() + seconds)
+_quiet_why = ""
+
+
+def _quiet(seconds: float, why: str = "") -> None:
+    global _quiet_until, _quiet_why
+    until = time.monotonic() + seconds
+    if until > _quiet_until:
+        _quiet_until = until
+        _quiet_why = why
 
 
 def _apply_t1(header: dict, payload: bytes) -> None:
@@ -358,11 +425,16 @@ def _apply_t1(header: dict, payload: bytes) -> None:
     _note_touched(header["uuid"])
     # A delta on one datablock wakes its dependents (a camera's data → its
     # object); the detector judges only while the host has been quiet.
-    _quiet(_FRAME_GRACE)
+    _quiet(_FRAME_GRACE, "t1")
     if db is None:
+        global _unknown_gap
         stats["unknown_uuid"] += 1
         stats["want_resync"] = True  # a blob we never got
+        _unknown_gap = True          # a cold-lane problem, whatever lane this rode
+        _refresh_gap_stats()
         return
+    if header.get("sd"):
+        stats["scene_digest"] = header["sd"]
     changes = json.loads(payload.decode("utf-8"))
     for path, value in changes:
         try:
@@ -381,7 +453,7 @@ def _apply_t1(header: dict, payload: bytes) -> None:
 def _apply_tombstone(header: dict) -> None:
     global _last_hot
     _note_touched(header["uuid"])
-    _quiet(_FRAME_GRACE)  # a removal wakes the survivors
+    _quiet(_FRAME_GRACE, "tomb")  # a removal wakes the survivors
     db = _resolve(header["uuid"])
     if db is None:
         return
@@ -390,6 +462,7 @@ def _apply_tombstone(header: dict) -> None:
     except Exception:
         stats["apply_errors"] += 1
     _uuid_map.pop(header["uuid"], None)
+    _held_set(header["uuid"], None)
     _last_hot = None  # same camera-view risk as a t2 apply (see above)
 
 
@@ -398,7 +471,7 @@ def _apply_link(header: dict) -> None:
     mapped path. Linked IDs are never stamped, so membership and pointers
     to them ride by name once they exist here."""
     from ..ring1 import pathmap
-    _quiet(_BLOB_GRACE)  # libraries.load re-evaluates the scene: not a local edit
+    _quiet(_BLOB_GRACE, "link")  # libraries.load re-evaluates the scene: not a local edit
     host_path = header.get("lib") or ""
     local = pathmap.localize_any(host_path, _mappings)
     if header.get("kind") == "unlink":
@@ -483,43 +556,86 @@ def _count_frozen_caches() -> int:
     return n
 
 
-def _apply_pending_t2() -> None:
-    global _pending_t2, _project_dir_local, _last_hot
-    header, blob = _pending_t2
-    _pending_t2 = None
+def _apply_one(header: dict, blob: bytes) -> str | None:
+    """Apply one completed blob. Returns the uuid whose "@" state must be
+    re-applied afterwards (None for a bootstrap, which carries its own)."""
+    global _project_dir_local, _unknown_gap, _last_boot_applied, _boot_gen
     blob_tag = header["blob"]["id"].replace(".", "-")
     _note_touched(header.get("uuid", ""))
-    _quiet(_BLOB_GRACE)  # a blob (and its dependencies) wakes the depsgraph broadly
+    if header.get("kind") == "boot":
+        errors, unmapped, _project_dir_local = bootstrap.apply_mainfile(
+            blob, blob_tag, header.get("project_dir", ""), _mappings
+        )
+        stats["bootstraps"] += 1
+        stats["apply_errors"] += errors
+        stats["unmapped_paths"] = unmapped
+        stats["host_ended"] = False
+        stats["want_resync"] = False  # the full file is the answer
+        _unknown_gap = False
+        _merger.clear_cold_gap()
+        _merger.clear_fast_gap()
+        _refresh_gap_stats()
+        _at_state.clear()  # the file carries view-layer state itself
+        _rebuild_uuid_map()  # a fresh scene: the batch's map is void
+        _last_boot_applied = time.monotonic()
+        _held_clear()
+        stats["scene_digest"] = header.get("scene_digest") or ""
+        try:
+            _boot_gen = int(header["blob"]["id"].split(".")[1])
+        except (KeyError, IndexError, ValueError):
+            _boot_gen = None
+        from . import session  # deferred: session imports this module
+        session.on_project_loaded()
+        return None
+    _name, errors = tier2_io.apply_blob(
+        blob, blob_tag, _mappings, _project_dir_local, uuid_map=_uuid_map
+    )
+    stats["applied_t2"] += 1
+    stats["apply_errors"] += errors
+    if header.get("digest"):
+        _held_set(header.get("uuid", ""), str(header["digest"]))
+    return header.get("uuid", "")
+
+
+def _apply_pending_batch() -> None:
+    """Every blob that has completed, in one tick, then the per-batch work
+    once: map rebuild, "@" re-apply, frozen-cache count, parked releases,
+    the camera-view re-assert. Blender evaluates once when the tick
+    returns. A bootstrap applies alone (it replaces the whole scene)."""
+    global _last_hot
+    start = time.monotonic()
+    _quiet(_BLOB_GRACE, "blob")  # a blob (and its dependencies) wakes the depsgraph broadly
+    due: list = []
+    reapply: list[str] = []
+    applied = 0
     try:
-        if header.get("kind") == "boot":
-            errors, unmapped, _project_dir_local = bootstrap.apply_mainfile(
-                blob, blob_tag, header.get("project_dir", ""), _mappings
-            )
-            stats["bootstraps"] += 1
-            stats["apply_errors"] += errors
-            stats["unmapped_paths"] = unmapped
-            stats["host_ended"] = False
-            stats["want_resync"] = False  # the full file is the answer
-            from . import session  # deferred: session imports this module
-            session.on_project_loaded()
-        else:
-            _name, errors = tier2_io.apply_blob(
-                blob, blob_tag, _mappings, _project_dir_local
-            )
-            stats["applied_t2"] += 1
-            stats["apply_errors"] += errors
-        _rebuild_uuid_map()
-        if header.get("kind") == "boot":
-            _at_state.clear()  # the file carries view-layer state itself
-        else:
-            _reapply_at_state(header.get("uuid", ""))
+        while _pending_blobs:
+            header, blob, seq = _pending_blobs[0]
+            is_boot = header.get("kind") == "boot"
+            if applied and (is_boot or time.monotonic() - start >= _BATCH_BUDGET_S):
+                break  # the rest next tick (a boot never shares a batch)
+            _pending_blobs.popleft()
+            try:
+                uuid = _apply_one(header, blob)
+                if uuid:
+                    reapply.append(uuid)
+            except Exception as exc:
+                stats["apply_errors"] += 1
+                stats["last_error"] = f"{header.get('kind')} {header.get('name')}: {exc!r}"
+            applied += 1
+            due += _merger.cold_done(seq)  # in order: fast messages wait per blob
+            if is_boot:
+                break
+        if reapply:
+            _rebuild_uuid_map()
+            for uuid in reapply:
+                _reapply_at_state(uuid)
         stats["frozen_caches"] = _count_frozen_caches()
-    except Exception as exc:
-        stats["apply_errors"] += 1
-        stats["last_error"] = f"{header.get('kind')} {header.get('name')}: {exc!r}"
     finally:
-        stats["applying"] = ""
-        _release(_merger.cold_done(_pending_t2_seq))
+        stats["batches"] += 1
+        stats["applying"] = _pending_label()
+        _refresh_held_stats()
+        _release(due)
         # A t2/boot apply can replace the very camera the viewport is
         # looking through — batch_remove knocks the view out of CAMERA
         # perspective. A static host view means every hot packet is
@@ -534,13 +650,19 @@ def _apply_pending_t2() -> None:
             _shot["measure_at"] = time.monotonic() + 0.3
 
 
+def _pending_label() -> str:
+    if not _pending_blobs:
+        return ""
+    first = _pending_blobs[0][0].get("name", "?")
+    return first if len(_pending_blobs) == 1 else f"{first} +{len(_pending_blobs) - 1}"
+
+
 def _process_cold(deadline: float) -> None:
     # One message at a time through the inboxes so a mid-batch stop (a
     # completed tier-2 blob deferring its apply) never drops already-polled
     # messages. Fast messages are applied even while a blob apply is
     # pending: the merge rule parks any that must follow it (LaneMerger),
     # so the rest are independent of it by construction.
-    global _pending_t2
     transport = _transport
     if transport is None:
         return
@@ -549,22 +671,29 @@ def _process_cold(deadline: float) -> None:
             _inbox_fast.extend(transport.poll_fast(64))
         if _inbox_fast:
             header, payload = _inbox_fast.popleft()
-        elif _pending_t2 is None:
+        elif len(_pending_blobs) < _BATCH_MAX and not _pending_boot():
             if not _inbox:
                 _inbox.extend(transport.poll_cold(8))
                 if not _inbox:
                     return
             header, payload = _inbox.popleft()
         else:
-            return  # cold waits for the pending apply; fast is drained
+            return  # cold waits for the pending batch; fast is drained
         seq = header.get("seq")
         kind = header.get("kind")
-        global _TEST_DROP_FIRST_T1
+        global _TEST_DROP_FIRST_T1, _test_drop_t2_id
         if _TEST_DROP_FIRST_T1 and kind == "t1":
             _TEST_DROP_FIRST_T1 = False
             continue  # simulate a lost frame: the next seq reveals the gap
+        if _TEST_DROP_FIRST_T2 and kind == "t2":
+            blob_id = header["blob"]["id"]
+            if _test_drop_t2_id is None:
+                _test_drop_t2_id = blob_id
+            if blob_id == _test_drop_t2_id:
+                continue  # every chunk of the first blob: a cold-lane hole
         if not _merger.observe(header):
             stats["want_resync"] = True
+            _refresh_gap_stats()
         stats["seq"] = _merger.cold.last_seen or 0
         stats["seq_fast"] = _merger.fast.last_seen or 0
         stats["gaps"] = _merger.gaps
@@ -574,14 +703,136 @@ def _process_cold(deadline: float) -> None:
         _dispatch(header, payload, seq)
 
 
+_unknown_gap = False  # a t1 named a uuid we never got (cleared by a bootstrap)
+
+# The inventory: written on the main thread, read (copied) on the IO thread
+# for manifest_req; the host's manifest batches queue on the IO thread and
+# merge on the tick.
+_held: dict[str, str] = {}
+_held_lock = threading.Lock()
+_held_version = 0
+_held_digest_cache: tuple[int, str] = (-1, "")
+_boot_gen: int | None = None   # the host's sent_boot of the file we run
+_manifests: collections.deque = collections.deque()
+
+
+def _held_set(uuid: str, digest: str | None) -> None:
+    global _held_version
+    with _held_lock:
+        if digest:
+            _held[uuid] = digest
+        else:
+            _held.pop(uuid, None)
+        _held_version += 1
+
+
+def _held_clear() -> None:
+    global _held_version
+    with _held_lock:
+        _held.clear()
+        _held_version += 1
+
+
+def _refresh_held_stats() -> None:
+    global _held_digest_cache
+    with _held_lock:
+        version = _held_version
+        if _held_digest_cache[0] != version:
+            _held_digest_cache = (version, resync.manifest_digest(_held))
+        stats["held_n"] = len(_held)
+    stats["held_digest"] = _held_digest_cache[1]
+
+
+def held_snapshot() -> dict:
+    """IO thread: the inventory for a manifest_req reply."""
+    with _held_lock:
+        held = dict(_held)
+    return {"kind": "manifest", "held": held, "scene_digest": stats["scene_digest"], "boot": _boot_gen}
+
+
+def notify_manifest(msg: dict) -> None:
+    """IO thread: a manifest batch from the host; merged on the tick."""
+    _manifests.append(msg)
+
+
+_MANIFESTS_AHEAD_MAX = 256  # batches held for a bootstrap still in flight
+
+
+def _merge_manifests() -> None:
+    """Batches for the file we run merge; batches for a NEWER bootstrap wait
+    (the host primes and sends while the file is still crossing, so they
+    race the boot); batches for an older one drop."""
+    keep: list = []
+    while _manifests:
+        m = _manifests.popleft()
+        boot = m.get("boot")
+        if _boot_gen is None or (isinstance(boot, int) and boot > _boot_gen):
+            if len(keep) < _MANIFESTS_AHEAD_MAX:
+                keep.append(m)
+            continue
+        if boot != _boot_gen:
+            if _DEBUG:
+                print(f"qcb manifest dropped: boot {boot!r} != {_boot_gen!r}", flush=True)
+            continue  # for a file we no longer run
+        if _DEBUG:
+            print(f"qcb manifest merged: {len(m.get('held') or {})} entries", flush=True)
+        held = m.get("held") or {}
+        if not isinstance(held, dict):
+            continue
+        with _held_lock:
+            global _held_version
+            for uuid, digest in held.items():
+                if uuid not in _held and digest:
+                    _held[uuid] = str(digest)
+            _held_version += 1
+    _manifests.extend(keep)
+
+
+def _refresh_gap_stats() -> None:
+    stats["cold_applied"] = _merger.cold_applied
+    stats["fast_applied"] = _merger.fast_applied
+    stats["fast_gap_at"] = _merger.fast.first_missing
+    lane = _merger.gap_lane
+    if _unknown_gap:
+        lane = "unknown" if not lane else lane
+    stats["gap_lane"] = lane
+
+
+def _end_resync(header: dict) -> None:
+    """The host finished a repair that was not a bootstrap: the hole it
+    answered is closed. The flag stays up only if another hole remains."""
+    global _unknown_gap
+    if _merger.lane_of(header) == merge.LANE_FAST:
+        _merger.clear_fast_gap()
+    else:
+        _merger.clear_cold_gap()
+        _unknown_gap = False
+    stats["resyncs"] += 1
+    _refresh_gap_stats()
+    stats["want_resync"] = bool(stats["gap_lane"])
+
+
+def _pending_boot() -> bool:
+    return any(h.get("kind") == "boot" for h, _b, _s in _pending_blobs)
+
+
 def _dispatch(header: dict, payload: bytes, seq) -> None:
-    global _pending_t2, _pending_t2_seq
+    global _pending_last_at, _pending_more
     kind = header.get("kind")
     if _merger.lane_of(header) == merge.LANE_FAST:
         if kind == "t1":
             _apply_t1(header, payload)
         elif kind == "tomb":
             _apply_tombstone(header)
+            _refresh_held_stats()
+        elif kind == "resync_end":
+            _end_resync(header)
+        _merger.fast_done(seq)
+        _refresh_gap_stats()
+        return
+    if kind == "resync_end":
+        _end_resync(header)
+        _release(_merger.cold_done(seq))
         return
     if kind == "t1":
         _apply_t1(header, payload)
@@ -602,10 +853,17 @@ def _dispatch(header: dict, payload: bytes, seq) -> None:
             done = _reassembler.feed(header, payload)
             if done is not None:
                 _blob_by_uuid.pop(uuid, None)
-                # Defer the indivisible apply one tick: label first.
-                stats["applying"] = done[0].get("name", "?")
-                _pending_t2 = done
-                _pending_t2_seq = seq  # cold_done only once it has applied
+                if kind == "boot":
+                    # The file supersedes every blob queued before it; its
+                    # cold_done covers their seqs, so parked fast messages
+                    # still release in order.
+                    _pending_blobs.clear()
+                _pending_last_at = time.monotonic()
+                _pending_more = bool(done[0].get("more")) and kind != "boot"
+                # Defer the apply one tick: label first. cold_done only
+                # once it has applied.
+                _pending_blobs.append((done[0], done[1], seq))
+                stats["applying"] = _pending_label()
                 area = _target_view()
                 if area:
                     area.tag_redraw()
@@ -613,11 +871,141 @@ def _dispatch(header: dict, payload: bytes, seq) -> None:
                 _release(_merger.cold_done(seq))  # a middle chunk: nothing waits on it
 
 
+_last_boot_applied = 0.0
+_BOOT_SETTLE_S = 2.0
+
+
+def applying() -> bool:
+    """A blob or bootstrap is queued, being applied, or has just applied: no
+    screen surgery now. open_mainfile leaves the screen's areas uninitialised
+    until the window refreshes; a region write from another timer in that
+    window crashed Blender in ED_area_init (smoke runs 2026-10-27)."""
+    return bool(_pending_blobs) or time.monotonic() - _last_boot_applied < _BOOT_SETTLE_S
+
+
 def _release(items: list) -> None:
     """Parked fast messages whose blob has now applied."""
     for header, payload in items:
         _dispatch(header, payload, header.get("seq"))
     stats["parked"] = _merger.parked
+
+
+def _service_vis(transport, now: float) -> None:
+    """Per-viewport visibility from the host (keyed hot "vis"): applied on
+    change and re-asserted every second, compare-before-write."""
+    global _last_vis_raw, _last_vis_applied
+    if not hasattr(transport, "poll_hot_keyed") or _pending_blobs:
+        return
+    raw = transport.poll_hot_keyed().get(visview.KEY)
+    if raw is None or (raw == _last_vis_raw and now - _last_vis_applied < _REASSERT_S):
+        return
+    want = visview.decode(raw)
+    area = _target_view()
+    if _DEBUG and raw != _last_vis_raw:
+        print(f"qcb vis recv: {want} area={area is not None}", flush=True)
+    if want is None or area is None:
+        return
+    try:
+        _apply_vis(want, area)
+    except Exception as exc:
+        stats["apply_errors"] += 1
+        stats["last_error"] = f"vis: {exc!r}"
+    _last_vis_raw = raw
+    _last_vis_applied = now
+
+
+def _lc_flat_index(target) -> int | None:
+    """The index bpy.ops.object.hide_collection takes: depth-first over the
+    view layer's tree, the master collection being 0."""
+    i = 0
+    target_ptr = target.as_pointer()
+
+    def walk(lc):
+        nonlocal i
+        if lc.as_pointer() == target_ptr:
+            return i
+        for child in lc.children:
+            i += 1
+            found = walk(child)
+            if found is not None:
+                return found
+        return None
+
+    return walk(bpy.context.view_layer.layer_collection)
+
+
+def _apply_vis(want: visview.VisSig, area) -> None:
+    global _last_hot
+    space = area.spaces.active
+    region = next((r for r in area.regions if r.type == "WINDOW"), None)
+    # RNA wrappers are re-created per access: compare the C pointer, not `is`.
+    area_ptr = area.as_pointer()
+    window = next((w for w in bpy.context.window_manager.windows
+                   if any(a.as_pointer() == area_ptr for a in w.screen.areas)), None)
+    if region is None or window is None:
+        return
+    view_layer = window.view_layer
+    have_local: list[str] = []
+    in_local = space.local_view is not None
+    if in_local:
+        for uuid, db in list(_uuid_map.items()):
+            try:
+                if isinstance(db, bpy.types.Object) and db.local_view_get(space):
+                    have_local.append(uuid)
+            except (RuntimeError, ReferenceError):
+                pass
+    local_colls = bool(getattr(space, "use_local_collections", False))
+    have_hidden: list[str] = []
+    override = dict(window=window, area=area, region=region, space_data=space,
+                    scene=bpy.context.scene, view_layer=view_layer)
+    if local_colls:
+        with bpy.context.temp_override(**override):
+            for uuid, db in list(_uuid_map.items()):
+                if isinstance(db, bpy.types.Collection):
+                    lc = _layer_collection_for(db)
+                    if lc is not None and not lc.exclude and not lc.hide_viewport and not lc.visible_get():
+                        have_hidden.append(uuid)
+    have = visview.VisSig.make(have_local, local_colls, have_hidden)
+    p = visview.plan(have, want)
+    if p.empty:
+        return
+    if _DEBUG:
+        print(f"qcb vis apply: {p}", flush=True)
+    with bpy.context.temp_override(**override):
+        if p.exit and in_local:
+            bpy.ops.view3d.localview(frame_selected=False)
+            _last_hot = None  # the view moved: re-apply the host's
+        if p.enter_with:
+            wanted = {u for u in p.enter_with}
+            for o in view_layer.objects:
+                try:
+                    o.select_set(o.get(UUID_PROP) in wanted)
+                except RuntimeError:
+                    pass
+            bpy.ops.view3d.localview(frame_selected=False)
+            _last_hot = None
+        for uuid in p.add:
+            db = _resolve(uuid)
+            if isinstance(db, bpy.types.Object):
+                db.local_view_set(space, True)
+        for uuid in p.remove:
+            db = _resolve(uuid)
+            if isinstance(db, bpy.types.Object):
+                db.local_view_set(space, False)
+        if p.set_local_colls is not None:
+            space.use_local_collections = p.set_local_colls
+        for uuid, hide in [(u, True) for u in p.lc_hide] + [(u, False) for u in p.lc_show]:
+            db = _resolve(uuid)
+            lc = _layer_collection_for(db) if isinstance(db, bpy.types.Collection) else None
+            if lc is None:
+                continue
+            if (not lc.visible_get()) == hide:
+                continue  # already as wanted
+            idx = _lc_flat_index(lc)
+            if idx is None:
+                continue
+            bpy.ops.object.hide_collection(collection_index=idx, toggle=True)
+    area.tag_redraw()
 
 
 def _target_view():
@@ -669,6 +1057,7 @@ def _apply_hot(packed: bytes, reassert: bool = False) -> None:
             state.frame != scene.frame_current
             and now - _last_frame_apply >= _FRAME_MIN_INTERVAL
         ):
+            _quiet(_FRAME_GRACE, "frame")
             scene.frame_set(state.frame)
             _last_frame_apply = now
         return
@@ -746,6 +1135,7 @@ def _apply_hot(packed: bytes, reassert: bool = False) -> None:
         state.frame != scene.frame_current
         and now - _last_frame_apply >= _FRAME_MIN_INTERVAL
     ):
+        _quiet(_FRAME_GRACE, "frame")
         scene.frame_set(state.frame)
         _last_frame_apply = now
         changed = True
@@ -781,6 +1171,7 @@ def _handle_new_session() -> None:
     _merger.cold.last_seen = _new_session_seqs[0]
     _merger.fast.last_seen = _new_session_seqs[1]
     _merger.cold_applied = _new_session_seqs[0]
+    _merger.fast_applied = _new_session_seqs[1]
     _reassembler = protocol.Reassembler()
     _blob_by_uuid.clear()
     _at_state.clear()
@@ -789,6 +1180,9 @@ def _handle_new_session() -> None:
     stats["parked"] = 0
     stats["gaps"] = 0
     stats["want_resync"] = False
+    global _unknown_gap
+    _unknown_gap = False
+    _refresh_gap_stats()
 
 
 def _handle_goodbye() -> None:
@@ -798,6 +1192,7 @@ def _handle_goodbye() -> None:
     back to work, no hands on this machine."""
     global _host_goodbye, _last_hot
     _host_goodbye = False
+    engine_qcb.idle()
     _last_hot = None  # stop the periodic re-assert: no session to follow
     import os, time
     if os.environ.get("QCB_DEBUG"):
@@ -833,6 +1228,9 @@ def _tick_inner(transport):
         _handle_goodbye()
     if _new_session:
         _handle_new_session()
+    if _manifests and (_boot_gen is not None or not _pending_blobs):
+        _merge_manifests()
+        _refresh_held_stats()
     start = time.monotonic()
     packed = transport.poll_hot()
     if packed is not None:
@@ -840,7 +1238,7 @@ def _tick_inner(transport):
         if stamped is not None and stamped.t_host:
             # Parity probe: the strip must show the newest stamp even on a
             # static view, so it redraws on every stamped packet.
-            overlay.set_probe(stamped.t_host, stamped.probe_seq)
+            engine_qcb.set_probe(stamped.t_host, stamped.probe_seq)
             probe_area = _target_view()
             if probe_area is not None:
                 probe_area.tag_redraw()
@@ -859,8 +1257,10 @@ def _tick_inner(transport):
         # untouched and a disturbed one converges within a second.
         _apply_hot(_last_hot, reassert=True)
         _last_hot_applied = start
-    if _pending_t2 is not None:
-        _apply_pending_t2()  # indivisible, labeled — may blow the budget
+    _service_vis(transport, start)
+    hold = max(_TEST_HOLD_COLD_S, _BURST_WAIT_S if _pending_more else 0.0)
+    if _pending_blobs and (start - _pending_last_at >= hold or len(_pending_blobs) >= _BATCH_MAX):
+        _apply_pending_batch()  # indivisible, labeled — may blow the budget
     _process_cold(start + _BUDGET_S)
     area = _target_view()
     if area is not None and (_shot["on"] or _shot["restore"]):
@@ -883,8 +1283,13 @@ def _on_depsgraph_replica(scene, depsgraph) -> None:
     the 3 s after a blob/bootstrap and the 0.5 s after a frame change."""
     if _transport is None:
         return
+    stats["evaluations"] += 1
     now = time.monotonic()
     if now < _quiet_until:
+        if _DEBUG:
+            names = [getattr(u.id, "name", "?") for u in depsgraph.updates][:6]
+            print(f"qcb local-edit skip t={now:.2f}: quiet for {_quiet_until - now:.2f}s ({_quiet_why}) "
+                  f"({len(depsgraph.updates)} updates: {names})", flush=True)
         return
     for update in depsgraph.updates:
         db = update.id.original
@@ -894,6 +1299,8 @@ def _on_depsgraph_replica(scene, depsgraph) -> None:
         if not uuid:
             continue
         if now - _touched.get(uuid, float("-inf")) < _TOUCH_GRACE:
+            if _DEBUG:
+                print(f"qcb local-edit skip t={now:.2f}: {db.name} touched {now - _touched[uuid]:.2f}s ago", flush=True)
             continue
         if (
             update.is_updated_shading
@@ -916,7 +1323,7 @@ def _on_depsgraph_replica(scene, depsgraph) -> None:
 
 def start(transport, mappings=()) -> None:
     global _transport, _last_hot, _last_hot_applied, \
-        _reassembler, _mappings, _pending_t2
+        _reassembler, _mappings
     _transport = transport
     _last_hot = None
     _last_hot_applied = 0.0
@@ -926,12 +1333,13 @@ def start(transport, mappings=()) -> None:
     _inbox_fast.clear()
     _blob_by_uuid.clear()
     _at_state.clear()
-    _pending_t2 = None
+    _pending_blobs.clear()
     _mappings = list(mappings)
     stats.update(
         seq=0, gaps=0, applied_t1=0, applied_t2=0, apply_errors=0,
         unknown_uuid=0, bootstraps=0, unmapped_paths=0, applying="", last_error="",
         want_resync=False, frozen_caches=0, seq_fast=0, parked=0,
+        batches=0, evaluations=0,
     )
     _rebuild_uuid_map()
     _touched.clear()

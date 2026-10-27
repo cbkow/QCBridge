@@ -1,5 +1,5 @@
 #!/bin/zsh
-# build-app.sh — build the agent and the capture helper and wrap them as
+# build-app.sh — build the agent and the encode helper and wrap them as
 # dist/QCBridge Agent.app, Developer-ID signed with the hardened runtime
 # and a secure timestamp (what notarization requires). The PKG script
 # takes this bundle as its input.
@@ -12,13 +12,13 @@ cd "$AGENT"
 VERSION="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
 if [ -z "${QCB_SKIP_BUILD:-}" ]; then
   cargo build --release
-  swiftc -O capture-mac/qcb-capture-mac.swift -o target/release/qcb-capture-mac
+  swiftc -O encode-mac/qcb-encode-mac.swift -o target/release/qcb-encode-mac
 fi
 APP="$AGENT/dist/QCBridge Agent.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/qcbridge-agent "$APP/Contents/MacOS/qcbridge-agent"
-cp target/release/qcb-capture-mac "$APP/Contents/MacOS/qcb-capture-mac"
+cp target/release/qcb-encode-mac "$APP/Contents/MacOS/qcb-encode-mac"
 cp assets/icons/qcbridge.icns "$APP/Contents/Resources/qcbridge.icns"
 sed "s/@VERSION@/$VERSION/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
@@ -30,7 +30,7 @@ if [ -z "$identity" ]; then
 fi
 # Inside-out: the helper, then the agent, then the bundle. Hardened
 # runtime + timestamp are what notarytool checks.
-for bin in "$APP/Contents/MacOS/qcb-capture-mac" "$APP/Contents/MacOS/qcbridge-agent"; do
+for bin in "$APP/Contents/MacOS/qcb-encode-mac" "$APP/Contents/MacOS/qcbridge-agent"; do
   codesign --force --sign "$identity" --options runtime --timestamp "$bin"
 done
 codesign --force --sign "$identity" --options runtime --timestamp "$APP"

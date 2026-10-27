@@ -66,3 +66,56 @@ def test_reset_drops_parked_and_trackers():
     m.reset()
     assert m.parked == 0 and m.cold_applied == 0 and m.gaps == 0
     assert m.observe(cold(1)[0])
+
+
+def test_first_missing_marks_the_hole_and_gap_lane_names_the_lane():
+    m = LaneMerger()
+    assert m.observe(fast(1, 0)[0])
+    assert not m.observe(fast(4, 0)[0])
+    assert m.fast.first_missing == 2
+    assert m.gap_lane == "fast"
+    assert m.observe(cold(1)[0])
+    assert not m.observe(cold(3)[0])
+    assert m.cold.first_missing == 2 and m.gap_lane == "both"
+    m.clear_cold_gap()
+    assert m.gap_lane == "fast"
+
+
+def test_fast_applied_advances_only_while_contiguous():
+    m = LaneMerger()
+    m.fast_done(1)
+    m.fast_done(2)
+    assert m.fast_applied == 2
+    m.fast_done(4)                      # 3 never applied: hold
+    assert m.fast_applied == 2
+    m.fast_done(3)
+    assert m.fast_applied == 4
+    m.fast_done(2)                      # a replay below the mark is a no-op
+    assert m.fast_applied == 4
+
+
+def test_clear_fast_gap_catches_applied_up_with_seen():
+    m = LaneMerger()
+    m.observe(fast(1, 0)[0]); m.fast_done(1)
+    m.observe(fast(3, 0)[0]); m.fast_done(3)
+    assert m.fast_applied == 1 and m.gap_lane == "fast"
+    m.clear_fast_gap()                  # the host re-asserted from seq 2 on
+    assert m.fast_applied == 3 and m.gap_lane == "" and m.fast.first_missing is None
+
+
+def test_parked_release_feeds_fast_done_in_order():
+    m = LaneMerger()
+    a = fast(1, after=2, uuid="a")
+    assert not m.admit(*a)
+    m.observe(a[0])
+    for h, _p in m.cold_done(2):
+        m.fast_done(h["seq"])
+    assert m.fast_applied == 1
+
+
+def test_reset_clears_applied_marks():
+    m = LaneMerger()
+    m.fast_done(5)
+    m.observe(fast(7, 0)[0])
+    m.reset()
+    assert m.fast_applied == 0 and m.gap_lane == ""

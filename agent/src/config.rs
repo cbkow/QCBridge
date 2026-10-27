@@ -38,16 +38,9 @@ pub struct Config {
     pub peer: String,
     /// Host: pinned replica certificate SHA-256 (hex). Empty = learn on first use.
     pub fingerprint: String,
-    /// Wire-rate cap for the video lane (replica), Mbps.
+    /// Wire-rate cap for the video lane (replica), Mbps. Unused since the
+    /// quinn port (video rides SRT from the replica); kept for existing TOMLs.
     pub cap_mbps: f64,
-    /// Replica, native capture: stream resolution as a fraction of the
-    /// captured pixels (1.0 = native; 0.5 halves each dimension).
-    pub capture_scale: f64,
-    /// Host: local TCP port re-serving the stream to the viewer (0 = off).
-    /// Off by default since the quinn port: video no longer rides the
-    /// connection, QCView opens the replica's srt:// directly, and nothing
-    /// feeds this listener. Kept for compatibility with existing TOMLs.
-    pub video_port: u16,
     /// Local socket for the addon (0 = pick a free port).
     pub local_port: u16,
     /// Replica: Blender binary and extra args; launched when the host's
@@ -91,8 +84,6 @@ impl Default for Config {
             peer: "127.0.0.1:19990".into(),
             fingerprint: String::new(),
             cap_mbps: 400.0,
-            capture_scale: 1.0,
-            video_port: 0,
             local_port: 0,
             blender_path: default_blender_path(),
             blender_args: Vec::new(),
@@ -162,7 +153,7 @@ impl Config {
 /// here: the command says "needs_restart" rather than pretending.
 pub const LIVE_FIELDS: &[&str] = &[
     "peer", "token", "fingerprint", "name", "discovery", "phonebook",
-    "blender_path", "blender_args", "kiosk", "idle_secs", "cap_mbps", "capture_scale",
+    "blender_path", "blender_args", "kiosk", "idle_secs", "cap_mbps",
     "path_mappings", "cache_root", "shared_root",
     // Live since 2026-09-24: a change rebuilds the role runtime in place
     // (the Send/Receive switch; a replica re-listening on a new address).
@@ -216,7 +207,6 @@ pub fn apply_live(cfg: &mut Config, patch: &serde_json::Value) -> Applied {
             "kiosk" => match val.as_bool() { Some(b) => { cfg.kiosk = b; true } None => false },
             "idle_secs" => match val.as_u64() { Some(n) => { cfg.idle_secs = n; true } None => false },
             "cap_mbps" => match val.as_f64() { Some(f) if f > 0.0 => { cfg.cap_mbps = f; true } _ => false },
-            "capture_scale" => match val.as_f64() { Some(f) if f > 0.0 && f <= 1.0 => { cfg.capture_scale = f; true } _ => false },
             "cache_root" => set_str(&mut cfg.cache_root, val),
             "shared_root" => set_str(&mut cfg.shared_root, val),
             "role" => match val.as_str() {
@@ -284,7 +274,6 @@ pub fn live_view(cfg: &Config) -> serde_json::Value {
         "kiosk": cfg.kiosk,
         "idle_secs": cfg.idle_secs,
         "cap_mbps": cfg.cap_mbps,
-        "capture_scale": cfg.capture_scale,
         "path_mappings": cfg.path_mappings,
         "cache_root": cfg.cache_root,
         "shared_root": cfg.shared_root,
@@ -703,7 +692,7 @@ mod tests {
     fn apply_live_rejects_bad_values_instead_of_coercing() {
         let mut cfg = Config::default();
         let a = apply_live(&mut cfg, &serde_json::json!({
-            "discovery": "loud", "idle_secs": "sixty", "capture_scale": 2.0, "kiosk": 1,
+            "discovery": "loud", "idle_secs": "sixty", "cap_mbps": -1.0, "kiosk": 1,
         }));
         assert!(a.changed.is_empty());
         assert_eq!(a.rejected.len(), 4);

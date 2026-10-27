@@ -506,7 +506,6 @@ def spawn_agent(cfg: TransportConfig, role: str) -> tuple[tuple[str, int, str], 
         f'listen = "{peer}"' if role == "replica" else f'peer = "{peer}"',
         'blender_path = ""',   # whoever spawned us already has Blender
         "tray = false",
-        "video_port = 0",      # video goes over SRT, not through the agent
     ]
     if getattr(cfg, "fingerprint", ""):
         lines.append(f'fingerprint = "{cfg.fingerprint}"')
@@ -591,7 +590,6 @@ class HostTransportAgent:
         # write partials uncompressed and the replica loads them 20× faster.
         self.wire_compresses = False
         self._fast_outstanding = 0
-        self.video_port = 0          # localhost TCP port serving Annex-B HEVC
         self.stats: dict = {}
         self.agent_version = ""      # set in agent mode
         self.agent_exe = ""
@@ -743,7 +741,6 @@ class HostTransportAgent:
         if name == "attached":  # agent mode: current state at attach time
             self.agent_version = event.get("version", "")
             self.agent_exe = event.get("exe", "")  # the settings window is this binary with --settings
-            self.video_port = int(event.get("video_port") or 0)
             self._link_up = bool(event.get("peer_up"))
             self.peer_fingerprint = event.get("peer_fingerprint") or ""
             self.peer_pinned = True
@@ -770,8 +767,6 @@ class HostTransportAgent:
             else:
                 self.link_note = event.get("reason") or ""
                 self._last_pong = 0.0
-        elif name == "video_listen":
-            self.video_port = int(event.get("port") or 0)
         elif name == "stats":
             self.stats = event
         elif name == "cold_dropped":
@@ -858,7 +853,6 @@ class ReplicaTransportAgent:
         self._port = 0
         self.fingerprint = ""        # our certificate SHA-256 — show it for pairing
         self.link_note = ""
-        self.video_state = "off"
         # The host is in a session, as the agent reports it (2026-09-25): the
         # replica's kiosk follows this, and so does the agent's Blender.
         self.session_on = True
@@ -926,16 +920,6 @@ class ReplicaTransportAgent:
         """One UDP port carries every lane; repeated for interface parity."""
         return (self._port, self._port, self._port)
 
-    # ── video child, owned by the helper (S6/S7 make it native) ──────────────
-
-    def start_video(self, argv: list[str], **params) -> None:
-        """argv = the ffmpeg fallback; params (fps, bitrate_mbps, region,
-        ten_bit) let the agent build its native capture command instead."""
-        self._link.cmd(cmd="video_start", argv=argv, **params)
-
-    def stop_video(self) -> None:
-        self._link.cmd(cmd="video_stop")
-
     # ── helper frames (reader thread = this transport's IO thread) ───────────
 
     def _on_frame(self, kind: int, body: bytes) -> None:
@@ -963,7 +947,6 @@ class ReplicaTransportAgent:
                 self.fingerprint = event.get("fingerprint") or ""
                 self.agent_version = event.get("version", "")
                 self.agent_exe = event.get("exe", "")
-                self.video_state = event.get("video_state") or self.video_state
                 self.agent_config = dict(event.get("config") or {})
                 self._ready.set()
             elif name == "config":
@@ -985,8 +968,6 @@ class ReplicaTransportAgent:
                 self.link_note = "" if event.get("up") else (event.get("reason") or "")
                 if not event.get("up"):
                     self._last_ping = 0.0
-            elif name == "video":
-                self.video_state = event.get("state") or ""
             elif name == "stats":
                 self.stats = event
             elif name == "error":

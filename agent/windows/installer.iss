@@ -6,7 +6,7 @@
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" agent\windows\installer.iss
 ; → agent\dist\QCBridge-Agent-<version>-Setup-x64.exe
 #define MyAppName "QCBridge Agent"
-#define MyAppVersion "0.2.1"
+#define MyAppVersion "0.3.0"
 #define MyAppPublisher "cbkow"
 #define MyAppURL "https://github.com/cbkow/QCBridge"
 #define MyAppExeName "qcbridge-agent.exe"
@@ -43,7 +43,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 Source: "..\target\release\qcbridge-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\qcb-capture-win.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\qcb-encode-win.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -57,7 +57,7 @@ Filename: "{app}\{#MyAppExeName}"; Description: "Start {#MyAppName} now"; Flags:
 
 [UninstallRun]
 ; A running agent holds its exe; stop it before the files go. Its job
-; object takes Blender, the capture helper and ffmpeg with it.
+; object takes Blender, the encode helper and ffmpeg with it.
 Filename: "{cmd}"; Parameters: "/C taskkill /F /IM qcbridge-agent.exe"; Flags: runhidden; RunOnceId: "StopAgent"
 
 [Code]

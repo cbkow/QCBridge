@@ -1,13 +1,16 @@
-"""Replica pixel path: spawn/supervise the capture-encode ffmpeg (decision #13).
+"""Replica pixel path: spawn and supervise the encoder (DESIGN-NOTES pixels).
 
-Windows production path: ddagrab (Desktop Duplication) → NVENC, fully
-GPU-resident (~15% of one core at 1440p30) — with kiosk mode the display IS
-the viewport, no crop. macOS: avfoundation screen capture → VideoToolbox as
-the dev fallback (the proper SCK helper is a parallel track).
+0.3: no screen capture. Blender's addon reads its own viewport pixels
+(ring0/engine_qcb) into a shared-memory ring; the encode helper
+(agent/encode-mac, agent/encode-win) converts them to PQ/BT.2020 10-bit
+and encodes HEVC Main10 on the GPU, Annex-B on its stdout; ffmpeg wraps
+that into MPEG-TS over SRT with `-c copy`. The addon configures, spawns and
+supervises; it never touches a pixel.
 
-The addon configures, spawns, and supervises; ffmpeg owns pixels→encode→SRT.
-All endpoints come from preferences — nothing is hardcoded (the 127.0.0.1
-lesson, results/vpn-stream-notes.md).
+`pixel_source="screen"` keeps the pre-0.3 path (ddagrab/avfoundation →
+hardware HEVC in ffmpeg) as the escape hatch for a Blender release that
+breaks the engine subclass. All endpoints come from preferences — nothing
+is hardcoded (the 127.0.0.1 lesson).
 """
 
 from __future__ import annotations
@@ -21,86 +24,70 @@ import time
 from pathlib import Path
 
 try:
-    from ..ring1 import probe
+    from ..ring1.stream_params import StreamParams
 except ImportError:  # file-imported by tests with qcbridge/ on sys.path
-    from ring1 import probe
+    from ring1.stream_params import StreamParams
 
 _RESTART_BACKOFF = 2.0
 
-# The native capture helper (S6 on macOS, S7 on Windows): screen -> hardware
-# HEVC on the GPU, Annex-B with AUDs on stdout. When one is present the
-# pixel path runs it and keeps ffmpeg only as the mux to SRT; when it is not,
-# ffmpeg captures and encodes as before. Same lookup as the agent binary:
-# explicit env, then the extension's bin/, then the cargo outputs.
-_NATIVE_EXE = "qcb-capture-win.exe" if sys.platform == "win32" else "qcb-capture-mac"
-# Rungs the helper can produce. 4:4:4 stays with ffmpeg (a CPU path there too).
-_NATIVE_RUNGS = {"hevc_10_420_100": True, "hevc_10_420_50": True}
+# The encode helper: shared-memory ring -> PQ/BT.2020 P010/x420 on the GPU
+# -> hardware HEVC Main10, Annex-B with AUDs on stdout. Same lookup as the
+# agent binary: explicit env, then the extension's bin/, then the cargo and
+# swiftc outputs. The 0.2 capture helpers have different names on purpose:
+# a stale one is never picked up.
+_HELPER_EXE = "qcb-encode-win.exe" if sys.platform == "win32" else "qcb-encode-mac"
+
+# VUI tags pinned in the mux, whatever the vendor encoder wrote: BT.2020
+# primaries (9), SMPTE ST 2084 (16), BT.2020 non-constant luminance (9),
+# limited range. Copy-safe: hevc_metadata rewrites parameter sets only.
+_WIRE_BSF = ("hevc_metadata=colour_primaries=9:transfer_characteristics=16"
+             ":matrix_coefficients=9:video_full_range_flag=0")
 
 
-def find_native_capture() -> str | None:
-    if os.environ.get("QCB_CAPTURE_NATIVE", "") == "0":
-        return None
+def find_encode_helper() -> str | None:
     here = Path(__file__).resolve()
     addon = here.parents[1]          # qcbridge/
     repo = here.parents[2]
-    explicit = os.environ.get("QCB_CAPTURE_BIN", "")
-    for cand in (explicit, str(addon / "bin" / _NATIVE_EXE)):
+    explicit = os.environ.get("QCB_PIXEL_HELPER", "")
+    for cand in (explicit, str(addon / "bin" / _HELPER_EXE)):
         if cand and os.path.isfile(cand):
             return cand
     builds = [
-        str(repo / "agent" / "target" / prof / _NATIVE_EXE) for prof in ("release", "debug")
+        str(repo / "agent" / "target" / prof / _HELPER_EXE) for prof in ("release", "debug")
     ] + [
-        str(repo / "agent" / "capture-win" / "target" / prof / _NATIVE_EXE) for prof in ("release", "debug")
+        str(repo / "agent" / "encode-win" / "target" / prof / _HELPER_EXE) for prof in ("release", "debug")
     ]
     builds = [b for b in builds if os.path.isfile(b)]
     return max(builds, key=os.path.getmtime) if builds else None
 
 
-def build_native_pipeline(
-    capture: str, ffmpeg: str, rung: str, srt_url: str, passphrase: str
-) -> tuple[list[str], list[str]]:
-    """(capture argv, mux argv): the helper encodes, ffmpeg only wraps the
-    Annex-B into MPEG-TS over SRT. GOP = one second, as the ffmpeg path's
-    -g, so a viewer joining the listener waits at most that for a key."""
-    url = srt_url
+def _with_passphrase(url: str, passphrase: str) -> str:
     if passphrase and "passphrase=" not in url:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}passphrase={passphrase}&pbkeylen=16"
-    fps = probe.capture_fps()
-    cap = [capture, "--fps", str(fps), "--bitrate", str(rung_mbps(rung)), "--gop", str(fps)]
-    if _NATIVE_RUNGS.get(rung):
-        cap.append("--10bit")
-    # The mux gets a keyframe request on spawn (below), so VPS/SPS/PPS lead
-    # its input and a tiny probe is enough; without that, ffmpeg's default
-    # 5 MB probe on a raw HEVC pipe kept a joining viewer waiting long
-    # enough to give up, the mux then died on the vanished socket, and the
-    # pair restarted into the same wait (found 2026-09-23 on Windows).
-    mux = [
+    return url
+
+
+def build_mux(ffmpeg: str, fps: int, srt_url: str, passphrase: str) -> list[str]:
+    """ffmpeg as the mux only: Annex-B HEVC on stdin -> MPEG-TS over SRT.
+    The helper gets a keyframe request on spawn, so VPS/SPS/PPS lead its
+    input and a tiny probe is enough; without that, ffmpeg's default 5 MB
+    probe on a raw HEVC pipe kept a joining viewer waiting long enough to
+    give up (found 2026-09-23 on Windows)."""
+    return [
         ffmpeg, "-hide_banner", "-loglevel", "warning",
         "-fflags", "nobuffer", "-probesize", "65536", "-analyzeduration", "0",
         "-f", "hevc", "-framerate", str(fps), "-i", "pipe:0",
-        "-c", "copy", "-fps_mode", "passthrough", "-flush_packets", "1",
-        "-f", "mpegts", url,
+        "-c", "copy", "-bsf:v", _WIRE_BSF, "-fps_mode", "passthrough", "-flush_packets", "1",
+        "-f", "mpegts", _with_passphrase(srt_url, passphrase),
     ]
-    return cap, mux
-
-# build_command(srt_url=PIPE_OUTPUT): Annex-B HEVC with AUDs on stdout, for
-# an external owner of the capture child, when there is one.
-PIPE_OUTPUT = "pipe:"
-
-# Encoder rungs judged on a production scene (windows-v0-matrix/notes.md).
-_RUNG_BITRATE = {
-    "hevc_10_420_100": "100M",
-    "hevc_10_420_50": "50M",
-    "hevc_10_444_50": "50M",
-}
-
-def capture_fps() -> int:
-    return probe.capture_fps()
 
 
-def rung_mbps(rung: str) -> int:
-    return int(_RUNG_BITRATE.get(rung, "100M").rstrip("M"))
+def build_encode_pipeline(
+    helper: str, ffmpeg: str, params: StreamParams, ring_name: str, srt_url: str, passphrase: str
+) -> tuple[list[str], list[str]]:
+    """(helper argv, mux argv) for the readback path."""
+    return params.helper_argv(helper, ring_name), build_mux(ffmpeg, params.fps, srt_url, passphrase)
 
 
 _proc: subprocess.Popen | None = None       # ffmpeg (capture+encode, or the mux)
@@ -110,14 +97,13 @@ _stop = threading.Event()
 _status = "off"
 
 
-def build_command(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> list[str]:
-    bitrate = _RUNG_BITRATE.get(rung, "100M")
-    url = srt_url
-    if passphrase and "passphrase=" not in url:
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}passphrase={passphrase}&pbkeylen=16"
-
-    fps = probe.capture_fps()  # 30 unless the parity spike overrides it
+def build_command(ffmpeg: str, params: StreamParams, srt_url: str, passphrase: str) -> list[str]:
+    """The screen-capture fallback (`pixel_source="screen"`): ffmpeg captures
+    the display and encodes 10-bit 4:2:0 HEVC in hardware. Display-referred
+    BT.709, what the 0.2 line streamed."""
+    bitrate = f"{params.bitrate_mbps}M"
+    url = _with_passphrase(srt_url, passphrase)
+    fps = params.fps
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "warning"]
     if sys.platform == "win32":
         # ddagrab hands NVENC 8-bit BGRA frames on the GPU. Any pixel-format
@@ -128,14 +114,8 @@ def build_command(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> list
         # (QCView's D3D11VA, found 2026-09-23) refuses the surface format
         # and falls to software; the macOS branch pins p010le, so does this.
         graph = f"ddagrab=output_idx=0:framerate={fps}:draw_mouse=0"
-        if rung == "hevc_10_444_50":
-            # True 4:4:4 needs the CPU path — NVENC silently downgrades 4:4:4
-            # requests on GPU frames (verify receiver-side, always).
-            graph += ",hwdownload,format=bgra,format=yuv444p10le"
-            codec = ["-c:v", "hevc_nvenc", "-profile:v", "rext"]
-        else:
-            graph += ",hwdownload,format=bgra,format=p010le"
-            codec = ["-c:v", "hevc_nvenc", "-profile:v", "main10"]
+        graph += ",hwdownload,format=bgra,format=p010le"
+        codec = ["-c:v", "hevc_nvenc", "-profile:v", "main10"]
         cmd += ["-filter_complex", graph] + codec
         # -delay 0: NVENC's default output delay holds ~4 frames (~130 ms)
         # for nothing we need; ull + bf 0 keep the encoder frame-in/frame-out.
@@ -152,15 +132,7 @@ def build_command(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> list
         ]
     else:
         raise RuntimeError("no capture path for this platform")
-    if srt_url == PIPE_OUTPUT:
-        # Raw HEVC carries no timestamps, so ffmpeg defaults to constant-rate
-        # output and pads with duplicate frames; at a 120 Hz capture the
-        # encoder then falls behind and latency grows without bound (seen
-        # live: 90 s behind after 90 s). Pass frames through as captured.
-        cmd += ["-fps_mode", "passthrough",
-                "-bsf:v", "hevc_metadata=aud=insert", "-f", "hevc", "-"]
-    else:
-        cmd += ["-f", "mpegts", url]
+    cmd += ["-f", "mpegts", url]
     return cmd
 
 
@@ -230,15 +202,21 @@ def _pump_prefixed(proc: subprocess.Popen, log, prefix: bytes) -> None:
         log.flush()
 
 
-def _supervise_native(cap_cmd: list[str], mux_cmd: list[str], log_path: Path) -> None:
+def _supervise_native(cap_cmd_fn, mux_cmd: list[str], log_path: Path) -> None:
     """Two children, one pipe: the helper's stdout is the mux's stdin. Either
     one leaving takes the other down and both come back after the backoff —
     the mux exits when the SRT viewer leaves (one viewer per listener), the
-    helper when the display changes or the desktop locks."""
+    helper when the ring is retired (exit 7: a bigger ring under a new
+    name, which `cap_cmd_fn()` returns on the respawn) or Blender is gone."""
     global _proc, _cap_proc, _status
     while not _stop.is_set():
+        cap_cmd = cap_cmd_fn()
+        if not cap_cmd:
+            _status = "waiting for the frame ring"
+            _stop.wait(_RESTART_BACKOFF / 4)
+            continue
         with open(log_path, "ab") as log:
-            log.write(f"\n--- spawn (native) {time.ctime()} ---\n".encode())
+            log.write(f"\n--- spawn (readback) {time.ctime()} ---\n".encode())
             log.flush()
             try:
                 _cap_proc = subprocess.Popen(
@@ -248,7 +226,7 @@ def _supervise_native(cap_cmd: list[str], mux_cmd: list[str], log_path: Path) ->
                     mux_cmd, stdin=_cap_proc.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
                 )
             except OSError as exc:
-                _status = f"native capture spawn failed: {exc}"
+                _status = f"encoder spawn failed: {exc}"
                 if _cap_proc is not None and _cap_proc.poll() is None:
                     _cap_proc.kill()
                 return
@@ -258,7 +236,7 @@ def _supervise_native(cap_cmd: list[str], mux_cmd: list[str], log_path: Path) ->
                 _cap_proc.stdin.flush()
             except OSError:
                 pass
-            _status = "streaming (native)"
+            _status = "streaming (readback)"
             pumps = [
                 threading.Thread(target=_pump_log, args=(_proc, log), name="qcb-pixel-log", daemon=True),
                 threading.Thread(target=_pump_prefixed, args=(_cap_proc, log, b""), name="qcb-capture-log", daemon=True),
@@ -278,30 +256,66 @@ def _supervise_native(cap_cmd: list[str], mux_cmd: list[str], log_path: Path) ->
                 t.join(timeout=2.0)
         if _stop.is_set():
             break
-        _status = f"stream ended (mux {_proc.returncode}, capture {_cap_proc.returncode}) — restarting"
+        _status = f"stream ended (mux {_proc.returncode}, encoder {_cap_proc.returncode}) — restarting"
         _stop.wait(_RESTART_BACKOFF / 4)  # a viewer leaving is the normal case; be back before the next one
     _status = "off"
 
 
-def start(ffmpeg: str, rung: str, srt_url: str, passphrase: str) -> None:
-    global _thread, _status
+_ring_name: str | None = None   # the frame ring the helper reads; swapped on a regrow
+_source = "readback"
+
+
+def restart_ring(ring_name: str) -> None:
+    """The producer retired its ring and made a bigger one: the helper is
+    exiting (7); its respawn reads the new name."""
+    global _ring_name
+    _ring_name = ring_name
+    child = _cap_proc
+    if child is not None and child.poll() is None:
+        try:
+            child.stdin.write(b"quit\n")
+            child.stdin.flush()
+        except OSError:
+            pass
+
+
+def start(ffmpeg: str, srt_url: str, passphrase: str, params: StreamParams | None = None,
+          source: str = "readback", ring_name: str | None = None) -> None:
+    """`source` — "readback" (the helper reads Blender's frame ring named
+    `ring_name`) or "screen" (ffmpeg captures the display). Readback with
+    no helper installed falls back to screen and says so."""
+    global _thread, _status, _ring_name, _source
     if _thread is not None:
         return
+    params = params or StreamParams()
     log_path = Path(tempfile.gettempdir()) / "qcbridge-pixelpath.log"
     _stop.clear()
     _status = "starting"
-    native = find_native_capture() if rung in _NATIVE_RUNGS else None
-    if native:
-        cap_cmd, mux_cmd = build_native_pipeline(native, ffmpeg, rung, srt_url, passphrase)
+    _ring_name = ring_name
+    helper = find_encode_helper() if source == "readback" else None
+    if source == "readback" and helper is None:
+        _status = "encoder helper not found — screen capture fallback"
+        source = "screen"
+    _source = source
+    if source == "readback":
+        mux_cmd = build_mux(ffmpeg, params.fps, srt_url, passphrase)
+
+        def cap_cmd_fn():
+            return params.helper_argv(helper, _ring_name) if _ring_name else None
+
         _thread = threading.Thread(
-            target=_supervise_native, args=(cap_cmd, mux_cmd, log_path), name="qcb-pixel", daemon=True
+            target=_supervise_native, args=(cap_cmd_fn, mux_cmd, log_path), name="qcb-pixel", daemon=True
         )
     else:
-        cmd = build_command(ffmpeg, rung, srt_url, passphrase)
+        cmd = build_command(ffmpeg, params, srt_url, passphrase)
         _thread = threading.Thread(
             target=_supervise, args=(cmd, log_path), name="qcb-pixel", daemon=True
         )
     _thread.start()
+
+
+def source() -> str:
+    return _source
 
 
 _external = None  # (stop_fn, state_fn): something else owns the child

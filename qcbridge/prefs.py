@@ -17,24 +17,13 @@ from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
 
 from .ring0 import kiosk, session
 
-ENCODER_RUNGS = [
-    # (identifier, label, description) — judged on a production scene,
-    # (the stage-0 capture harness's Windows matrix, 2026-09)
-    (
-        "hevc_10_420_100",
-        "HEVC 10-bit 4:2:0 100M (default)",
-        "Fully GPU-resident capture+encode; headroom while Cycles saturates the machine",
-    ),
-    (
-        "hevc_10_420_50",
-        "HEVC 10-bit 4:2:0 50M",
-        "Step-down rung; same zero-copy path at half the bitrate",
-    ),
-    (
-        "hevc_10_444_50",
-        "HEVC 10-bit 4:4:4 50M (chroma QC)",
-        "True 4:4:4 requires the CPU conversion path; verify receiver-side pix_fmt",
-    ),
+PIXEL_SOURCES = [
+    ("readback", "Viewport readback (default)",
+     "Blender reads its own viewport pixels: scene-linear, PQ/BT.2020 10-bit on the wire, "
+     "the view transform happens in QCView (0.3). No screen capture"),
+    ("screen", "Screen capture (fallback)",
+     "The 0.2 path: ffmpeg captures the display and encodes display-referred 10-bit HEVC. "
+     "For a Blender release that breaks the readback"),
 ]
 
 
@@ -173,8 +162,8 @@ class QCB_OT_kiosk_toggle(Operator):
 _SETTINGS_FIELDS = (
     "role", "replica_address", "bind_address", "port_control", "port_hot",
     "port_cold", "token", "enable_stream", "srt_port", "srt_url",
-    "srt_latency_ms", "encoder_rung", "ffmpeg_path", "replica_kiosk",
-    "cache_root",
+    "srt_latency_ms", "pixel_source", "stream_bitrate_mbps", "stream_width",
+    "stream_fps", "ffmpeg_path", "replica_kiosk", "cache_root",
 )
 
 
@@ -469,8 +458,31 @@ class QCBridgePreferences(AddonPreferences):
     )
     # (SRT passphrase is derived from the session token on both ends —
     # deliberately not user-configurable; decision #16 amendment.)
-    encoder_rung: EnumProperty(
-        name="Encoder Rung", items=ENCODER_RUNGS, default="hevc_10_420_100"
+    pixel_source: EnumProperty(
+        name="Pixel Source", items=PIXEL_SOURCES, default="readback",
+    )
+    stream_bitrate_mbps: IntProperty(
+        name="Stream Bitrate (Mbps)",
+        description=(
+            "HEVC Main10 rate. 30 already matches the 0.2 line's 100 Mbps "
+            "8-bit stream on a clean scene (2026-10-27 spike); noisy "
+            "viewports flatten every rate alike"
+        ),
+        default=50, min=5, max=400,
+    )
+    stream_width: IntProperty(
+        name="Stream Width (px)",
+        description=(
+            "The camera frame is fitted to at most this many pixels wide in "
+            "Shot Mode (the replica's window permitting); the stream's "
+            "resolution, independent of the replica's screen"
+        ),
+        default=2560, min=640, max=7680, step=2,
+    )
+    stream_fps: IntProperty(
+        name="Stream Rate (fps)",
+        description="Frames per second the encoder is paced to; the GOP is one second",
+        default=30, min=5, max=120,
     )
     ffmpeg_path: StringProperty(
         name="FFmpeg Path",
@@ -563,7 +575,10 @@ class QCBridgePreferences(AddonPreferences):
             sub.prop(self, "srt_port")
             sub.prop(self, "srt_latency_ms")
             sub.prop(self, "srt_url")
-            sub.prop(self, "encoder_rung")
+            sub.prop(self, "pixel_source")
+            sub.prop(self, "stream_bitrate_mbps")
+            sub.prop(self, "stream_width")
+            sub.prop(self, "stream_fps")
             sub.prop(self, "ffmpeg_path")
             if not agent_mode:
                 box.prop(self, "replica_kiosk")

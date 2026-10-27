@@ -21,7 +21,7 @@ prefs = SimpleNamespace(
     role="HOST", replica_address="127.0.0.1", bind_address="0.0.0.0",
     port_control=19990, port_hot=19991, port_cold=19992, token="smoketok",
     enable_stream=False, srt_port=19998, srt_url="", srt_latency_ms=300,
-    encoder_rung="hevc_10_420_100", ffmpeg_path="", replica_kiosk=False,
+    pixel_source="readback", stream_bitrate_mbps=50, stream_width=2560, stream_fps=30, ffmpeg_path="", replica_kiosk=False,
     path_mappings=[],
 )
 
@@ -54,6 +54,15 @@ cloth.point_cache.frame_start = 1
 cloth.point_cache.frame_end = 24
 
 cam = bpy.data.objects["Camera"]
+
+# Six meshes for the batch-apply check (step_batch6): in the scene before
+# the session starts so they ride the bootstrap, and the only thing that
+# changes later is their modifier stacks — six tier-2 blobs in one burst,
+# no Scene-structural change (which would cost an automatic bootstrap and
+# absorb the blobs).
+for i in range(6):
+    bpy.ops.mesh.primitive_cube_add(size=0.5, location=(6 + i, 0, 0))
+    bpy.context.active_object.name = f"Batch{i}"
 
 session.start(prefs)
 sync = session.state["sync"]
@@ -276,7 +285,22 @@ def step_armature():
     results["arm_matrix"] = [round(v, 6) for row in pb.matrix for v in row]
 
 
+def _peer_counts():
+    ps = getattr(session.state["transport"], "peer_status", {}) or {}
+    return {k: ps.get(k) for k in ("applied_t2", "batches", "evaluations")}
+
+
+def step_batch6():
+    # One tick, six structural edits → six tier-2 blobs in a burst. With
+    # QCB_TEST_HOLD_COLD_MS on the replica they complete before the first
+    # applies, so the pong must show ONE batch (DESIGN-NOTES sync batch-apply).
+    results["batch_before"] = _peer_counts()
+    for i in range(6):
+        bpy.data.objects[f"Batch{i}"].modifiers.new("Disp", "DISPLACE")
+
+
 def step_finalize():
+    results["batch_after"] = _peer_counts()
     results["bake_note_seen_again"] = bool(sync.bake_note)
     results["cam_matrix"] = mat(cam)
     results["box_matrix"] = mat(box)
@@ -290,7 +314,7 @@ STEPS = [
     step_bake, step_resync, step_influence, step_free_bake,
     step_gn_add, step_gn_tweak, step_rail_add, step_rail_retime,
     step_ctrl_props, step_ctrl_tweak, step_shapekeys, step_shapekeys2,
-    step_lattice, step_armature, step_finalize,
+    step_lattice, step_armature, step_batch6, step_finalize,
 ]
 SETTLE = 3.0  # sweep (0.5 s) + debounce + tier-2 flight, with margin
 

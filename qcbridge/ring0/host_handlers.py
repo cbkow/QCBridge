@@ -25,6 +25,9 @@ import mathutils
 from ..ring1 import protocol
 from ..ring1.classifier import DEBOUNCE_S, Debouncer, classify_update
 from ..ring1.dirtyset import DirtySet, Tier
+from ..ring1.fastlog import FastLog
+from ..ring1.resync import DeltaPlan, plan_delta
+from ..ring1 import visview
 from ..ring1.registry import IdentityRegistry
 from ..ring1.shadow import TRACKED, ShadowStore
 from . import bootstrap, identity, tier2_io
@@ -51,6 +54,19 @@ _TYPE_KEYS = {
 
 
 _lc_memo: tuple[float, dict] = (0.0, {})
+
+
+def _largest_view3d():
+    """The 3D view the artist works in (host_hot's pick)."""
+    best = None
+    best_size = -1
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "VIEW_3D":
+                size = area.width * area.height
+                if size > best_size:
+                    best, best_size = area, size
+    return best
 
 
 def _layer_collections():
@@ -118,6 +134,33 @@ class HostSync:
         # datablock, or the last bootstrap chunk, whichever is later.
         self._uuid_cold_seq: dict[str, int] = {}
         self._boot_last_seq = 0
+        # What left on the fast lane, by seq: when the replica's pong reports
+        # a hole there, the datablocks named from the hole on are re-asserted
+        # as full tier-1 snapshots instead of a whole-file bootstrap
+        # (DESIGN-NOTES sync fast-ack).
+        self.fastlog = FastLog()
+        self._fast_resend_queue: list[tuple[str, str]] = []  # (uuid, kind)
+        self._fast_resend_end = False  # a resync_end owes the replica
+        self.fast_resyncs = 0
+        # Delta resync (DESIGN-NOTES sync delta-resync): the replica keeps an
+        # inventory {uuid: digest}; every t2 carries its digest, and what
+        # _prime_hashes learns after a bootstrap goes over in `manifest`
+        # batches so the two inventories converge. A cold hole is then a
+        # set difference, not a file.
+        self._manifest_pending: dict[str, str] = {}
+        self._manifest_reqs: list[tuple[int, float]] = []
+        self._manifest: dict | None = None      # the replica's last answer
+        self._manifest_req: int | None = None   # outstanding manifest_req
+        self._manifest_req_at = 0.0
+        self._delta_queue: list[tuple[str, str | None]] = []  # (uuid, replica digest)
+        self._delta_tail: list[str] = []        # full t1 re-asserts after the blobs
+        self._delta_end_pending = False
+        self.delta_resyncs = 0
+        self.delta_t2 = 0
+        self.manifests_sent = 0
+        self._scene_digest = ""
+        self._boot_gen = -1
+        self._burst = False
         self.sent_t1 = 0
         self.sent_t2 = 0
         self.t2_unsupported = 0
@@ -164,6 +207,12 @@ class HostSync:
         self._suppress_marks = True
         self._uuid_to_db: dict[str, bpy.types.ID] = {}
         self._vis_state: dict[str, tuple] = {}  # uuid → visibility vector
+        # Per-viewport visibility (Local View, collection isolation) lives on
+        # the SpaceView3D, not on a datablock: sampled on the sweep, sent as
+        # a keyed hot value, re-asserted every second (DESIGN-NOTES sync
+        # vis-signature). zmq has no keyed lane: skipped there.
+        self._vis_sig: visview.VisSig | None = None
+        self._vis_sent_at = 0.0
         self._last_sweep = 0.0
         self._in_handler = False
         self._drop_next_batch = False
@@ -244,6 +293,56 @@ class HostSync:
                     self.dirty.mark(uuid, Tier.T2)
                     self._touch_ready(uuid, now)
                 self._vis_state[uuid] = digest
+
+        self._sample_view_visibility(now, layer_collections)
+
+    def _sample_view_visibility(self, now: float, layer_collections: dict) -> None:
+        """Local View and per-viewport collection isolation of the largest
+        3D view, as a signature on the keyed hot lane."""
+        transport = self.transport
+        if not hasattr(transport, "send_hot_keyed"):
+            return
+        area = _largest_view3d()
+        if area is None:
+            return
+        space = area.spaces.active
+        local: list[str] = []
+        try:
+            in_local = space.local_view is not None
+        except AttributeError:
+            in_local = False
+        if in_local:
+            for obj in bpy.data.objects:
+                try:
+                    if obj.local_view_get(space):
+                        uuid = self.registry.uuid_for(obj.session_uid)
+                        if uuid:
+                            local.append(uuid)
+                except (RuntimeError, ReferenceError):
+                    pass
+        local_colls = bool(getattr(space, "use_local_collections", False))
+        hidden: list[str] = []
+        if local_colls:
+            region = next((r for r in area.regions if r.type == "WINDOW"), None)
+            try:
+                with bpy.context.temp_override(area=area, region=region, space_data=space):
+                    for coll in bpy.data.collections:
+                        lc = layer_collections.get(coll.session_uid)
+                        if lc is None or lc.exclude or lc.hide_viewport:
+                            continue
+                        if not lc.visible_get():
+                            uuid = self.registry.uuid_for(coll.session_uid)
+                            if uuid:
+                                hidden.append(uuid)
+            except Exception:
+                pass
+        sig = visview.VisSig.make(local, local_colls, hidden)
+        if sig != self._vis_sig or now - self._vis_sent_at >= 1.0:
+            if _DEBUG and sig != self._vis_sig:
+                print(f"qcb vis signature: {sig}", flush=True)
+            self._vis_sig = sig
+            self._vis_sent_at = now
+            transport.send_hot_keyed(visview.KEY, visview.encode(sig))
 
     def _touch_ready(self, uuid: str, now: float) -> None:
         """A sweep-detected change is already coalesced by the sweep cadence;
@@ -366,8 +465,15 @@ class HostSync:
             "uuid": "__mainfile__",
             "name": bpy.path.basename(bpy.data.filepath) or "untitled",
             "project_dir": bootstrap.project_dir_canonical(self.mappings),
+            "scene_digest": self.scene_digest_now(),
         }
         blob_id = f"boot.{self.sent_boot}.{self.seq + 1}"
+        self._boot_gen = self.sent_boot  # the number the replica reads back from the blob id
+        self._manifest_pending.clear()
+        self._manifest = None
+        self._delta_queue.clear()
+        self._delta_tail.clear()
+        self._delta_end_pending = False
         self._boot_outbox.extend(protocol.chunk_blob("boot", blob_id, data, meta=meta))
         self._shipped = {
             uuid for uuid, db in self._uuid_to_db.items()
@@ -427,6 +533,12 @@ class HostSync:
             return _FLUSH_TICK  # pre-handshake: the bootstrap will cover it
         if not self._drain_t2_outbox():
             return _FLUSH_TICK  # backpressure mid-blob: resume next tick
+        if self._fast_resend_queue or self._fast_resend_end:
+            self._drain_fast_resend()
+        if self._delta_queue or self._delta_tail or self._delta_end_pending:
+            self._drain_delta()
+            return _FLUSH_TICK  # the repair first; edits queue behind it
+        self._send_manifest_batch(now)
         if self._auto_boot_at and now >= self._auto_boot_at:
             if now - self._last_auto_boot >= _AUTO_BOOT_MIN_INTERVAL:
                 self._auto_boot_at = 0.0
@@ -445,6 +557,10 @@ class HostSync:
             return _FLUSH_TICK
         ready_set = set(self.debounce.ready(now))
         tombstones, dirty = self.dirty.drain()
+        # More blobs than this tick's budget: the ones that leave now tell
+        # the replica a burst is on, so it holds its batch a moment for the
+        # rest and evaluates once (DESIGN-NOTES sync batch-apply).
+        self._burst = sum(1 for u, t in dirty if t == Tier.T2 and u in ready_set) > _T2_PER_TICK
         for uuid in tombstones:
             self._send_tombstone(uuid)
         t2_budget = _T2_PER_TICK
@@ -475,6 +591,9 @@ class HostSync:
             snapshot = build_snapshot(db)
         except ReferenceError:  # died between mark and flush; sweep will see it
             return
+        old_shadow = self.shadow.get(uuid)  # to put back if the delta never leaves
+        if isinstance(db, bpy.types.Scene):
+            self._scene_digest = _scene_struct_digest(snapshot)
         diff = self.shadow.diff_and_update(uuid, snapshot)
         if diff is None and db.users == 0 and not db.use_fake_user:
             return  # orphan: primed, not shipped — nothing on the replica needs it yet
@@ -499,7 +618,7 @@ class HostSync:
             # blob is refused (Scene) they must still go out (DESIGN-NOTES sync A2).
             self._flush_t2(uuid, snapshot, fallback=diff["changes"])
             return
-        self._send_t1(uuid, db, diff["changes"])
+        self._send_t1(uuid, db, diff["changes"], old_shadow=old_shadow)
 
     # "@" pointer setters and the bpy.data collection their names resolve in.
     _POINTER_SETTERS = {
@@ -508,9 +627,15 @@ class HostSync:
         "@ll_receiver": "collections", "@ll_blocker": "collections",
     }
 
-    def _send_t1(self, uuid: str, db, changes: list) -> None:
+    def _send_t1(self, uuid: str, db, changes: list, old_shadow: dict | None = None,
+                 full: bool = False) -> bool:
+        """`old_shadow` — the shadow before this diff; restored on refusal so
+        the next diff finds the same changes (the shadow used to advance at
+        diff time and a refused send silently lost the delta). `full` marks
+        a re-assert: every tracked path, not a diff. False = refused (the
+        uuid was requeued)."""
         if not changes:
-            return
+            return True
         # Setters first: "@rbw" must create the world before
         # "rigidbody_world.*" paths write into it.
         changes = sorted(changes, key=lambda c: not c[0].startswith("@"))
@@ -530,19 +655,29 @@ class HostSync:
                         self._flush_t2(t_uuid)
                     if t_uuid in self._t2_outbox:
                         self.dirty.requeue(uuid, Tier.T1)  # after the blob has fully left
-                        return
+                        if old_shadow is not None:
+                            self.shadow.restore(uuid, old_shadow)
+                        return False
                     after = max(after, self._uuid_cold_seq.get(t_uuid, 0))
         self.seq_fast += 1
         header = {"kind": "t1", "lane": "f", "seq": self.seq_fast, "uuid": uuid,
                   "after": after}
+        if full:
+            header["full"] = True
+        if isinstance(db, bpy.types.Scene) and self._scene_digest:
+            header["sd"] = self._scene_digest
         payload = json.dumps(changes).encode("utf-8")
         if self.transport.send_fast(header, payload):
             self.sent_t1 += len(changes)
+            self.fastlog.record(self.seq_fast, uuid, "t1")
             if _DEBUG:
                 print(f"qcb t1 send {db.name}: {[p for p, _ in changes]}", flush=True)
-        else:
-            self.seq_fast -= 1
-            self.dirty.requeue(uuid, Tier.T1)
+            return True
+        self.seq_fast -= 1
+        self.dirty.requeue(uuid, Tier.T1)
+        if old_shadow is not None:
+            self.shadow.restore(uuid, old_shadow)
+        return False
 
     def _after_for(self, uuid: str) -> int:
         return max(self._uuid_cold_seq.get(uuid, 0), self._boot_last_seq, self._link_seq)
@@ -641,8 +776,12 @@ class HostSync:
                 print(f"qcb t2 skip {db.name} (unchanged blob)", flush=True)
             return
         self._blob_hash[uuid] = digest
+        self._manifest_pending.pop(uuid, None)  # the blob itself tells the replica
         blob_id = f"{uuid}.{self.seq + 1}"
-        meta = {"uuid": uuid, "name": db.name, "coll": tier2_io.collection_of(db)}
+        meta = {"uuid": uuid, "name": db.name, "coll": tier2_io.collection_of(db),
+                "digest": digest.hex()}
+        if self._burst:
+            meta["more"] = True
         self._t2_outbox[uuid] = list(protocol.chunk_blob("t2", blob_id, data, meta=meta))
         self.sent_t2 += 1
         if _DEBUG:
@@ -679,6 +818,7 @@ class HostSync:
             if data is None:
                 continue
             self._blob_hash[uuid] = self._blob_digest(db, data)
+            self._manifest_pending[uuid] = self._blob_hash[uuid].hex()
             self.primed += 1
             n += 1
 
@@ -704,13 +844,218 @@ class HostSync:
             self._shipped.add(uuid)
         return True
 
-    def _send_tombstone(self, uuid: str) -> None:
+    def _send_tombstone(self, uuid: str) -> bool:
         self.seq_fast += 1
         header = {"kind": "tomb", "lane": "f", "seq": self.seq_fast, "uuid": uuid,
                   "after": self._after_for(uuid)}
-        if not self.transport.send_fast(header):
-            self.seq_fast -= 1
-            self.dirty.requeue_tombstone(uuid)
+        if self.transport.send_fast(header):
+            self.fastlog.record(self.seq_fast, uuid, "tomb")
+            return True
+        self.seq_fast -= 1
+        self.dirty.requeue_tombstone(uuid)
+        return False
+
+    # ── fast-lane re-assert (DESIGN-NOTES sync fast-ack) ─────────────────────
+
+    def resend_fast_window(self, gap_at: int) -> int:
+        """The replica reported a hole on the fast lane at `gap_at`: queue a
+        full tier-1 snapshot (or a tombstone) for every datablock named at
+        or after it, then a resync_end. Returns how many were queued."""
+        window = self.fastlog.window_since(int(gap_at or 0))
+        self._fast_resend_queue.extend(window)
+        self._fast_resend_end = True
+        self.fast_resyncs += 1
+        if _DEBUG:
+            print(f"qcb fast re-assert from {gap_at}: {len(window)} datablocks", flush=True)
+        return len(window)
+
+    _FAST_RESEND_PER_TICK = 16
+
+    def _drain_fast_resend(self) -> None:
+        n = 0
+        while self._fast_resend_queue and n < self._FAST_RESEND_PER_TICK:
+            uuid, kind = self._fast_resend_queue[0]
+            sent = self._send_tombstone(uuid) if kind == "tomb" else self._send_t1_full(uuid)
+            if not sent:
+                return  # backpressure: resume next tick, same entry
+            self._fast_resend_queue.pop(0)
+            n += 1
+        if not self._fast_resend_queue and self._fast_resend_end:
+            self.seq_fast += 1
+            header = {"kind": "resync_end", "lane": "f", "seq": self.seq_fast,
+                      "uuid": "", "after": 0}
+            if self.transport.send_fast(header):
+                self._fast_resend_end = False
+            else:
+                self.seq_fast -= 1
+
+    # ── delta resync (DESIGN-NOTES sync delta-resync) ─────────────────────
+
+    _MANIFEST_BATCH = 512
+    _DELTA_PER_TICK = _T2_PER_TICK * 4
+    _MANIFEST_REQ_TIMEOUT = 5.0
+
+    def scene_digest_now(self) -> str:
+        scene = bpy.context.scene
+        if scene is None:
+            return ""
+        try:
+            self._scene_digest = _scene_struct_digest(build_snapshot(scene))
+        except Exception:
+            pass
+        return self._scene_digest
+
+    def _send_manifest_batch(self, now: float) -> None:
+        """Idle work after _prime_hashes: tell the replica the digests of
+        what the bootstrap carried, a few hundred at a time, on the control
+        lane (fire-and-forget; the acks are reaped)."""
+        for req_id, t in list(self._manifest_reqs):
+            if self.transport.poll_reply(req_id) is not None or now - t > self._MANIFEST_REQ_TIMEOUT:
+                self.transport.cancel_request(req_id)
+                self._manifest_reqs.remove((req_id, t))
+        if not self._manifest_pending or len(self._manifest_reqs) >= 4:
+            return
+        if not hasattr(self.transport, "request_nowait"):
+            self._manifest_pending.clear()
+            return
+        batch = dict(list(self._manifest_pending.items())[: self._MANIFEST_BATCH])
+        for uuid in batch:
+            del self._manifest_pending[uuid]
+        req_id = self.transport.request_nowait(
+            {"kind": "manifest", "boot": self._boot_gen, "held": batch}
+        )
+        self._manifest_reqs.append((req_id, now))
+        self.manifests_sent += 1
+        if _DEBUG:
+            print(f"qcb manifest batch {len(batch)} (boot {self._boot_gen})", flush=True)
+
+    def delta_state(self, status: dict) -> str:
+        """"ready" (the replica's inventory is in hand and its Scene matches
+        ours), "pending" (asked for it), "mismatch" (bootstrap)."""
+        if not status.get("scene_digest") or status.get("scene_digest") != self.scene_digest_now():
+            return "mismatch"
+        held_digest = status.get("held_digest")
+        if self._manifest is not None and self._manifest.get("held_digest") == held_digest:
+            return "ready"
+        now = time.monotonic()
+        if self._manifest_req is not None:
+            reply = self.transport.poll_reply(self._manifest_req)
+            if reply is not None:
+                self._manifest_req = None
+                if reply.get("kind") == "manifest":
+                    self._manifest = dict(reply, held_digest=held_digest)
+                    return "ready" if self._manifest.get("scene_digest") == self._scene_digest else "mismatch"
+                return "mismatch"
+            if now - self._manifest_req_at > self._MANIFEST_REQ_TIMEOUT:
+                self.transport.cancel_request(self._manifest_req)
+                self._manifest_req = None
+                return "mismatch"
+            return "pending"
+        self._manifest_req = self.transport.request_nowait({"kind": "manifest_req"})
+        self._manifest_req_at = now
+        return "pending"
+
+    def plan_from_manifest(self, status: dict) -> DeltaPlan | None:
+        """The delta against the replica's inventory, or None (bootstrap)."""
+        manifest = self._manifest or {}
+        held = manifest.get("held") or {}
+        host_alive: set[str] = set()
+        at_state_all: list[str] = []
+        for uuid, db in self._uuid_to_db.items():
+            if not _alive(db) or not (db.users > 0 or db.use_fake_user):
+                continue
+            if isinstance(db, (bpy.types.Scene, bpy.types.Key)) or tier2_io.collection_of(db) is None:
+                continue
+            host_alive.add(uuid)
+            if isinstance(db, (bpy.types.Object, bpy.types.Collection)):
+                at_state_all.append(uuid)
+        host_hash = {u: d.hex() for u, d in self._blob_hash.items()}
+        return plan_delta(host_alive, host_hash, held, self._scene_digest,
+                          manifest.get("scene_digest") or "", status.get("gap_lane", ""), at_state_all)
+
+    def send_delta(self, plan: DeltaPlan) -> None:
+        """Queue the repair: tombstones now, blobs and re-asserts across the
+        next ticks, then a cold resync_end."""
+        held = (self._manifest or {}).get("held") or {}
+        for uuid in plan.tombs:
+            self._send_tombstone(uuid)
+        self._delta_queue = [(u, held.get(u)) for u in plan.resend] + [(u, held.get(u)) for u in plan.verify]
+        scenes = [u for u, db in self._uuid_to_db.items() if isinstance(db, bpy.types.Scene) and _alive(db)]
+        self._delta_tail = (scenes if plan.scene_t1 else []) + [u for u in plan.at_state if u not in scenes]
+        self._delta_end_pending = True
+        self._manifest = None  # stale once we start changing what it holds
+        self.delta_resyncs += 1
+        if _DEBUG:
+            print(f"qcb delta resync: {len(plan.tombs)} tombs, {len(plan.resend)} resend, "
+                  f"{len(plan.verify)} verify, {len(self._delta_tail)} re-asserts", flush=True)
+
+    def _drain_delta(self) -> None:
+        if not self._drain_t2_outbox():
+            return  # a blob mid-flight: next tick
+        n = 0
+        while self._delta_queue and n < self._DELTA_PER_TICK:
+            uuid, expect = self._delta_queue[0]
+            if not self._resend_t2(uuid, expect):
+                return  # backpressure: same entry next tick
+            self._delta_queue.pop(0)
+            n += 1
+        if self._delta_queue:
+            return
+        while self._delta_tail and n < self._DELTA_PER_TICK:
+            if not self._send_t1_full(self._delta_tail[0]):
+                return
+            self._delta_tail.pop(0)
+            n += 1
+        if self._delta_tail:
+            return
+        if self._delta_end_pending:
+            self.seq += 1
+            if self.transport.send_cold({"kind": "resync_end", "seq": self.seq}, b""):
+                self._delta_end_pending = False
+            else:
+                self.seq -= 1
+
+    def _resend_t2(self, uuid: str, expect: str | None) -> bool:
+        """Serialize now and send unless the replica already holds exactly
+        this (`expect` = its digest). False = refused, retry next tick."""
+        db = self._uuid_to_db.get(uuid)
+        if db is None or not _alive(db):
+            return self._send_tombstone(uuid)
+        try:
+            data = tier2_io.serialize(db, compress=self._blend_compress())
+        except ReferenceError:
+            return self._send_tombstone(uuid)
+        if data is None:
+            return True  # a type with no tier 2: the file carries it
+        digest = self._blob_digest(db, data)
+        self._blob_hash[uuid] = digest
+        if expect and digest.hex() == expect:
+            return True
+        blob_id = f"{uuid}.{self.seq + 1}"
+        meta = {"uuid": uuid, "name": db.name, "coll": tier2_io.collection_of(db), "digest": digest.hex()}
+        self._t2_outbox[uuid] = list(protocol.chunk_blob("t2", blob_id, data, meta=meta))
+        self.sent_t2 += 1
+        self.delta_t2 += 1
+        self._drain_t2_outbox(uuid)
+        return True
+
+    def _send_t1_full(self, uuid: str) -> bool:
+        """Every tracked path of the datablock as one fast message: the
+        replica may have missed any delta since the hole, and every setter
+        is idempotent, so the whole shadow is the cheapest exact answer.
+        A datablock that is gone becomes a tombstone."""
+        db = self._uuid_to_db.get(uuid)
+        if db is None or not _alive(db):
+            return self._send_tombstone(uuid)
+        shadow = self.shadow.get(uuid)
+        if shadow is None:
+            try:
+                shadow = build_snapshot(db)
+            except ReferenceError:
+                return self._send_tombstone(uuid)
+            self.shadow.diff_and_update(uuid, shadow)
+        changes = [(p, v) for p, v in shadow.items() if not p.startswith("~")]
+        return self._send_t1(uuid, db, changes, full=True)
 
     def _externalize_caches(self) -> None:
         """Point caches without an external path get one under the shared
@@ -1056,6 +1401,16 @@ def _object_sweep_vector(obj: bpy.types.Object) -> tuple:
         obj.visible_camera, obj.is_holdout, obj.is_shadow_catcher,
         obj.field.type if obj.field else "",
     )
+
+
+_SCENE_STRUCT_KEYS = ("~scene_struct", "@master_members", "~anim", "~idprop_groups")
+
+
+def _scene_struct_digest(snapshot: dict) -> str:
+    """The part of a Scene snapshot that only the file carries: a mismatch
+    between host and replica means a delta cannot repair it."""
+    parts = {k: snapshot.get(k) for k in _SCENE_STRUCT_KEYS if k in snapshot}
+    return hashlib.md5(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def _datablock_sweep_vector(db) -> tuple:

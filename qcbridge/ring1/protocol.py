@@ -134,6 +134,21 @@ def token_fingerprint(token: str) -> str:
     return hashlib.sha256(f"qcb-token:{token}".encode()).hexdigest()[:8]
 
 
+# Capabilities beyond PROTOCOL_VERSION, advertised by each end (host in the
+# hello, replica in the hello_reply) and read with `in`: every one is
+# additive, so a mismatched pair degrades to the pre-0.3 behaviour instead
+# of denying the handshake.
+#   fast_ack  — the pong carries fast_applied / fast_gap_at / gap_lane and
+#               the replica understands a fast "resync_end".
+#   batch_apply — the replica applies every completed blob in one tick and
+#               reports `batches` / `evaluations` in the pong.
+#   delta_resync — t2 meta carries a digest, boots a scene digest; the
+#               replica keeps an inventory, answers `manifest_req`, accepts
+#               `manifest` batches, and a cold "resync_end" ends a delta.
+HOST_CAPS = ("fast_ack", "delta_resync")
+REPLICA_CAPS = ("fast_ack", "batch_apply", "delta_resync")
+
+
 def make_hello(
     token: str, epoch: str, blender_version: str, addon_version: str = "",
     seq: int = 0, seq_fast: int = 0, mappings: list | None = None,
@@ -141,6 +156,7 @@ def make_hello(
 ) -> dict:
     return {
         "kind": "hello",
+        "caps": list(HOST_CAPS),
         "token": token,
         # The host's path-mapping rows (wire dicts), so the replica can
         # localize with the host's table alone (2026-09-24). Absent from an
@@ -177,7 +193,8 @@ def check_hello(msg: dict, expected_token: str) -> tuple[bool, str]:
 
 # ── cold channel ─────────────────────────────────────────────────────────────
 # Message kinds: "t1" (property deltas), "t2" (datablock blob), "tomb"
-# (tombstone), "boot" (bootstrap blob). Fast-lane messages ("t1", "tomb")
+# (tombstone), "boot" (bootstrap blob), "resync_end" (a repair that was not
+# a bootstrap is complete; on either lane). Fast-lane messages ("t1", "tomb")
 # carry lane="f" and `after` (ring1/merge.py).
 
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
@@ -276,12 +293,21 @@ class SeqTracker:
     def __init__(self) -> None:
         self.last_seen: int | None = None
         self.gaps = 0
+        # The first seq that never arrived, from the oldest unresolved gap;
+        # the host re-asserts everything it sent from here on (ring1.fastlog)
+        # and clear_gap() closes the hole.
+        self.first_missing: int | None = None
 
     def observe(self, seq: int) -> bool:
         """Returns True if `seq` follows contiguously."""
         contiguous = self.last_seen is None or seq == self.last_seen + 1
         if not contiguous:
             self.gaps += 1
+            if self.first_missing is None and self.last_seen is not None and seq > self.last_seen + 1:
+                self.first_missing = self.last_seen + 1
         if self.last_seen is None or seq > self.last_seen:
             self.last_seen = seq
         return contiguous
+
+    def clear_gap(self) -> None:
+        self.first_missing = None

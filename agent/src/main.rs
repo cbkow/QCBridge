@@ -14,13 +14,12 @@
 
 use anyhow::{Context, Result};
 use qcbridge_agent::blender::{Event, Lifecycle};
-use qcbridge_agent::config::{self, Config, SharedConfig};
+use qcbridge_agent::config::{self, SharedConfig};
 use qcbridge_agent::discovery;
 use qcbridge_agent::link::{Inbound, Link, serve_local, writer_thread};
 use qcbridge_agent::platform;
 use qcbridge_agent::session::{self, Ctx, HostTarget, PeerObserver};
 use qcbridge_agent::log;
-use qcbridge_agent::video::{VideoSink, VideoSource, video_listener};
 use serde_json::{Value, json};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -178,10 +177,6 @@ fn start_role(agent: &Agent) -> Result<RoleRuntime> {
         } else {
             *agent.status.lock().unwrap() = "waiting for the addon".into();
         }
-        if cfg.video_port > 0 {
-            let addr = format!("127.0.0.1:{}", cfg.video_port).parse()?;
-            rt.tasks.push(agent.rt.spawn(video_listener(addr, agent.ctx.video_sink.clone(), agent.link.clone())));
-        }
         rt.tasks.push(agent.rt.spawn(session::host_loop(agent.ctx.clone(), agent.host_control.clone())));
     } else {
         let addr = cfg.listen.parse().context("listen must be IP:PORT")?;
@@ -304,8 +299,6 @@ fn attach_reply(agent: &Agent) -> Value {
         "addon_attached": agent.link.attached.load(Relaxed),
         // Where this binary is: the addon opens the settings window from it.
         "exe": std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
-        "video_port": agent.cfg.with(|c| if c.role == "host" { c.video_port } else { 0 }),
-        "video_state": *agent.ctx.video_src.state.lock().unwrap(),
         // COLD_ACK carries bytes since 2026-09-23; an addon that does not
         // see this key falls back to counting messages against an old agent.
         "credits": "bytes",
@@ -471,10 +464,6 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
         );
     }
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
-    let video_src = Arc::new(VideoSource::new());
-    video_src.set_log_dir(base.clone());
-    let video_sink = Arc::new(VideoSink::new());
-
     // One config from here on. Everything long-lived takes a handle to it,
     // so a change is visible to all of them; `cfg` itself stays only for the
     // startup reads below, which happen before any of this can be edited.
@@ -485,7 +474,7 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
     let host_control = Arc::new(session::HostControl::new(None));
     let ctx = Arc::new(Ctx::new(
         role_host, shared.clone(), link.clone(), inb.clone(),
-        control_rx, cold_rx, fast_rx, video_src.clone(), video_sink.clone(),
+        control_rx, cold_rx, fast_rx,
         Arc::new(session::NoObserver),
     ));
     let agent = Arc::new(Agent {
@@ -507,7 +496,6 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
             if let Some(l) = &a.role.lock().unwrap().lifecycle { let _ = l.tx.send(Event::AddonDetached); }
             if exit_with_addon {
                 log!("[agent] addon detached; exiting (--exit-with-addon)");
-                a.ctx.video_src.stop();
                 a.quit.notify_waiters();
             }
         });
@@ -568,51 +556,8 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
     }
 }
 
-/// argv for the native capture child if one is installed beside the agent.
-fn native_capture_argv(cmd: &Value, cfg: &Config) -> Option<Vec<String>> {
-    let exe = std::env::current_exe().ok()?;
-    let name = if cfg!(target_os = "macos") { "qcb-capture-mac" } else if cfg!(windows) { "qcb-capture-win.exe" } else { return None };
-    let path = exe.parent()?.join(name);
-    if !path.is_file() {
-        return None;
-    }
-    let fps = cmd.get("fps").and_then(Value::as_u64).unwrap_or(60);
-    let mbps = cmd.get("bitrate_mbps").and_then(Value::as_u64).unwrap_or(50);
-    let mut argv = vec![path.to_string_lossy().into_owned(), "--fps".into(), fps.to_string(), "--bitrate".into(), mbps.to_string()];
-    if cfg.capture_scale > 0.0 && cfg.capture_scale != 1.0 {
-        argv.push("--scale".into());
-        argv.push(cfg.capture_scale.to_string());
-    }
-    if let Some(r) = cmd.get("region").and_then(Value::as_str) {
-        argv.push("--region".into());
-        argv.push(r.to_string());
-    }
-    if cmd.get("ten_bit").and_then(Value::as_bool) == Some(true) {
-        argv.push("--10bit".into());
-    }
-    Some(argv)
-}
-
 fn handle_cmd(agent: &Agent, cmd: &Value) {
     match cmd.get("cmd").and_then(Value::as_str) {
-        Some("video_start") => {
-            let mut argv: Vec<String> = cmd.get("argv").and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            // S6: prefer the native capture binary shipped next to the agent
-            // (ScreenCaptureKit -> VideoToolbox) over the addon's ffmpeg argv.
-            if cmd.get("native").and_then(Value::as_bool) != Some(false) {
-                if let Some(native) = agent.cfg.with(|c| native_capture_argv(cmd, c)) {
-                    argv = native;
-                }
-            }
-            if argv.is_empty() {
-                agent.link.event_blocking(json!({"event": "error", "msg": "video_start: empty argv"}));
-            } else {
-                agent.ctx.video_src.start(argv, agent.link.clone());
-            }
-        }
-        Some("video_stop") => agent.ctx.video_src.stop(),
         Some("connect") if agent.cfg.is_host() => {
             let addr = cmd.get("peer").and_then(Value::as_str).unwrap_or("").to_string();
             if addr.is_empty() {
@@ -718,7 +663,6 @@ fn handle_cmd(agent: &Agent, cmd: &Value) {
         Some("shutdown") => {
             // The addon asking us to exit: only meaningful for headless test agents.
             if !agent.cfg.with(|c| c.tray) {
-                agent.ctx.video_src.stop();
                 agent.quit.notify_waiters();
             }
         }
@@ -943,7 +887,6 @@ mod tray {
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
                     }
-                    agent.ctx.video_src.stop();
                     // Sends bye, removes the phonebook entry, deregisters
                     // from agent.json.
                     let role = agent.cfg.role();

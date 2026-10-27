@@ -78,7 +78,8 @@ for key in host["order"]:
     bl = replica.get("blobs", [])
     def counts_at(t):
         c = (0, 0)
-        for tt, a2, a1 in bl:
+        for row in bl:
+            tt, a2, a1 = row[0], row[1], row[2]  # [t, applied_t2, applied_t1, batches, evaluations]
             if tt <= t:
                 c = (a2, a1)
         return c

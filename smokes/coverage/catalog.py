@@ -258,6 +258,53 @@ def _():
     o = obj("CovVis"); return None if o is None else o.show_in_front
 
 
+def _largest_view3d_space():
+    best, best_size = None, -1
+    for w in bpy.context.window_manager.windows:
+        for a in w.screen.areas:
+            if a.type == "VIEW_3D" and a.width * a.height > best_size:
+                best, best_size = a, a.width * a.height
+    return best.spaces.active if best else None
+
+
+def _local_view_names():
+    sp = _largest_view3d_space()
+    if sp is None or sp.local_view is None:
+        return []
+    out = []
+    for o in bpy.data.objects:
+        try:
+            if o.local_view_get(sp):
+                out.append(o.name)
+        except RuntimeError:
+            pass
+    return sorted(out)
+
+
+@action("view_local_view", "visibility", "Local View on CovVis (per-viewport; keyed hot lane)")
+def view_local_view():
+    o = obj("CovVis")
+    for ob in bpy.context.view_layer.objects:
+        ob.select_set(ob is o)
+    with obj_ctx(o):
+        bpy.ops.view3d.localview(frame_selected=False)
+@probe(view_local_view)
+def _():
+    return _local_view_names()
+
+
+@action("view_local_view_exit", "visibility", "leave Local View")
+def view_local_view_exit():
+    sp = _largest_view3d_space()
+    if sp is not None and sp.local_view is not None:
+        with ops_ctx():
+            bpy.ops.view3d.localview(frame_selected=False)
+@probe(view_local_view_exit)
+def _():
+    sp = _largest_view3d_space()
+    return None if sp is None else (sp.local_view is None)
+
+
 @action("obj_hide_eye", "visibility", "eye toggle (hide_set)")
 def obj_hide_eye():
     obj("CovVis").hide_set(True)

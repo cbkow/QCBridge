@@ -91,7 +91,6 @@ struct Draft {
     cache_root: String,
     shared_root: String,
     cap_mbps: String,
-    capture_scale: String,
     rows: Vec<Row>,
     rows_dirty: bool,
     token_input: String,
@@ -195,7 +194,6 @@ impl App {
         d.cache_root = s("cache_root");
         d.shared_root = s("shared_root");
         d.cap_mbps = cfg.get("cap_mbps").and_then(Value::as_f64).map(|f| format!("{f}")).unwrap_or_default();
-        d.capture_scale = cfg.get("capture_scale").and_then(Value::as_f64).map(|f| format!("{f}")).unwrap_or_default();
         if force_rows || !d.rows_dirty {
             let rows: Vec<PathMapping> = cfg.get("path_mappings").cloned()
                 .and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
@@ -694,11 +692,8 @@ impl App {
                 ui.label("Mbps for the video lane");
             });
             ui.end_row();
-            ui.label("Capture scale");
-            ui.horizontal(|ui| {
-                self.number_field(ui, "capture_scale", |d| &mut d.capture_scale, false);
-                ui.label("1.0 = native pixels; 0.5 halves each dimension (native capture)");
-            });
+            ui.label("Pixels");
+            ui.label("The stream's rate, size and rate cap are Blender's (the replica's Pixel Path preferences)");
             ui.end_row();
         });
     }

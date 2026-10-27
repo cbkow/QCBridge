@@ -1,0 +1,10 @@
+/Users/chris/Documents/GitHub/QCBridge/agent/encode-win/target/x86_64-pc-windows-msvc/debug/deps/windows_future-e7a02ba5d956e392.d: /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/lib.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/bindings.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/bindings_impl.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/get.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/waiter.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/../readme.md
+
+/Users/chris/Documents/GitHub/QCBridge/agent/encode-win/target/x86_64-pc-windows-msvc/debug/deps/libwindows_future-e7a02ba5d956e392.rmeta: /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/lib.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/bindings.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/bindings_impl.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/get.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/waiter.rs /Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/../readme.md
+
+/Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/lib.rs:
+/Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/bindings.rs:
+/Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/bindings_impl.rs:
+/Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/get.rs:
+/Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/waiter.rs:
+/Users/chris/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/windows-future-0.2.1/src/../readme.md:

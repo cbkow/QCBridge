@@ -21,13 +21,13 @@ prefs = SimpleNamespace(
     role="REPLICA", replica_address="", bind_address="127.0.0.1",
     port_control=19990, port_hot=19991, port_cold=19992, token="covtok",
     enable_stream=False, srt_port=19998, srt_url="", srt_latency_ms=120,
-    encoder_rung="hevc_10_420_100", ffmpeg_path="", replica_kiosk=False,
+    pixel_source="readback", stream_bitrate_mbps=50, stream_width=2560, stream_fps=30, ffmpeg_path="", replica_kiosk=False,
     path_mappings=[],
 )
 session.start(prefs)
 
 history: dict = {}  # key -> [[value, t_first_seen], ...] on change only
-blobs: list = []     # [[t, applied_t2, applied_t1]] whenever a count moves — the cost column
+blobs: list = []     # [[t, applied_t2, applied_t1, batches, evaluations]] whenever a count moves — the cost column
 
 
 def _dump():
@@ -43,7 +43,8 @@ def _dump():
             hist.append([canon, now])
     st = replica_apply.stats
     if not blobs or blobs[-1][1] != st["applied_t2"] or blobs[-1][2] != st["applied_t1"]:
-        blobs.append([now, st["applied_t2"], st["applied_t1"]])
+        blobs.append([now, st["applied_t2"], st["applied_t1"],
+                      st.get("batches", 0), st.get("evaluations", 0)])
     d = {"history": history, "blobs": blobs,
          "stats": {k: v for k, v in st.items() if k != "applying"}}
     tmp = os.path.join(OUT, "replica.json.tmp")

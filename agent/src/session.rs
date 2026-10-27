@@ -12,7 +12,6 @@
 
 use crate::link::{Inbound, Link, T_COLD, T_COLD_ACK, T_CONTROL, T_FAST, T_FAST_ACK};
 use crate::load_or_create_cert;
-use crate::video::{VideoSink, VideoSource};
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::{BufMut, Bytes, BytesMut};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -66,8 +65,6 @@ pub struct Ctx {
     /// Host: whether the Blender addon is attached — the session signal the
     /// control lane carries to the replica. Set by the status ticker.
     pub addon_session: tokio::sync::watch::Sender<bool>,
-    pub video_src: Arc<VideoSource>,
-    pub video_sink: Arc<VideoSink>,
     /// The role's observer (a replica's Blender lifecycle, a host's pin
     /// keeper); replaced on a role switch.
     observer: Mutex<Arc<dyn PeerObserver>>,
@@ -83,8 +80,6 @@ impl Ctx {
         control_rx: mpsc::Receiver<Bytes>,
         cold_rx: mpsc::Receiver<Bytes>,
         fast_rx: mpsc::Receiver<Bytes>,
-        video_src: Arc<VideoSource>,
-        video_sink: Arc<VideoSink>,
         observer: Arc<dyn PeerObserver>,
     ) -> Self {
         Self {
@@ -94,7 +89,6 @@ impl Ctx {
             cold_rx: tokio::sync::Mutex::new(cold_rx),
             fast_rx: tokio::sync::Mutex::new(fast_rx),
             addon_session: tokio::sync::watch::channel(false).0,
-            video_src, video_sink,
             observer: Mutex::new(observer),
             last_stats: Mutex::new(serde_json::Value::Null),
         }

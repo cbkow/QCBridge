@@ -3,7 +3,7 @@ kills and restarts the replica. Records every note transition and how many
 bootstraps were sent, so the runner can see the re-handshake happen. After
 the second bootstrap it makes two tier-1 edits a second apart — the second
 one is what reveals a dropped first one (QCB_TEST_DROP_FIRST_T1 on the
-replica) and drives the want_resync → auto-bootstrap path."""
+replica) and drives the want_resync → fast re-assert path."""
 import json
 import os
 import sys
@@ -24,7 +24,7 @@ prefs = SimpleNamespace(
     role="HOST", replica_address="127.0.0.1", bind_address="0.0.0.0",
     port_control=19990, port_hot=19991, port_cold=19992, token="smoketok",
     enable_stream=False, srt_port=19998, srt_url="", srt_latency_ms=120,
-    encoder_rung="hevc_10_420_100", ffmpeg_path="", replica_kiosk=False,
+    pixel_source="readback", stream_bitrate_mbps=50, stream_width=2560, stream_fps=30, ffmpeg_path="", replica_kiosk=False,
     path_mappings=[],
 )
 
@@ -42,6 +42,9 @@ def dump():
     with open(tmp, "w") as f:
         json.dump({"seq": sync.seq, "sent_boot": sync.sent_boot,
                    "auto_resyncs": session.state.get("auto_resyncs", 0),
+                   "fast_resyncs": session.state.get("fast_resyncs", 0),
+                   "delta_resyncs": session.state.get("delta_resyncs", 0),
+                   "delta_t2": getattr(sync, "delta_t2", 0),
                    "peer_status": getattr(session.state["transport"], "peer_status", {}),
                    "note": session.state["note"], **results}, f, indent=1)
     _atomic_replace(tmp, os.path.join(OUT, "host.json"))
@@ -66,6 +69,19 @@ def _driver():
     elif state["phase"] == "edit_b" and now >= state["at"]:
         cube.location.y = 3.0
         results["edits"].append(["y", 3.0, time.time()])
+        state["phase"] = "edit_c"
+        state["at"] = now + 6.0  # after the fast re-assert has settled
+    elif state["phase"] == "edit_c" and now >= state["at"]:
+        # two tier-2 blobs of the cube: the replica drops the first one
+        # (QCB_TEST_DROP_FIRST_T2) and the second reveals the cold hole →
+        # want_resync → a DELTA resync resends the cube, no bootstrap
+        cube.modifiers.new("Disp", "DISPLACE")
+        results["edits"].append(["mod", "Disp", time.time()])
+        state["phase"] = "edit_d"
+        state["at"] = now + 1.5
+    elif state["phase"] == "edit_d" and now >= state["at"]:
+        cube.modifiers.new("Disp2", "DISPLACE")
+        results["edits"].append(["mod", "Disp2", time.time()])
         state["phase"] = "done"
         results["done"] = True
         dump()

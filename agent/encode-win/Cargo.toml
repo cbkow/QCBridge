@@ -1,0 +1,36 @@
+[package]
+name = "qcb-encode-win"
+version = "0.3.0"
+edition = "2024"
+publish = false
+# GPL-3.0-or-later, matching the repository LICENSE.
+license = "GPL-3.0-or-later"
+description = "QCBridge: the replica's Windows encoder (Blender's shared-memory float ring -> PQ/BT.2020 P010 on the GPU -> Media Foundation HEVC Main10), the twin of qcb-encode-mac"
+
+[workspace]
+
+[[bin]]
+name = "qcb-encode-win"
+path = "src/main.rs"
+
+[dependencies]
+# One system API end to end, as the Mac is Metal + VideoToolbox: D3D11 for
+# the conversion (a pixel shader into the P010 planes), the vendor's hardware
+# HEVC encoder behind Media Foundation. No vendor SDK, no per-GPU code path.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+] }
+
+[profile.release]
+debug = 1

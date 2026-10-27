@@ -129,6 +129,13 @@ else:
     checks["armature_pose_synced"] = "arm_pose" in milestones
     checks["replica_clean"] = (s.get("gaps") == 0 and s.get("apply_errors") == 0
                                and s.get("unknown_uuid") == 0)
+    b0, b1 = host.get("batch_before") or {}, host.get("batch_after") or {}
+    d = {k: (b1.get(k) or 0) - (b0.get(k) or 0) for k in ("applied_t2", "batches", "evaluations")}
+    # six blobs in a burst → one apply batch → one depsgraph evaluation
+    # (the dump timer's view_layer.update() may add one)
+    checks["batch_apply_once"] = (d["applied_t2"] == 6 and d["batches"] == 1
+                                  and d["evaluations"] <= 2)
+    milestones["batch_deltas"] = d
 
 verdict = {"pass": bool(checks) and all(checks.values()),
            "checks": checks, "milestones": milestones,

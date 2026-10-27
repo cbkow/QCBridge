@@ -57,8 +57,3 @@ def test_hot_packet_probe_is_optional_and_dedup_safe():
     assert protocol.unpack_hot(plain + b"x") is None
 
 
-def test_capture_fps_env(monkeypatch):
-    monkeypatch.setenv("QCB_CAPTURE_FPS", "60")
-    assert probe.capture_fps() == 60
-    monkeypatch.delenv("QCB_CAPTURE_FPS")
-    assert probe.capture_fps() == 30

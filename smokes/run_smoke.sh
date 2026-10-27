@@ -10,7 +10,7 @@ rm -f "$SCRATCH"/host.json "$SCRATCH"/replica.json "$SCRATCH"/verdict.json
 mkdir -p "$SCRATCH/bl_replica" "$SCRATCH/bl_host"
 
 QCB_DEBUG=1 BLENDER_USER_RESOURCES="$SCRATCH/bl_replica" \
-  "$BL" --factory-startup -noaudio --python "$HERE/smoke_replica.py" \
+  QCB_TEST_HOLD_COLD_MS=1000 "$BL" --factory-startup -noaudio --python "$HERE/smoke_replica.py" \
   -- "$SCRATCH" > "$SCRATCH/replica.log" 2>&1 &
 REPLICA_PID=$!
 sleep 4
