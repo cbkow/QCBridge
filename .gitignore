@@ -18,3 +18,4 @@ agent/capture-win/target/
 
 # local notes, spikes and anything else that stays on this machine
 private/
+agent/encode-win/target/

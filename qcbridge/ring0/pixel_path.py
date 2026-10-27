@@ -49,12 +49,26 @@ _WIRE_BSF = ("hevc_metadata=colour_primaries=9:transfer_characteristics=16"
              ":matrix_coefficients=9:video_full_range_flag=0")
 
 
+def installed_helper_paths() -> list[str]:
+    """Where the installers put the encode helper, beside the agent
+    (release 0.3.0): the PKG's app bundle on macOS, the Inno installer's
+    folder on Windows — the same homes as transport_agent.installed_agent_paths.
+    A helper extracted from a downloaded extension zip would carry the
+    quarantine flag and be refused on macOS; the installed one is notarized."""
+    if sys.platform == "darwin":
+        return ["/Applications/QCBridge/QCBridge Agent.app/Contents/MacOS/qcb-encode-mac"]
+    if sys.platform == "win32":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        return [os.path.join(pf, "QCBridge", "qcb-encode-win.exe")]
+    return []
+
+
 def find_encode_helper() -> str | None:
     here = Path(__file__).resolve()
     addon = here.parents[1]          # qcbridge/
     repo = here.parents[2]
     explicit = os.environ.get("QCB_PIXEL_HELPER", "")
-    for cand in (explicit, str(addon / "bin" / _HELPER_EXE)):
+    for cand in [explicit, str(addon / "bin" / _HELPER_EXE)] + installed_helper_paths():
         if cand and os.path.isfile(cand):
             return cand
     builds = [

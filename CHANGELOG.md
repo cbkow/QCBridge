@@ -6,7 +6,7 @@ matching versions on **both machines**: the ends now tell each other their
 version at connect, and the panel warns if they don't match. Mismatched ends
 mostly work, but they degrade in confusing ways — update both.
 
-## 0.3.0 — in progress (branch `0.3-zero-capture`)
+## 0.3.0 — 2026-10-27
 
 **No screen capture.** The replica's viewport leaves Blender from the
 inside: for Cycles the extension registers its own render engine, a

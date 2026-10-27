@@ -63,3 +63,15 @@ def test_readback_pipeline_carries_the_working_matrix():
     cap, _mux = pixel_path.build_encode_pipeline("qcb-encode-mac", "ffmpeg", params, "qcb-7-1", URL, "secret123456")
     assert cap[:9] == ["qcb-encode-mac", "--shm", "qcb-7-1", "--fps", "25", "--bitrate", "40", "--gop", "25"]
     assert cap[9] == "--matrix" and cap[10].count(",") == 8
+
+
+def test_installed_helper_paths_mirror_the_agent():
+    """The installers ship the helper beside the agent; the lookup knows
+    those homes (release 0.3.0) and the two lists agree on the folder."""
+    from ring1.transport_agent import installed_agent_paths
+    import os.path
+    agent, helper = installed_agent_paths(), pixel_path.installed_helper_paths()
+    assert len(agent) == len(helper)
+    for a, h in zip(agent, helper):
+        assert os.path.dirname(a) == os.path.dirname(h)
+        assert os.path.basename(h).startswith("qcb-encode")
