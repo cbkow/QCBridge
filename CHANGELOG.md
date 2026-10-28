@@ -6,7 +6,7 @@ matching versions on **both machines**: the ends now tell each other their
 version at connect, and the panel warns if they don't match. Mismatched ends
 mostly work, but they degrade in confusing ways — update both.
 
-## 0.4.0 — in progress (folds in the unpublished 0.3.0 of 2026-10-27)
+## 0.4.0 — 2026-10-28 (folds in the unpublished 0.3.0 of 2026-10-27)
 
 **QCView listens; the replica calls; nothing launches QCView.** The host
 add-on writes QCView a card (`Inputs/blender.json` in QCView's application
