@@ -67,6 +67,8 @@ pub struct Lifecycle {
     log_dir: PathBuf,
     child: Mutex<Option<Child>>,
     pub peer_up: AtomicBool,
+    /// The host's address as seen from here (ip:port of its QUIC end).
+    pub peer_addr: Mutex<Option<String>>,
     /// The host is in a session (its addon attached to its agent). Blender
     /// here is launched for this, and closed once it ends (2026-09-25).
     pub session_on: AtomicBool,
@@ -75,9 +77,11 @@ pub struct Lifecycle {
 }
 
 impl PeerObserver for Lifecycle {
-    fn peer_up(&self, _fp: Option<String>) {
+    fn peer_up(&self, _fp: Option<String>, addr: Option<String>) {
         self.peer_up.store(true, Relaxed);
+        *self.peer_addr.lock().unwrap() = addr.clone();
         let _ = self.tx.send(Event::PeerUp);
+        self.link.event_try(json!({"event": "peer", "peer": 0, "up": true, "addr": addr}));
     }
     fn peer_down(&self, _reason: String) {
         self.peer_up.store(false, Relaxed);
@@ -101,6 +105,7 @@ impl Lifecycle {
             cfg, link, local_port, secret, log_dir,
             child: Mutex::new(None),
             peer_up: AtomicBool::new(false),
+            peer_addr: Mutex::new(None),
             session_on: AtomicBool::new(false),
             tx, status,
         });
@@ -126,8 +131,9 @@ impl Lifecycle {
         // and it suits a machine where Blender is started by hand.
         // One read of the shared config, so a launch cannot see half of an
         // edit made while it was assembling the command.
-        let (path, args, kiosk) = self.cfg.with(|c| {
-            (c.blender_path.clone(), c.blender_args.clone(), c.kiosk)
+        let (path, args, kiosk, geometry, resolution) = self.cfg.with(|c| {
+            (c.blender_path.clone(), c.blender_args.clone(), c.kiosk, c.window_geometry_args(),
+             c.replica_resolution.clone())
         });
         if path.trim().is_empty() {
             self.set_status("host in session (Blender supervision off)");
@@ -145,7 +151,8 @@ impl Lifecycle {
             }
         };
         let mut cmd = Command::new(&path);
-        cmd.args(&args)
+        cmd.args(&geometry)   // the window IS the stream resolution (config.rs replica_resolution)
+            .args(&args)
             .arg("--python-expr")
             .arg(LAUNCH_EXPR)
             .env("QCB_AGENT_PORT", self.local_port.to_string())
@@ -153,6 +160,7 @@ impl Lifecycle {
             // No QCB_AGENT_TOKEN any more: the addon takes the derived
             // secrets from the attach reply; the token stays in the agent.
             .env("QCB_AGENT_KIOSK", if kiosk { "1" } else { "0" })
+            .env("QCB_AGENT_RESOLUTION", &resolution)
             .env("QCB_TRANSPORT", "agent")
             .stdin(Stdio::null())
             .stdout(out)

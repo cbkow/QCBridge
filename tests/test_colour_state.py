@@ -84,15 +84,46 @@ def test_missing_replica_block_is_one_warning():
     assert cs.mismatches(None, _cm("REPLICA")) == []
 
 
-def test_config_and_working_space_mismatches_are_errors():
+def test_configs_are_compared_by_content_not_cache_id():
+    """A file's Working Space derives a new config (new cache ID) on every
+    load, so two Blenders on the same file never share an ID: only what is
+    in use may raise an error (2026-10-28)."""
     r = _cm("REPLICA", config={"cache_id": "3a34339323cc019a", "file": "config.ocio"})
     rows = cs.mismatches(_cm("HOST"), r)
-    assert [k for lv, k, _ in rows if lv == "error"] == ["config"]
-    assert "OCIO configs differ" in rows[0][2]
-    r2 = _cm("REPLICA", working={"name": "ACEScg", "to_xyz": [[0.66, 0.13, 0.16], [0.27, 0.67, 0.06], [-0.0055, 0.004, 1.09]]})
-    rows = cs.mismatches(_cm("HOST"), r2)
-    assert any(k == "working" and lv == "error" for lv, k, _ in rows)
+    assert [lv for lv, k, _ in rows if k == "config"] == ["info"]
+    assert "in use agree" in next(txt for lv, k, txt in rows if k == "config")
+    assert cs.worst_level(rows) != "error"
+    # the same IDs: no config row at all
+    assert not [k for _, k, _ in cs.mismatches(_cm("HOST"), _cm("REPLICA")) if k == "config"]
+
+
+def test_working_space_mismatch_is_an_error_and_names_the_file():
+    h = _cm("HOST", working={"name": "Linear Rec.2020", "to_xyz": [[0.6369, 0.1446, 0.1689], [0.2627, 0.6780, 0.0593], [0.0, 0.0281, 1.0610]],
+                             "linear": True, "assumed": False, "source": "file:lin_rec2020_scene"})
+    r = _cm("REPLICA", config={"cache_id": "3a34339323cc019a", "file": "config.ocio"})
+    rows = cs.mismatches(h, r)
+    by = {k: (lv, txt) for lv, k, txt in rows}
+    assert by["working"][0] == "error" and "Linear Rec.2020" in by["working"][1] and "the host file sets it" in by["working"][1]
+    assert by["config"][0] == "warn"
     assert cs.worst_level(rows) == "error"
+    r2 = _cm("REPLICA", working={"name": "ACEScg", "to_xyz": [[0.66, 0.13, 0.16], [0.27, 0.67, 0.06], [-0.0055, 0.004, 1.09]]})
+    assert any(k == "working" and lv == "error" for lv, k, _ in cs.mismatches(_cm("HOST"), r2))
+
+
+def test_missing_display_or_view_keeps_the_config_row_a_warning():
+    r = _cm("REPLICA", config={"cache_id": "other"}, display_devices=["sRGB", "Rec.1886"], views_available=["Standard", "Filmic"])
+    rows = cs.mismatches(_cm("HOST"), r)   # host view AgX, not on the replica
+    by = {k: lv for lv, k, _ in rows}
+    assert by["view"] == "error" and by["config"] == "warn"
+
+
+def test_working_space_source_shows_in_rows_and_link():
+    h = _cm("HOST", working={"name": "Linear Rec.2020", "to_xyz": cs.matrix_rows(cs.M_709_TO_XYZ),
+                             "linear": True, "assumed": False, "source": "file:lin_rec2020_scene"})
+    assert ("Working space", "Linear Rec.2020 (file)") in cs.summary_rows(h)
+    q = cs.deep_link_params(h, _cm("REPLICA"), {})
+    assert q["ws"] == "Linear Rec.2020" and q["ws_source"] == "file:lin_rec2020_scene"
+    assert ("Working space", "Linear Rec.709") in cs.summary_rows(_cm("REPLICA"))
 
 
 def test_display_view_and_look_availability():
@@ -141,9 +172,9 @@ def test_deep_link_flags_a_config_mismatch_and_assumed_working_space():
     h = _cm("HOST")
     r = cs.fallback_cm("REPLICA", "4.5.0", {}, error="x")
     q = cs.deep_link_params(h, r, {})
-    assert q["cm_ok"] == "0"            # configs differ (fallback has no cache id)
     assert q["ws_assumed"] == "1"
-    assert int(q["cm_n"]) >= 2
+    assert int(q["cm_n"]) >= 2        # the config row (info) + the assumed-working-space warning
+    assert any(k == "ocio_replica" for _, k, _ in cs.mismatches(h, r))
 
 
 def test_summary_rows_read_as_words():

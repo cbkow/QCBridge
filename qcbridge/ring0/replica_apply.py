@@ -18,7 +18,7 @@ import time
 import bpy
 from mathutils import Matrix
 
-from ..ring1 import merge, protocol, resync, visview
+from ..ring1 import merge, protocol, resync, timeline, visview
 from . import bootstrap, engine_qcb, kiosk, overlay, pixel_path, tier2_io
 from .identity import UUID_PROP
 
@@ -430,6 +430,7 @@ def _apply_t1(header: dict, payload: bytes) -> None:
         global _unknown_gap
         stats["unknown_uuid"] += 1
         stats["want_resync"] = True  # a blob we never got
+        timeline.mark("unknown_uuid", uuid=header["uuid"], name=header.get("name"))
         _unknown_gap = True          # a cold-lane problem, whatever lane this rode
         _refresh_gap_stats()
         return
@@ -482,6 +483,7 @@ def _apply_link(header: dict) -> None:
     if not os.path.exists(local):
         stats["unmapped_paths"] += 1
         stats["last_error"] = f"library not found here: {local}"
+        timeline.mark("link.missing", host=host_path, local=local)
         return
     want_objects = set(header.get("objects") or [])
     want_colls = set(header.get("collections") or [])
@@ -563,9 +565,14 @@ def _apply_one(header: dict, blob: bytes) -> str | None:
     blob_tag = header["blob"]["id"].replace(".", "-")
     _note_touched(header.get("uuid", ""))
     if header.get("kind") == "boot":
+        timeline.mark("boot.apply.start", id=blob_tag, bytes=len(blob), seq=header.get("seq"))
+        _t_boot = time.monotonic()
         errors, unmapped, _project_dir_local = bootstrap.apply_mainfile(
             blob, blob_tag, header.get("project_dir", ""), _mappings
         )
+        timeline.mark("boot.applied", id=blob_tag, s=time.monotonic() - _t_boot, errors=errors,
+                      unmapped=unmapped, unmapped_names=bootstrap.last_unmapped[:8],
+                      project_dir_local=_project_dir_local or "(none)")
         stats["bootstraps"] += 1
         stats["apply_errors"] += errors
         stats["unmapped_paths"] = unmapped
@@ -622,6 +629,7 @@ def _apply_pending_batch() -> None:
             except Exception as exc:
                 stats["apply_errors"] += 1
                 stats["last_error"] = f"{header.get('kind')} {header.get('name')}: {exc!r}"
+                timeline.mark("apply.error", kind=header.get("kind"), name=header.get("name"), exc=repr(exc)[:160])
             applied += 1
             due += _merger.cold_done(seq)  # in order: fast messages wait per blob
             if is_boot:
@@ -694,6 +702,8 @@ def _process_cold(deadline: float) -> None:
         if not _merger.observe(header):
             stats["want_resync"] = True
             _refresh_gap_stats()
+            timeline.mark("gap", lane=_merger.lane_of(header), seq=seq, kind=kind,
+                          name=header.get("name"), gap_lane=stats["gap_lane"], gaps=_merger.gaps)
         stats["seq"] = _merger.cold.last_seen or 0
         stats["seq_fast"] = _merger.fast.last_seen or 0
         stats["gaps"] = _merger.gaps
@@ -747,6 +757,7 @@ def held_snapshot() -> dict:
     """IO thread: the inventory for a manifest_req reply."""
     with _held_lock:
         held = dict(_held)
+    timeline.mark("manifest.sent", held=len(held), scene=str(stats["scene_digest"])[:8], boot=_boot_gen)
     return {"kind": "manifest", "held": held, "scene_digest": stats["scene_digest"], "boot": _boot_gen}
 
 
@@ -810,6 +821,7 @@ def _end_resync(header: dict) -> None:
     stats["resyncs"] += 1
     _refresh_gap_stats()
     stats["want_resync"] = bool(stats["gap_lane"])
+    timeline.mark("resync.end", lane=_merger.lane_of(header), still_wanted=stats["want_resync"])
 
 
 def _pending_boot() -> bool:
@@ -1202,6 +1214,7 @@ def _handle_goodbye() -> None:
         area.spaces.active.shading.type = "SOLID"
         area.tag_redraw()
     kiosk.exit_now()
+    timeline.mark("goodbye.handled")
     pixel_path.stop()
     stats["host_ended"] = True
 

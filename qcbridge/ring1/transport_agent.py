@@ -596,6 +596,7 @@ class HostTransportAgent:
         self.agent_mode = False
         # Mirrored from the agent: it owns these, we display them.
         self.agent_config: dict = {}
+        self.peer_addr: str = ""   # the other agent's "ip:port" as our agent sees it (2026-10-28)
         self.peers: list = []        # last discovery result
         self.peers_sources: list = []
         self._cmd_ids = itertools.count(1000)
@@ -743,6 +744,7 @@ class HostTransportAgent:
             self.agent_exe = event.get("exe", "")  # the settings window is this binary with --settings
             self._link_up = bool(event.get("peer_up"))
             self.peer_fingerprint = event.get("peer_fingerprint") or ""
+            self.peer_addr = event.get("peer_addr") or ""   # "ip:port" of the other agent, as seen here
             self.peer_pinned = True
             self.agent_config = dict(event.get("config") or {})
             self._credits_bytes = event.get("credits") == "bytes"
@@ -761,7 +763,10 @@ class HostTransportAgent:
         elif name == "peer":
             self._link_up = bool(event.get("up"))
             if self._link_up:
-                self.peer_fingerprint = event.get("fingerprint") or ""
+                if event.get("fingerprint") is not None:
+                    self.peer_fingerprint = event.get("fingerprint") or ""
+                if event.get("addr"):
+                    self.peer_addr = str(event.get("addr"))
                 self.peer_pinned = bool(event.get("pinned", True))
                 self.link_note = ""
             else:
@@ -858,6 +863,7 @@ class ReplicaTransportAgent:
         self.session_on = True
         self.stats: dict = {}
         self.agent_config: dict = {}
+        self.peer_addr: str = ""   # the other agent's "ip:port" as our agent sees it (2026-10-28)
         self.peers: list = []
         self.peers_sources: list = []
         self._cmd_ids = itertools.count(1000)

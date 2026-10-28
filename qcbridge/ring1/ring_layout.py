@@ -35,6 +35,7 @@ F_CAMERA_RECT = 1       # the frame is the camera rectangle (shot mode), not the
 F_PROBE_STAMPED = 2     # the latency probe strip is stamped bottom-left
 F_OFFSCREEN_ENGINE = 4  # EEVEE/Workbench offscreen draw, not a Cycles readback
 F_FIRST_AFTER_LOAD = 8  # first frame after a bootstrap applied
+F_WARMUP = 16           # start-up black (kernels compiling, textures loading): shown as black, not skipped
 
 # States.
 STATE_LIVE = 0

@@ -91,6 +91,20 @@ class ResyncPolicy:
         self.sent += 1
         return "full"
 
+    def allow_full(self, now: float) -> bool:
+        """A caller that decided "delta" found nothing to plan (the Scene's
+        structure differs) and wants the file instead: the full-bootstrap
+        rate limit applies to it too (2026-10-28: without it a persistent
+        structure difference re-shipped the file at the 1 s fast cadence;
+        0.2.1 allowed one per `min_interval`). False = not yet; the
+        decision is un-served so the next tick asks again."""
+        if now - self._last_sent < self.min_interval:
+            self._served_for = None
+            return False
+        self._last_sent = now
+        self.sent += 1
+        return True
+
     def should_resync(self, status: dict, now: float) -> bool:
         """The pre-0.3 question: bootstrap or not. Kept for callers that
         know nothing about lanes."""

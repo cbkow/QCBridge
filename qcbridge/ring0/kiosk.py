@@ -22,6 +22,13 @@ import bpy
 _DEBUG = bool(os.environ.get("QCB_DEBUG"))
 
 _want = False                # kiosk requested for this session
+_fullscreen = False          # OS fullscreen too (the agent's "fullscreen" resolution); default: the window
+                             # the agent sized to the stream (2026-10-28), area-fullscreen + chrome-off only
+
+
+def set_fullscreen(on: bool) -> None:
+    global _fullscreen
+    _fullscreen = bool(on)
 _os_fullscreen_done = False  # survives file loads AND session restarts:
                              # the OS window stays fullscreen either way
 _steps: list[tuple[float, str]] = []  # (due monotonic time, step name)
@@ -152,7 +159,7 @@ def _run_step(name: str) -> None:
     if not area:
         return
     if name == "os_fullscreen":
-        if not _os_fullscreen_done:
+        if not _os_fullscreen_done and _fullscreen:
             with bpy.context.temp_override(window=window, area=area, region=region):
                 bpy.ops.wm.window_fullscreen_toggle()
             _os_fullscreen_done = True
@@ -177,6 +184,14 @@ def _run_step(name: str) -> None:
             space.show_region_toolbar = False  # T-panel
             area.tag_redraw()
     elif name == "verify":
+        try:
+            from ..ring1 import timeline
+            _w, _a, _r = _v3d()
+            if _r is not None:
+                timeline.mark("kiosk.verify", region=[_r.width, _r.height], fullscreen=window.screen.show_fullscreen,
+                              os_fullscreen=_os_fullscreen_done)
+        except Exception:
+            pass
         # The OS-fullscreen transition animates; a window re-layout at its
         # end can wipe an area-maximize applied mid-animation (measured on
         # macOS). Verify the end state and re-run the sequence until it

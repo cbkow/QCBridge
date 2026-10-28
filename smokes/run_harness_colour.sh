@@ -7,6 +7,7 @@
 # (QCV_APP = its binary; QCView's ffmpeg is used for SRT), Blender.
 #   QCB_TRANSPORT=agent QCB_AGENT=spawn smokes/run_harness_colour.sh [work-dir]
 #   QCB_HARNESS_DISPLAY=Rec.2020 QCB_HARNESS_VIEW=Standard … for other host settings
+#   QCB_HARNESS_WORKING="Linear Rec.2020" sets the FILE working space (both Blenders follow the file)
 #   OCIO=<config> exported in the shell puts BOTH Blenders on that config.
 #   QCB_HARNESS_REPLICA=<address> runs against a replica already up elsewhere
 #   (then no replica is started here; the box's own agent must be listening).

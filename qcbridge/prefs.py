@@ -297,26 +297,43 @@ class QCB_OT_replica_zoom(Operator):
 class QCB_OT_open_qcview(Operator):
     bl_idname = "qcbridge.open_qcview"
     bl_label = "Open in QCView"
-    bl_description = "Launch QCView on the replica's live stream (deep link)"
+    bl_description = ("Stream to QCView: with 'Stream to QCView here' the card is (re)written for "
+                      "QCView on this machine — open QCView yourself, it listens; otherwise the "
+                      "legacy qcview://stream link launches it")
 
     @classmethod
     def poll(cls, context):
-        return bool(session.qcview_deep_link())
+        return bool(session.qcview_deep_link()) or bool(session.state.get("viewer_card_path"))
 
     def execute(self, context):
         import subprocess
         import sys
 
+        from .ring1 import timeline
+        prefs = get_prefs(context)
+        if getattr(prefs, "viewer_push", True):
+            path = session.viewer_card_refresh(force=True)
+            timeline.mark("qcview.card_button", path=path)
+            if path:
+                self.report({"INFO"}, f"QCView card written ({path}) — open QCView, it listens on port {prefs.viewer_port}")
+                return {"FINISHED"}
+            self.report({"WARNING"}, session.state.get("viewer_card_error") or "no card yet — is the session connected?")
+            return {"CANCELLED"}
         link = session.qcview_deep_link()
+        timeline.mark("qcview.open", pixel=(getattr(session.state.get("transport"), "peer_status", {}) or {}).get("pixel"))
+        # Never hand Blender's own OCIO variable to QCView (Blender sets it in
+        # its process; QCView honours $OCIO and would load Blender's config
+        # under that name — found 2026-10-27).
+        import os
+        env = {k: v for k, v in os.environ.items() if k != "OCIO"}
         try:
             if sys.platform == "darwin":
-                subprocess.Popen(["open", link])
+                subprocess.Popen(["open", link], env=env)
             elif sys.platform == "win32":
-                import os
-
-                os.startfile(link)  # MSIX protocol registration routes it
+                subprocess.Popen(["cmd", "/c", "start", "", link], env=env,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # MSIX protocol registration routes it
             else:
-                subprocess.Popen(["xdg-open", link])
+                subprocess.Popen(["xdg-open", link], env=env)
         except OSError as exc:
             self.report({"ERROR"}, f"could not launch QCView: {exc}")
             return {"CANCELLED"}
@@ -442,6 +459,21 @@ class QCBridgePreferences(AddonPreferences):
         description="SRT port the replica listens on (URL is auto-generated)",
         default=9998, min=1024, max=65535,
     )
+    viewer_push: BoolProperty(
+        name="Stream to QCView here",
+        description=(
+            "The replica calls QCView on THIS machine (QCView listens on the port "
+            "below; the add-on writes QCView a card with the port, passphrase and "
+            "colour setup — nothing is launched). Off: the replica listens and "
+            "QCView is opened through the legacy qcview://stream link"
+        ),
+        default=True,
+    )
+    viewer_port: IntProperty(
+        name="QCView Port",
+        description="SRT port QCView listens on, on this machine, for the replica's stream",
+        default=9998, min=1024, max=65535,
+    )
     srt_latency_ms: IntProperty(
         name="Stream Latency (ms)",
         description=(
@@ -477,11 +509,12 @@ class QCBridgePreferences(AddonPreferences):
     stream_width: IntProperty(
         name="Stream Width (px)",
         description=(
-            "The camera frame is fitted to at most this many pixels wide in "
-            "Shot Mode (the replica's window permitting); the stream's "
-            "resolution, independent of the replica's screen"
+            "The stream's width in pixels. With the agent it FOLLOWS the agent's "
+            "Resolution setting (the replica's Blender window is opened at that "
+            "size, so the viewport, the ring and the encoder mean the same number); "
+            "in Shot Mode the camera frame is fitted to at most this many pixels wide"
         ),
-        default=2560, min=640, max=7680, step=2,
+        default=1920, min=640, max=7680, step=2,
     )
     stream_fps: IntProperty(
         name="Stream Rate (fps)",

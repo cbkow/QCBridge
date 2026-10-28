@@ -48,6 +48,18 @@ pub struct Config {
     pub blender_path: String,
     pub blender_args: Vec<String>,
     pub kiosk: bool,
+    /// Replica: the window Blender is launched with = the stream's
+    /// resolution (2026-10-28: the ring takes the viewport size, so a
+    /// fullscreen window had Cycles rendering 3840x2160 for a 2560 stream).
+    /// A preset ("1920x1080" default, "2560x1440", "1280x720"), any "WxH",
+    /// or "fullscreen" (the old behaviour). The addon mirrors it into its
+    /// stream width.
+    pub replica_resolution: String,
+    /// Replica: the display's backing scale (points → pixels), reported by
+    /// the addon after its first launch (`preferences.system.pixel_size`);
+    /// 0 = unknown (macOS assumes 2, the rest 1). Blender's --window-geometry
+    /// takes points.
+    pub replica_backing_scale: f64,
     /// Replica: close Blender this many seconds after the host's session
     /// ends — Stop Session, its Blender quitting, or a lost link (0 = at
     /// once). A host that restarts its session inside the grace finds a
@@ -88,6 +100,8 @@ impl Default for Config {
             blender_path: default_blender_path(),
             blender_args: Vec::new(),
             kiosk: true,
+            replica_resolution: "1920x1080".into(),
+            replica_backing_scale: 0.0,
             idle_secs: 20,
             tray: true,
             name: String::new(),
@@ -111,6 +125,42 @@ fn default_blender_path() -> String {
 }
 
 pub const DISCOVERY_MODES: &[&str] = &["off", "direct", "discoverable"];
+
+/// The replica-resolution presets the settings window offers, in order.
+pub const RESOLUTION_PRESETS: &[&str] = &["1920x1080", "2560x1440", "1280x720", "fullscreen"];
+
+/// "WxH" → (w, h) (even, sane), "fullscreen" → None; anything else is
+/// rejected (Err) so a typo cannot launch a 0x0 window.
+pub fn parse_resolution(s: &str) -> std::result::Result<Option<(u32, u32)>, String> {
+    let s = s.trim().to_ascii_lowercase();
+    if s == "fullscreen" {
+        return Ok(None);
+    }
+    let (w, h) = s.split_once('x').ok_or_else(|| format!("not WxH: {s}"))?;
+    let (w, h): (u32, u32) = (w.trim().parse().map_err(|_| "width".to_string())?,
+                              h.trim().parse().map_err(|_| "height".to_string())?);
+    if !(320..=7680).contains(&w) || !(200..=4320).contains(&h) {
+        return Err(format!("out of range: {w}x{h}"));
+    }
+    Ok(Some((w & !1, h & !1)))
+}
+
+impl Config {
+    /// Extra Blender arguments for the window: `--window-geometry 0 0 W H`
+    /// in points (pixels / backing scale), none for "fullscreen".
+    pub fn window_geometry_args(&self) -> Vec<String> {
+        let Ok(Some((w, h))) = parse_resolution(&self.replica_resolution) else { return Vec::new() };
+        let scale = if self.replica_backing_scale > 0.0 {
+            self.replica_backing_scale
+        } else if cfg!(target_os = "macos") {
+            2.0
+        } else {
+            1.0
+        };
+        let (pw, ph) = ((w as f64 / scale).round() as u32, (h as f64 / scale).round() as u32);
+        vec!["--window-geometry".into(), "0".into(), "0".into(), pw.to_string(), ph.to_string()]
+    }
+}
 
 /// What the machine is called, for the beacon and the tray. No crate: libc
 /// is already in the tree via quinn, and Windows always sets COMPUTERNAME.
@@ -155,6 +205,7 @@ pub const LIVE_FIELDS: &[&str] = &[
     "peer", "token", "fingerprint", "name", "discovery", "phonebook",
     "blender_path", "blender_args", "kiosk", "idle_secs", "cap_mbps",
     "path_mappings", "cache_root", "shared_root",
+    "replica_resolution", "replica_backing_scale",
     // Live since 2026-09-24: a change rebuilds the role runtime in place
     // (the Send/Receive switch; a replica re-listening on a new address).
     "role", "listen",
@@ -205,6 +256,14 @@ pub fn apply_live(cfg: &mut Config, patch: &serde_json::Value) -> Applied {
                 _ => false,
             },
             "kiosk" => match val.as_bool() { Some(b) => { cfg.kiosk = b; true } None => false },
+            "replica_resolution" => match val.as_str() {
+                Some(r) if parse_resolution(r).is_ok() => { cfg.replica_resolution = r.trim().to_ascii_lowercase(); true }
+                _ => false,
+            },
+            "replica_backing_scale" => match val.as_f64() {
+                Some(f) if f > 0.0 && f <= 4.0 => { cfg.replica_backing_scale = f; true }
+                _ => false,
+            },
             "idle_secs" => match val.as_u64() { Some(n) => { cfg.idle_secs = n; true } None => false },
             "cap_mbps" => match val.as_f64() { Some(f) if f > 0.0 => { cfg.cap_mbps = f; true } _ => false },
             "cache_root" => set_str(&mut cfg.cache_root, val),
@@ -272,6 +331,8 @@ pub fn live_view(cfg: &Config) -> serde_json::Value {
         "blender_path": cfg.blender_path,
         "blender_args": cfg.blender_args,
         "kiosk": cfg.kiosk,
+        "replica_resolution": cfg.replica_resolution,
+        "replica_backing_scale": cfg.replica_backing_scale,
         "idle_secs": cfg.idle_secs,
         "cap_mbps": cfg.cap_mbps,
         "path_mappings": cfg.path_mappings,

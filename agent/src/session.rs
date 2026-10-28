@@ -39,7 +39,10 @@ pub const DEFAULT_MTU: u16 = crate::DEFAULT_MAX_UDP_PAYLOAD;
 
 /// What the lifecycle wants to know about the peer.
 pub trait PeerObserver: Send + Sync {
-    fn peer_up(&self, fingerprint: Option<String>);
+    /// `addr`: the peer's remote address as this end sees it ("ip:port"),
+    /// so the replica can call the host's viewer (QCView) without any
+    /// address being typed (2026-10-28).
+    fn peer_up(&self, fingerprint: Option<String>, addr: Option<String>);
     fn peer_down(&self, reason: String);
     /// Replica: the host said goodbye (sniffed from the control lane).
     fn goodbye(&self);
@@ -111,7 +114,7 @@ impl Ctx {
 /// Between roles: nothing to tell.
 pub struct NoObserver;
 impl PeerObserver for NoObserver {
-    fn peer_up(&self, _fp: Option<String>) {}
+    fn peer_up(&self, _fp: Option<String>, _addr: Option<String>) {}
     fn peer_down(&self, _reason: String) {}
     fn goodbye(&self) {}
 }
@@ -348,7 +351,7 @@ pub async fn serve_one(ctx: Arc<Ctx>, endpoint: &quinn::Endpoint) -> Result<()> 
         }
     }
 
-    ctx.observer().peer_up(None);
+    ctx.observer().peer_up(None, Some(conn.remote_address().to_string()));
     let lanes = Lanes {
         control_send,
         control_recv,
@@ -458,7 +461,7 @@ pub async fn connect_one(ctx: Arc<Ctx>, target: &HostTarget) -> Result<()> {
             return Err(e);
         }
     };
-    ctx.observer().peer_up(fingerprint);
+    ctx.observer().peer_up(fingerprint, Some(conn.remote_address().to_string()));
     let r = run_lanes(ctx.clone(), conn, lanes).await;
     ctx.observer().peer_down(r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());
     r

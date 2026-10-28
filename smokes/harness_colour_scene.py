@@ -12,9 +12,30 @@ import os
 import bpy
 
 
+def set_working_space(name: str) -> str:
+    """The file's Working Space (Blender 5.2, `wm.set_working_color_space`):
+    the harness runs on Linear Rec.709 and, with QCB_HARNESS_WORKING, on
+    another working space the config defines (Linear Rec.2020, ACEScg) —
+    the case that shipped Rec.2020 pixels through the Rec.709 matrix on
+    2026-10-27. Returns what Blender reports afterwards."""
+    if not name:
+        return ""
+    try:
+        bpy.ops.wm.set_working_color_space(working_space=name, convert_colors=False)
+    except Exception as exc:  # noqa: BLE001
+        print("harness: set_working_color_space failed:", exc, flush=True)
+    try:
+        return str(bpy.data.colorspace.working_space)
+    except Exception:
+        return ""
+
+
 def build_scene(scene):
     engine = os.environ.get("QCB_SMOKE_ENGINE", "CYCLES")
     scene.render.engine = engine
+    ws = set_working_space(os.environ.get("QCB_HARNESS_WORKING", ""))
+    if ws:
+        print("harness: working space", ws, flush=True)
     scene.render.resolution_x, scene.render.resolution_y = 1920, 1080
     if engine == "CYCLES":
         # Converged and denoised at both ends: the comparison is of colour,

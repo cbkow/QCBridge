@@ -99,7 +99,7 @@ probe = {}
 if url:
     try:
         out = subprocess.run(["ffprobe", "-v", "error", "-rw_timeout", "15000000",
-                              "-probesize", "300000", "-analyzeduration", "1000000", "-select_streams", "v:0",
+                              "-fpsprobesize", "0", "-probesize", "300000", "-analyzeduration", "1000000", "-select_streams", "v:0",
                               "-show_entries", "stream=codec_name,profile,pix_fmt,width,height,color_transfer,color_primaries,color_space",
                               "-of", "json", url], capture_output=True, text=True, timeout=45)
         probe = (json.loads(out.stdout or "{}").get("streams") or [{}])[0]
@@ -140,7 +140,7 @@ checks["helper_argv_has_matrix"] = "--matrix" in argv and argv[argv.index("--mat
 # still take a viewer after sitting idle past the old 10 s listen timeout.
 def srt_caller_ok(secs):
     try:
-        subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-probesize", "300000",
+        subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-fpsprobesize", "0", "-probesize", "300000",
                         "-analyzeduration", "1000000", "-i", url, "-frames:v", "1", "-f", "null", "-"],
                        timeout=secs, check=True, capture_output=True)
         return True
@@ -149,7 +149,7 @@ def srt_caller_ok(secs):
 ffmpeg = "ffmpeg"   # on PATH, as the probe's ffprobe
 rejoin = False
 if url and ffmpeg:
-    reader = subprocess.Popen([ffmpeg, "-hide_banner", "-loglevel", "error", "-probesize", "300000",
+    reader = subprocess.Popen([ffmpeg, "-hide_banner", "-loglevel", "error", "-fpsprobesize", "0", "-probesize", "300000",
                                "-analyzeduration", "1000000", "-i", url, "-t", "3", "-f", "null", "-"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(3.0)
@@ -164,10 +164,23 @@ if url and ffmpeg:
     checks["viewer_rejoin"] = rejoin
     time.sleep(16.0)   # idle past the old listen timeout
     checks["listener_survives_idle"] = srt_caller_ok(20)
-verdict = {"pass": all(checks.values()), "checks": checks, "readback": rb, "probe": probe,
+    # A viewer must get a picture within seconds of asking (2026-10-28: an
+    # idle stream used to leave the muxer in its input probe for a minute,
+    # and callers with "Input/output error").
+    # A real viewer retries (QCView: 250 ms → 3 s backoff); the gate is the
+    # time until a retrying caller has a frame, not one attempt's luck.
+    t_join = time.time()
+    numbers_join = None
+    while time.time() - t_join < 8.0:
+        if srt_caller_ok(6):
+            numbers_join = round(time.time() - t_join, 2)
+            break
+        time.sleep(0.5)
+    checks["viewer_connects_fast"] = numbers_join is not None and numbers_join < 5.0
+verdict = {"pass": all(checks.values()), "checks": checks, "readback": rb, "probe": probe, "join_s": numbers_join,
            "pixel": r.get("pixel"), "ffmpeg": r.get("ffmpeg"), "deep_link": deep}
 json.dump(verdict, open(f"{S}/verdict.json", "w"), indent=1)
-print(json.dumps({"pass": verdict["pass"], "checks": checks, "readback": rb, "probe": probe, "pixel": r.get("pixel")}, indent=1))
+print(json.dumps({"pass": verdict["pass"], "checks": checks, "readback": rb, "probe": probe, "pixel": r.get("pixel"), "join_s": numbers_join}, indent=1))
 sys.exit(0 if verdict["pass"] else 1)
 '@
 $pyfile = Join-Path $Scratch "poll.py"

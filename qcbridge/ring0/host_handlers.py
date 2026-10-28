@@ -22,7 +22,7 @@ from bpy.app.handlers import persistent
 import idprop
 import mathutils
 
-from ..ring1 import protocol
+from ..ring1 import protocol, timeline
 from ..ring1.classifier import DEBOUNCE_S, Debouncer, classify_update
 from ..ring1.dirtyset import DirtySet, Tier
 from ..ring1.fastlog import FastLog
@@ -455,12 +455,16 @@ class HostSync:
 
     # ── flush timer (main thread) ────────────────────────────────────────────
 
-    def send_bootstrap(self) -> None:
+    def send_bootstrap(self, reason: str = "") -> None:
         """Queue the full mainfile for the wire (tier 3 — session bootstrap
         and force-resync). Chunks drain through flush_tick under
         backpressure; explicit, so it proceeds even while paused."""
+        t_ser = time.monotonic()
         data = bootstrap.serialize_mainfile(compress=self._blend_compress())
         self.last_bootstrap_bytes = len(data)
+        timeline.mark("boot.queued", n=self.sent_boot, bytes=len(data), reason=reason,
+                      serialize_s=time.monotonic() - t_ser, seq=self.seq + 1,
+                      libraries=len(bpy.data.libraries))
         meta = {
             "uuid": "__mainfile__",
             "name": bpy.path.basename(bpy.data.filepath) or "untitled",
@@ -523,6 +527,7 @@ class HostSync:
                 self._boot_outbox.pop(0)
                 if not self._boot_outbox:
                     self._boot_last_seq = header["seq"]
+                    timeline.mark("boot.sent", seq=header["seq"], n=self.sent_boot - 1)
                     self._uuid_cold_seq.clear()  # the file supersedes every blob
                     self.bake_note = ""  # the full file carries every baked cache
                     self.t2_unsupported = 0  # ditto anything we couldn't resend
@@ -864,6 +869,7 @@ class HostSync:
         window = self.fastlog.window_since(int(gap_at or 0))
         self._fast_resend_queue.extend(window)
         self._fast_resend_end = True
+        timeline.mark("fast.resent", gap_at=gap_at, n=len(window))
         self.fast_resyncs += 1
         if _DEBUG:
             print(f"qcb fast re-assert from {gap_at}: {len(window)} datablocks", flush=True)
@@ -932,6 +938,12 @@ class HostSync:
     def delta_state(self, status: dict) -> str:
         """"ready" (the replica's inventory is in hand and its Scene matches
         ours), "pending" (asked for it), "mismatch" (bootstrap)."""
+        out = self._delta_state(status)
+        timeline.mark_changed("delta.state", state=out, replica_scene=str(status.get("scene_digest"))[:8],
+                              host_scene=str(self.scene_digest_now())[:8])
+        return out
+
+    def _delta_state(self, status: dict) -> str:
         if not status.get("scene_digest") or status.get("scene_digest") != self.scene_digest_now():
             return "mismatch"
         held_digest = status.get("held_digest")
@@ -985,6 +997,8 @@ class HostSync:
         self._delta_end_pending = True
         self._manifest = None  # stale once we start changing what it holds
         self.delta_resyncs += 1
+        timeline.mark("delta.sent", tombs=len(plan.tombs), resend=len(plan.resend),
+                      verify=len(plan.verify), reasserts=len(self._delta_tail))
         if _DEBUG:
             print(f"qcb delta resync: {len(plan.tombs)} tombs, {len(plan.resend)} resend, "
                   f"{len(plan.verify)} verify, {len(self._delta_tail)} re-asserts", flush=True)
@@ -1739,6 +1753,20 @@ def _load_post_handler(_filepath):
         if _DEBUG:
             print(f"qcb load_post → reset + bootstrap ({bpy.data.filepath})", flush=True)
         _sync.reset_for_new_file()
+    # The file may have switched Blender's Working Space (a derived OCIO
+    # config): re-read now so the panel, the hello and the card say so
+    # before the next 1 s tick (2026-10-28).
+    try:
+        from . import colour_state, session
+        changed = colour_state.refresh(session.state.get("role") or "HOST")
+        if changed:
+            session._recompute_mismatches()
+        timeline.mark("host.file_loaded", file=bpy.path.basename(bpy.data.filepath) or "untitled",
+                      ws=((session.state.get("cm") or {}).get("working") or {}).get("name"),
+                      ws_source=((session.state.get("cm") or {}).get("working") or {}).get("source"),
+                      cm_changed=changed)
+    except Exception as exc:  # never let a colour read cost the load
+        timeline.mark("host.file_loaded", error=repr(exc)[:120])
 
 
 def _flush_timer():

@@ -1215,6 +1215,7 @@ fn ring_loop(opts: &Opts, shared: Arc<Shared>) -> Result<()> {
     let mut conv: Option<Converter> = None;
     let mut enc_tx: Option<std::sync::mpsc::SyncSender<Frame>> = None;
     let mut session = (0u32, 0u32);
+    let mut session_at = Instant::now();   // keyframes at the idle floor for the first seconds of a session
 
     let interval = Duration::from_secs_f64(1.0 / opts.fps.max(1) as f64);
     // An idle producer (Cycles converged, host static) yields nothing, and a
@@ -1222,7 +1223,10 @@ fn ring_loop(opts: &Opts, shared: Arc<Shared>) -> Result<()> {
     // probe for ever (found 2026-09-23 with QCView). Re-send the last frame
     // a few times a second when nothing changed — an unchanged P-frame is
     // a few hundred bytes — so the stream never goes silent.
-    let idle_floor = Duration::from_secs_f64(1.0 / (opts.fps.max(1) as f64 / 8.0).clamp(2.0, 10.0));
+    // 10 Hz at 30 fps (was fps/8): a joining viewer's demuxer wants ~20 frames
+    // before it opens (ffmpeg's rate probe on HEVC), so an idle stream at
+    // 3.75 Hz cost it 5 s; a tiny P-frame ten times a second costs nothing.
+    let idle_floor = Duration::from_secs_f64(1.0 / (opts.fps.max(1) as f64 / 3.0).clamp(5.0, 10.0));
     let t0 = Instant::now();
     let mut last_sent = Instant::now() - interval;
     let mut last_alive = Instant::now();
@@ -1241,7 +1245,6 @@ fn ring_loop(opts: &Opts, shared: Arc<Shared>) -> Result<()> {
                 std::thread::sleep(Duration::from_micros(500)); // pace: the newest frame wins when we wake
                 continue;
             }
-            last_latest = latest;
             let slot = (latest & 0xFF) as usize;
             if slot < ring.slot_count {
                 ring.claim(slot);
@@ -1251,14 +1254,31 @@ fn ring_loop(opts: &Opts, shared: Arc<Shared>) -> Result<()> {
                 let bpr = ring.desc_u32(slot, DESC_BPR) as usize;
                 let pf = ring.desc_u32(slot, DESC_PF);
                 if seq_before & 1 == 1 {
+                    // Writer inside: come back for THIS frame (the cursor
+                    // stays). Advancing it lost a still scene's only new
+                    // frame and the idle re-send kept the previous picture
+                    // at its previous size (found 2026-10-28, Shot Mode).
                     ring.release();
-                    shared.stats.stale.fetch_add(1, Relaxed); // writer inside
+                    shared.stats.stale.fetch_add(1, Relaxed);
+                    std::thread::sleep(Duration::from_micros(500));
+                    continue;
                 } else if pf != PF_RGBA32F || w < 16 || h < 16 || w % 2 != 0 || h % 2 != 0 || bpr * h as usize > ring.pixels_capacity {
                     ring.release();
+                    last_latest = latest;
                     log(format!("bad frame desc {w}x{h} bpr={bpr} pf={pf}"));
                 } else {
                     shared.stats.frames_in.fetch_add(1, Relaxed);
                     if session != (w, h) {
+                        if session != (0, 0) {
+                            // A new frame size mid-stream: exit for a respawn (8).
+                            // The mux (ffmpeg -c copy) keeps the stream parameters
+                            // it saw at open, so a viewer joining after a size
+                            // change was told the OLD size while the frames were
+                            // the new one (found 2026-10-28, Shot Mode).
+                            log(format!("frame size {}x{} -> {w}x{h}: exiting for a respawn", session.0, session.1));
+                            ring.release();
+                            std::process::exit(8);
+                        }
                         // A new size: a converter and an encoder session for it.
                         // The old encoder thread ends when its channel closes.
                         conv = Some(Converter::new(&gpu, w, h, opts.cpu, opts.matrix)?);
@@ -1277,6 +1297,7 @@ fn ring_loop(opts: &Opts, shared: Arc<Shared>) -> Result<()> {
                             .expect("encode thread");
                         enc_tx = Some(tx);
                         session = (w, h);
+                        session_at = Instant::now();
                         shared.force_key.store(true, Relaxed);
                         last_tex = None;
                     }
@@ -1286,11 +1307,13 @@ fn ring_loop(opts: &Opts, shared: Arc<Shared>) -> Result<()> {
                     let seq_after = ring.seqlock(slot);
                     ring.release();
                     match r {
-                        Ok(tex) if seq_after == seq_before => fresh = Some(tex),
+                        Ok(tex) if seq_after == seq_before => { last_latest = latest; fresh = Some(tex) }
                         Ok(_) => {
-                            shared.stats.stale.fetch_add(1, Relaxed); // overwritten mid-copy: drop
+                            shared.stats.stale.fetch_add(1, Relaxed); // overwritten mid-copy: retry this frame
+                            std::thread::sleep(Duration::from_micros(500));
+                            continue;
                         }
-                        Err(e) => log(format!("convert: {e}")),
+                        Err(e) => { last_latest = latest; log(format!("convert: {e}")) }
                     }
                 }
             }
@@ -1304,8 +1327,12 @@ fn ring_loop(opts: &Opts, shared: Arc<Shared>) -> Result<()> {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        let want_key = shared.force_key.swap(false, Relaxed);
         let idle_resend = last_sent.elapsed() >= idle_floor;
+        // The first seconds of a session: idle re-sends are KEYframes, so the
+        // mux's probe and a joining viewer's probe complete on the first
+        // packets instead of waiting for bytes that never come (2026-10-28).
+        let startup_keys = idle_resend && session_at.elapsed() < Duration::from_secs(3);
+        let want_key = shared.force_key.swap(false, Relaxed) || startup_keys;
         let tex = match fresh.or_else(|| if want_key || idle_resend { last_tex.clone() } else { None }) {
             Some(t) => t,
             None => {

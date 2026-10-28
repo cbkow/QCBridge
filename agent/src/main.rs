@@ -39,6 +39,7 @@ qcbridge-agent [--config PATH] [--no-tray] [--role host|replica] [--listen IP:PO
 struct HostObserver {
     status: Arc<Mutex<String>>,
     fingerprint: Mutex<Option<String>>,
+    peer_addr: Mutex<Option<String>>,
     up: AtomicBool,
     link: Arc<Link>,
     cfg_path: std::path::PathBuf,
@@ -47,9 +48,10 @@ struct HostObserver {
 }
 
 impl PeerObserver for HostObserver {
-    fn peer_up(&self, fp: Option<String>) {
+    fn peer_up(&self, fp: Option<String>, addr: Option<String>) {
         self.up.store(true, Relaxed);
         *self.fingerprint.lock().unwrap() = fp.clone();
+        *self.peer_addr.lock().unwrap() = addr.clone();
         *self.status.lock().unwrap() = "replica connected".into();
         let mut pinned = false;
         if let Some(fp) = &fp {
@@ -73,7 +75,7 @@ impl PeerObserver for HostObserver {
                 log!("[agent] pinned replica certificate {fp}");
             }
         }
-        self.link.event_try(json!({"event": "peer", "peer": 0, "up": true, "fingerprint": fp, "pinned": !pinned}));
+        self.link.event_try(json!({"event": "peer", "peer": 0, "up": true, "fingerprint": fp, "pinned": !pinned, "addr": addr}));
     }
     fn peer_down(&self, reason: String) {
         self.up.store(false, Relaxed);
@@ -145,7 +147,7 @@ fn start_role(agent: &Agent) -> Result<RoleRuntime> {
     let mut rt = RoleRuntime::default();
     let observer: Arc<dyn PeerObserver> = if role_host {
         let h = Arc::new(HostObserver {
-            status: agent.status.clone(), fingerprint: Mutex::new(None), up: AtomicBool::new(false),
+            status: agent.status.clone(), fingerprint: Mutex::new(None), peer_addr: Mutex::new(None), up: AtomicBool::new(false),
             link: agent.link.clone(), cfg_path: agent.cfg_path.clone(), cfg: agent.cfg.clone(),
             control: agent.host_control.clone(),
         });
@@ -309,8 +311,15 @@ fn attach_reply(agent: &Agent) -> Value {
         // threw them away; now there is a reason to keep them.
         "config": agent.cfg.with(config::live_view),
     });
-    if let Some(h) = &agent.role.lock().unwrap().host_obs {
-        v["peer_fingerprint"] = json!(h.fingerprint.lock().unwrap().clone());
+    {
+        let role = agent.role.lock().unwrap();
+        if let Some(h) = &role.host_obs {
+            v["peer_fingerprint"] = json!(h.fingerprint.lock().unwrap().clone());
+            v["peer_addr"] = json!(h.peer_addr.lock().unwrap().clone());
+        }
+        if let Some(l) = &role.lifecycle {
+            v["peer_addr"] = json!(l.peer_addr.lock().unwrap().clone());
+        }
     }
     v
 }

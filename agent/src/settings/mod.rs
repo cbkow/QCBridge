@@ -83,6 +83,7 @@ struct Draft {
     role: String,
     blender_path: String,
     kiosk: bool,
+    replica_resolution: String,
     idle_secs: String,
     discovery: String,
     phonebook: String,
@@ -186,6 +187,7 @@ impl App {
         d.role = s("role");
         d.blender_path = s("blender_path");
         d.kiosk = cfg.get("kiosk").and_then(Value::as_bool).unwrap_or(false);
+        d.replica_resolution = s("replica_resolution");
         d.idle_secs = cfg.get("idle_secs").and_then(Value::as_u64).map(|n| n.to_string()).unwrap_or_default();
         d.discovery = s("discovery");
         d.phonebook = s("phonebook");
@@ -366,10 +368,36 @@ impl App {
                 ui.end_row();
 
                 ui.label("Kiosk");
-                if ui.checkbox(&mut self.draft.kiosk, "Full-screen viewport, no UI, when launched for a sender").changed() {
+                if ui.checkbox(&mut self.draft.kiosk, "Viewport only, no UI, when launched for a sender").changed() {
                     let v = self.draft.kiosk;
                     self.send(json!({"kiosk": v}));
                 }
+                ui.end_row();
+
+                ui.label("Resolution");
+                ui.vertical(|ui| {
+                    let before = self.draft.replica_resolution.clone();
+                    ui.horizontal(|ui| {
+                        for preset in crate::config::RESOLUTION_PRESETS {
+                            ui.radio_value(&mut self.draft.replica_resolution, preset.to_string(), *preset);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("custom");
+                        let resp = ui.add(egui::TextEdit::singleline(&mut self.draft.replica_resolution).desired_width(90.0));
+                        if resp.lost_focus() && self.draft.replica_resolution != before
+                            && crate::config::parse_resolution(&self.draft.replica_resolution).is_ok() {
+                            let v = self.draft.replica_resolution.clone();
+                            self.send(json!({"replica_resolution": v}));
+                        }
+                    });
+                    if self.draft.replica_resolution != before
+                        && crate::config::RESOLUTION_PRESETS.contains(&self.draft.replica_resolution.as_str()) {
+                        let v = self.draft.replica_resolution.clone();
+                        self.send(json!({"replica_resolution": v}));
+                    }
+                    ui.label("The Blender window the sender's session opens = the stream's resolution; fullscreen is the old behaviour");
+                });
                 ui.end_row();
 
                 ui.label("Close Blender after");

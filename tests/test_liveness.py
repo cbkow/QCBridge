@@ -101,3 +101,19 @@ def test_decide_delta_when_the_replica_can_take_one():
     assert p.decide(st, 0.0, caps, None, "mismatch") == "full"
     p = ResyncPolicy(min_interval=10.0)
     assert p.decide(st, 0.0, ("fast_ack",), None, "ready") == "full"
+
+
+def test_delta_that_plans_nothing_is_rate_limited_like_a_full_bootstrap():
+    """2026-10-28: a persistent structure difference used to re-ship the
+    file at the 1 s fast cadence through the delta fallback."""
+    caps = ("fast_ack", "delta_resync")
+    st = {"want_resync": True, "gap_lane": "cold", "bootstraps": 1, "resyncs": 0}
+    p = ResyncPolicy(min_interval=10.0)
+    assert p.decide(st, 0.0, caps, None, "ready") == "delta"
+    assert p.allow_full(0.0) is True            # the first fallback goes
+    st2 = dict(st, bootstraps=2)
+    assert p.decide(st2, 1.5, caps, None, "ready") == "delta"
+    assert p.allow_full(1.5) is False           # too soon: un-served, asked again next tick
+    assert p.decide(st2, 2.6, caps, None, "ready") == "delta"   # asked again once the 1 s fast interval passed
+    assert p.allow_full(10.5) is True
+    assert p.sent == 2

@@ -24,6 +24,11 @@ import time
 from pathlib import Path
 
 try:
+    from ..ring1 import timeline
+except ImportError:  # the tests load this file as ring0.pixel_path (qcbridge/ on sys.path)
+    from ring1 import timeline  # type: ignore
+
+try:
     from ..ring1.stream_params import StreamParams
 except ImportError:  # file-imported by tests with qcbridge/ on sys.path
     from ring1.stream_params import StreamParams
@@ -68,16 +73,25 @@ def find_encode_helper() -> str | None:
     addon = here.parents[1]          # qcbridge/
     repo = here.parents[2]
     explicit = os.environ.get("QCB_PIXEL_HELPER", "")
-    for cand in [explicit, str(addon / "bin" / _HELPER_EXE)] + installed_helper_paths():
+    for cand in [explicit, str(addon / "bin" / _HELPER_EXE)]:
         if cand and os.path.isfile(cand):
             return cand
+    # A checkout: the freshest cargo/swiftc output BEFORE the installed app
+    # (the same rule as transport_agent.find_agent, 2026-10-28: with the
+    # PKG installed, the smoke ran the shipped helper while every edit went
+    # into target/). An installed extension has no target/ beside it.
     builds = [
         str(repo / "agent" / "target" / prof / _HELPER_EXE) for prof in ("release", "debug")
     ] + [
         str(repo / "agent" / "encode-win" / "target" / prof / _HELPER_EXE) for prof in ("release", "debug")
     ]
     builds = [b for b in builds if os.path.isfile(b)]
-    return max(builds, key=os.path.getmtime) if builds else None
+    if builds:
+        return max(builds, key=os.path.getmtime)
+    for cand in installed_helper_paths():
+        if os.path.isfile(cand):
+            return cand
+    return None
 
 
 def _with_passphrase(url: str, passphrase: str) -> str:
@@ -92,10 +106,20 @@ def build_mux(ffmpeg: str, fps: int, srt_url: str, passphrase: str) -> list[str]
     The helper gets a keyframe request on spawn, so VPS/SPS/PPS lead its
     input and a tiny probe is enough; without that, ffmpeg's default 5 MB
     probe on a raw HEVC pipe kept a joining viewer waiting long enough to
-    give up (found 2026-09-23 on Windows)."""
+    give up (found 2026-09-23 on Windows).
+
+    The probe is what decides when the OUTPUT opens (the listener, or the
+    call to QCView): ffmpeg reads input until `probesize` bytes, 20 frames
+    or `analyzeduration` have gone by — and `-analyzeduration 0` means the
+    5 s default, not zero (read in demux.c, 2026-10-28). On an idle stream
+    (one small keyframe, tiny P-frames) the old 64 KB probe took over a
+    minute; the viewer got "Input/output error" until then. Now: 32 bytes
+    (the minimum), 1 µs, no frame-rate probing, and wallclock timestamps so
+    the viewer's own probe can measure a second of stream."""
     return [
         ffmpeg, "-hide_banner", "-loglevel", "warning",
-        "-fflags", "nobuffer", "-probesize", "65536", "-analyzeduration", "0",
+        "-fflags", "nobuffer", "-probesize", "32", "-analyzeduration", "1", "-fpsprobesize", "0",
+        "-use_wallclock_as_timestamps", "1",
         "-f", "hevc", "-framerate", str(fps), "-i", "pipe:0",
         "-c", "copy", "-bsf:v", _WIRE_BSF, "-fps_mode", "passthrough", "-flush_packets", "1",
         "-f", "mpegts", _with_passphrase(srt_url, passphrase),
@@ -233,6 +257,7 @@ def _supervise_native(cap_cmd_fn, mux_cmd: list[str], log_path: Path) -> None:
         cap_cmd = cap_cmd_fn()
         if not cap_cmd:
             _status = "waiting for the frame ring"
+            timeline.mark_changed("pixel.status", status=_status)
             _stop.wait(_RESTART_BACKOFF / 4)
             continue
         if outdated["strip_matrix"] and "--matrix" in cap_cmd:
@@ -240,6 +265,7 @@ def _supervise_native(cap_cmd_fn, mux_cmd: list[str], log_path: Path) -> None:
             cap_cmd = cap_cmd[:i] + cap_cmd[i + 2:]
         spawned_at = time.monotonic()
         _last_argv = list(cap_cmd)
+        timeline.mark("pixel.spawn", helper=os.path.basename(cap_cmd[0]), ring=_ring_name)
         with open(log_path, "ab") as log:
             log.write(f"\n--- spawn (readback) {time.ctime()} ---\n".encode())
             log.flush()
@@ -252,6 +278,7 @@ def _supervise_native(cap_cmd_fn, mux_cmd: list[str], log_path: Path) -> None:
                 )
             except OSError as exc:
                 _status = f"encoder spawn failed: {exc}"
+                timeline.mark("pixel.spawn_failed", exc=str(exc)[:160])
                 if _cap_proc is not None and _cap_proc.poll() is None:
                     _cap_proc.kill()
                 return
@@ -293,11 +320,16 @@ def _supervise_native(cap_cmd_fn, mux_cmd: list[str], log_path: Path) -> None:
             _status = "encoder helper outdated — rebuild (wire assumes Linear Rec.709)"
             continue
         _status = f"stream ended (mux {_proc.returncode}, encoder {_cap_proc.returncode}) — restarting"
+        timeline.mark("pixel.ended", mux=_proc.returncode, encoder=_cap_proc.returncode,
+                      mux_first=mux_exited_first, up_s=time.monotonic() - spawned_at,
+                      why=("ring retired" if _cap_proc.returncode == 7 else
+                           "frame size changed" if _cap_proc.returncode == 8 else ""))
         # The mux leaving on its own — a viewer gone, or the listen timed out
         # with nobody there — is the normal case: relisten at once, no gap
         # for the next viewer to fall into. The backoff is for the helper
         # dying (a crash loop would otherwise spin).
-        if _cap_proc.returncode is not None and _cap_proc.returncode != 0 and mux_exited_first is False:
+        if (_cap_proc.returncode is not None and _cap_proc.returncode not in (0, 7, 8)
+                and mux_exited_first is False):
             _stop.wait(_RESTART_BACKOFF / 4)
     _status = "off"
 
@@ -311,6 +343,7 @@ def restart_ring(ring_name: str) -> None:
     exiting (7); its respawn reads the new name."""
     global _ring_name
     _ring_name = ring_name
+    timeline.mark("ring.retire", ring=ring_name)
     child = _cap_proc
     if child is not None and child.poll() is None:
         try:

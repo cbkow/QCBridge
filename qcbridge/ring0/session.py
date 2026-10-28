@@ -13,11 +13,11 @@ import uuid as _uuid
 
 import bpy
 
-from ..ring1 import liveness, pathmap, protocol, toolbox
+from ..ring1 import liveness, pathmap, protocol, timeline, toolbox
 from ..ring1.stream_params import StreamParams
 from ..ring1.transport import TransportConfig
 from ..ring1 import colour_state as _cs
-from . import colour_state, engine_qcb, host_handlers, host_hot, kiosk, overlay, pixel_path, replica_apply
+from . import colour_state, engine_qcb, host_handlers, host_hot, kiosk, overlay, pixel_path, replica_apply, viewer_card
 
 
 
@@ -53,7 +53,7 @@ def _agent_cert_dir() -> str:
     """Stable across sessions, or the host's pinned fingerprint would break."""
     return os.path.join(bpy.utils.user_resource("CONFIG"), "qcbridge-cert")
 
-_HANDSHAKE_TIMEOUT = 3.0
+_HANDSHAKE_TIMEOUT = 8.0   # a replica still loading a file answers late; 3 s made a second hello (2026-10-28)
 _HANDSHAKE_RETRY = 2.0
 
 
@@ -89,6 +89,9 @@ state = {
     "ffmpeg_note": "",     # which resolution rung provided ffmpeg (replica)
     "peer_stream": {},     # host: the replica's stream descriptor from hello
     "shot_mode": False,    # host: replica holds the fitted camera frame
+    "viewer": {}, "viewer_addr": "", "viewer_pending": False,   # replica: the host's viewer (QCView) to call
+    "viewer_card_path": "", "viewer_card_digest": "", "viewer_card_error": "",   # host: QCView's card
+    "stream_info": None,   # replica: the live stream descriptor (hello_reply + pong)
     "peer_addon": None,    # peer's addon version ("" = pre-0.1.5 peer)
     # Colour awareness (2026-10-27, DESIGN-NOTES pixels colour state): this
     # end's block, the peer's, and what they say about each other.
@@ -102,6 +105,22 @@ def _recompute_mismatches() -> None:
     host_cm = state.get("cm") if state.get("role") == "HOST" else state.get("peer_cm")
     rep_cm = state.get("peer_cm") if state.get("role") == "HOST" else state.get("cm")
     state["cm_mismatches"] = _cs.mismatches(host_cm, rep_cm)
+    timeline.mark_changed("cm.mismatches", n=len(state["cm_mismatches"]),
+                          keys=[m[1] for m in state["cm_mismatches"]])
+
+
+def _timeline_path(role: str) -> str:
+    """Blender's config dir (user_resource CONFIG): survives reinstalls, is
+    where qcbridge_settings.json already lives; one file per role."""
+    try:
+        d = bpy.utils.user_resource("CONFIG", create=True)
+    except Exception:
+        return ""
+    return os.path.join(d, f"qcbridge-timeline-{(role or 'session').lower()}.log")
+
+
+def timeline_tail(n: int = 40) -> list[str]:
+    return timeline.tail(n)
 
 
 def colour_rows() -> list[tuple[str, str, str]]:
@@ -179,7 +198,12 @@ def _start_agent_if_needed(prefs) -> None:
 def start(prefs) -> str:
     if running():
         return "already running"
+    timeline.begin(str(getattr(prefs, "role", "")), _timeline_path(str(getattr(prefs, "role", ""))),
+                   addon=_addon_version(), blender=bpy.app.version_string,
+                   transport=os.environ.get("QCB_TRANSPORT", "agent") or "agent",
+                   file=bpy.path.basename(bpy.data.filepath) or "untitled")
     _start_agent_if_needed(prefs)
+    timeline.mark("agent.ready", role=str(getattr(prefs, "role", "")))
     state["epoch"] = _uuid.uuid4().hex
     state["paused"] = False
     state["peer_epoch"] = None
@@ -220,7 +244,12 @@ def stop() -> None:
     pixel_path.stop()
     if transport is not None:
         transport.stop()
+    if state.get("viewer_card_path"):
+        viewer_card.remove()
+        timeline.mark("card.removed")
     state.update(
+        viewer_card_path="", viewer_card_digest="", viewer_card_error="",
+        viewer={}, viewer_addr="", viewer_pending=False, stream_info=None,
         role=None, transport=None, peer_epoch=None, note="", sync=None,
         prefs=None, ffmpeg_note="", peer_stream={}, shot_mode=False,
         peer_addon=None, cm={}, peer_cm={}, cm_mismatches=[],
@@ -343,9 +372,11 @@ def _start_host(prefs) -> None:
                 mappings=pathmap.rows_to_wire(mappings),
                 shared_root=_shared_root_card(transport),
                 cm=state.get("cm"),
+                viewer=_viewer_block(prefs),
             )
             pending["req"] = transport.request_nowait(hello)
             pending["sent_at"] = now
+            timeline.mark("handshake.sent", seq=hello.get("seq"), epoch=str(state["epoch"])[:8])
             return 0.25
         reply = transport.poll_reply(pending["req"])
         if reply is not None:
@@ -358,12 +389,16 @@ def _start_host(prefs) -> None:
                 state["peer_cm"] = reply.get("cm") or {}
                 _recompute_mismatches()
                 state["note"] = "connected"
+                timeline.mark("handshake.ok", peer_addon=state["peer_addon"], caps=list(state["peer_caps"]),
+                              stream=(state["peer_stream"] or {}).get("source"),
+                              port=(state["peer_stream"] or {}).get("port"))
                 state["resync_policy"].reset()
                 # Fresh handshake = fresh epoch pairing → full bootstrap
                 # (decision #16). Transport blips re-handshake too, with a
                 # fresh host epoch, because frames sent into the outage are
                 # gone (DESIGN-NOTES sync A6) and the replica may be a new process.
-                state["sync"].send_bootstrap()
+                state["sync"].send_bootstrap("handshake")
+                viewer_card_refresh()
                 # Re-assert host-owned replica state a fresh session lost.
                 transport.request_nowait(
                     {"kind": "shot", "on": state["shot_mode"]}
@@ -372,12 +407,14 @@ def _start_host(prefs) -> None:
                 pending["armed"] = False
                 return None
             state["note"] = f"denied: {reply.get('reason', '')}"
+            timeline.mark("handshake.denied", reason=reply.get("reason", ""))
             pending["req"] = None
             return _HANDSHAKE_RETRY  # denials can be fixed live
         if now - pending["sent_at"] > _HANDSHAKE_TIMEOUT:
             transport.cancel_request(pending["req"])
             pending["req"] = None
             state["note"] = address_error or "replica unreachable — retrying"
+            timeline.mark("handshake.timeout")
             return _HANDSHAKE_RETRY
         return 0.25
 
@@ -433,10 +470,27 @@ def _start_host(prefs) -> None:
                 _recompute_mismatches()
                 if not pending["armed"] and "cm" in (state.get("peer_caps") or ()):
                     transport.request_nowait({"kind": "cm", "cm": state["cm"]})
+            if not pending["armed"]:
+                viewer_card_refresh()
         peer_cm = status.get("cm")
         if isinstance(peer_cm, dict) and peer_cm.get("digest") and peer_cm.get("digest") != (state.get("peer_cm") or {}).get("digest"):
             state["peer_cm"] = peer_cm
             _recompute_mismatches()
+        timeline.mark_changed("peer.pixel", status=status.get("pixel"), ffmpeg=status.get("ffmpeg"))
+        peer_stream = status.get("stream")
+        if isinstance(peer_stream, dict) and peer_stream and peer_stream != state.get("peer_stream"):
+            # The replica re-described its stream (a file switched its
+            # working space → a new matrix): the link, the card and the
+            # harness follow (2026-10-28).
+            state["peer_stream"] = peer_stream
+            timeline.mark("peer.stream", working=(peer_stream.get("format") or {}).get("working", {}).get("name"),
+                          source=peer_stream.get("source"), port=peer_stream.get("port"))
+        _rb = status.get("readback") or {}
+        if _rb.get("published"):
+            timeline.mark_changed("peer.first_frame", size=_rb.get("size"), engine=_rb.get("engine"))
+        timeline.mark_changed("peer.sync", bootstraps=status.get("bootstraps"), gaps=status.get("gaps"),
+                              errors=status.get("errors"), unmapped=status.get("unmapped"),
+                              unknown=status.get("unknown"), local_edits=status.get("local_edits"))
         sync = state.get("sync")
         if sync is not None and not pending["armed"]:
             caps = state.get("peer_caps") or ()
@@ -447,6 +501,12 @@ def _start_host(prefs) -> None:
             verdict = state["resync_policy"].decide(
                 status, _time.monotonic(), caps, sync.fastlog.covers, delta_state
             )
+            if verdict != "none":
+                timeline.mark("resync.verdict", verdict=verdict, delta_state=delta_state,
+                              gap_lane=status.get("gap_lane"), gaps=status.get("gaps"),
+                              fast_gap_at=status.get("fast_gap_at"), unknown=status.get("unknown"),
+                              bootstraps=status.get("bootstraps"), resyncs=status.get("resyncs"),
+                              errors=status.get("errors"))
             if verdict == "fast":
                 # A hole on the fast lane only: re-assert the datablocks
                 # named from the hole on, no bootstrap (DESIGN-NOTES sync fast-ack).
@@ -457,13 +517,16 @@ def _start_host(prefs) -> None:
                 # file (DESIGN-NOTES sync delta-resync).
                 plan = sync.plan_from_manifest(status)
                 if plan is None:
-                    sync.send_bootstrap()
-                    state["auto_resyncs"] = state.get("auto_resyncs", 0) + 1
+                    if state["resync_policy"].allow_full(_time.monotonic()):
+                        sync.send_bootstrap("policy: delta planned nothing (scene digests differ)")
+                        state["auto_resyncs"] = state.get("auto_resyncs", 0) + 1
+                    else:
+                        timeline.mark("resync.deferred", why="delta planned nothing; full bootstrap rate-limited")
                 else:
                     sync.send_delta(plan)
                     state["delta_resyncs"] = state.get("delta_resyncs", 0) + 1
             elif verdict == "full":
-                sync.send_bootstrap()
+                sync.send_bootstrap(f"policy: full (delta_state={delta_state}, gap_lane={status.get('gap_lane')})")
                 state["auto_resyncs"] = state.get("auto_resyncs", 0) + 1
         return 0.25
 
@@ -505,16 +568,8 @@ def _start_replica(prefs) -> None:
     # which, and whether it was read from the config or assumed.
     stream_params = StreamParams.from_prefs(prefs).with_working((state.get("cm") or {}).get("working"))
     state["stream_params"] = stream_params
-    stream_info = {
-        "enabled": bool(getattr(prefs, "enable_stream", True)),
-        "port": prefs.srt_port,
-        "latency_ms": getattr(prefs, "srt_latency_ms", 120),
-        # 0.3: what is on the wire (DESIGN-NOTES pixels wire) — additive;
-        # an older host ignores it, an older replica lacks it and the host
-        # reads that as the 0.2 screen stream.
-        "source": _pixel_source(prefs),
-        **stream_params.descriptor(),
-    }
+    stream_info = _stream_descriptor(prefs, stream_params)
+    state["stream_info"] = stream_info   # mutated in place when the working space moves
 
     our_version = _addon_version()  # captured: the handler runs on IO thread
 
@@ -534,8 +589,20 @@ def _start_replica(prefs) -> None:
                 state["peer_epoch"] = msg.get("epoch")
                 state["peer_addon"] = msg.get("addon", "")
                 state["peer_cm"] = msg.get("cm") or {}
+                # Where the host's viewer listens (QCView on the host machine,
+                # 2026-10-28): the port from the hello, the address from our
+                # agent's view of the QUIC peer. The main thread re-aims the
+                # pixel path (a caller instead of a listener) on its next tick.
+                viewer = dict(msg.get("viewer") or {})
+                addr = _host_of(getattr(transport, "peer_addr", "") or "")
+                if viewer != state.get("viewer") or addr != state.get("viewer_addr"):
+                    state["viewer"] = viewer
+                    state["viewer_addr"] = addr
+                    state["viewer_pending"] = True
                 _recompute_mismatches()  # pure dict work: fine on the IO thread
                 state["note"] = "host connected"
+                timeline.mark("hello.received", host_addon=msg.get("addon", ""), seq=msg.get("seq"),
+                              mappings=len(received), new_epoch=state["peer_epoch"] == msg.get("epoch"))
             return {
                 "kind": "hello_reply", "ok": ok, "reason": reason,
                 "epoch": epoch, "stream": stream_info,
@@ -554,6 +621,7 @@ def _start_replica(prefs) -> None:
         if msg.get("kind") == "goodbye":
             replica_apply.notify_host_goodbye()  # flag only; handled on tick
             state["note"] = "host ended session"
+            timeline.mark("host.goodbye")
             return {"kind": "goodbye_ack"}
         if msg.get("kind") == "shot":
             replica_apply.set_shot_mode(bool(msg.get("on")))
@@ -573,6 +641,7 @@ def _start_replica(prefs) -> None:
     transport.set_request_handler(_handler)
     transport.set_status_provider(
         lambda: {
+            "stream": state.get("stream_info") or {},
             "seq": replica_apply.stats["seq"],
             "gaps": replica_apply.stats["gaps"],
             "errors": replica_apply.stats["apply_errors"],
@@ -614,6 +683,8 @@ def _start_replica(prefs) -> None:
     transport.start()  # agent mode: returns once attached, so the mirror is in
     state["transport"] = transport
     state["note"] = "listening"
+    timeline.mark("transport.attached", stream=stream_info.get("source") if isinstance(stream_info, dict) else None,
+                  width=stream_params.width, ring=engine_qcb.ring_name())
 
     def _cm_watch():
         if state["transport"] is not transport:
@@ -621,11 +692,29 @@ def _start_replica(prefs) -> None:
         if not replica_apply.applying():   # never read the scene mid-bootstrap
             if colour_state.refresh("REPLICA"):
                 _recompute_mismatches()
+                _follow_working(prefs)
         return 2.0
 
     bpy.app.timers.register(_cm_watch, first_interval=2.0, persistent=True)
+
+    def _viewer_watch():
+        if state["transport"] is not transport:
+            return None
+        if state.get("viewer_pending"):
+            state["viewer_pending"] = False
+            url = _replica_srt_url(prefs)
+            info = state.get("stream_info")
+            if isinstance(info, dict):
+                info["push"] = _push_block()
+            timeline.mark("viewer.aim", url=url.split("?")[0], push=_push_block())
+            if pixel_path.status() != "off" or getattr(prefs, "enable_stream", True):
+                _start_pixel_path(prefs, restart=True)
+        return 0.5
+
+    bpy.app.timers.register(_viewer_watch, first_interval=0.5, persistent=True)
     _push_paths_to_agent(prefs, transport)
     _mirror_paths_from_agent(prefs, transport)
+    _report_backing_scale(transport)
     own_rows["rows"] = _effective_mappings(prefs, transport)
     replica_apply.start(transport, own_rows["rows"])
     overlay.enable(_replica_overlay_text)
@@ -676,6 +765,12 @@ def _replica_srt_url(prefs) -> str:
     an override for unusual topologies."""
     if prefs.srt_url:
         return prefs.srt_url
+    push = _push_block()
+    if push:
+        # The host's viewer (QCView on the host machine) listens; we call it
+        # (2026-10-28). Reconnects are the supervisor's respawn: a failed
+        # call ends the mux, the pair comes back at once, the probe is cheap.
+        return f"srt://{push['addr']}:{push['port']}?mode=caller&latency={push['latency_ms'] * 1000}"
     bind = prefs.bind_address or "0.0.0.0"
     latency_us = getattr(prefs, "srt_latency_ms", 120) * 1000
     # listen_timeout: with no viewer, ffmpeg sits in the SRT listen with its
@@ -689,7 +784,115 @@ def _replica_srt_url(prefs) -> str:
     return f"srt://{bind}:{prefs.srt_port}?mode=listener&latency={latency_us}&listen_timeout=30000000"
 
 
-def _start_pixel_path(prefs) -> None:
+def _host_of(addr: str) -> str:
+    """'ip:port' / '[v6]:port' → the host part."""
+    addr = addr.strip()
+    if not addr:
+        return ""
+    if addr.startswith("["):
+        return addr[1:addr.index("]")] if "]" in addr else addr
+    return addr.rsplit(":", 1)[0] if addr.count(":") == 1 else addr
+
+
+def _viewer_block(prefs) -> dict:
+    """Host: what the hello says about the viewer on this machine."""
+    return {
+        "enabled": bool(getattr(prefs, "viewer_push", False)) and bool(getattr(prefs, "enable_stream", True)),
+        "port": int(getattr(prefs, "viewer_port", 9998) or 9998),
+        "latency_ms": int(getattr(prefs, "srt_latency_ms", 120) or 120),
+    }
+
+
+def _push_block() -> dict:
+    """Replica: where to call, or {} (listen as before)."""
+    viewer = state.get("viewer") or {}
+    addr = state.get("viewer_addr") or ""
+    if not viewer.get("enabled") or not addr:
+        return {}
+    return {"addr": addr, "port": int(viewer.get("port") or 9998), "latency_ms": int(viewer.get("latency_ms") or 120)}
+
+
+def viewer_card_refresh(force: bool = False) -> str:
+    """Host: write QCView's card when its content moved (ring0/viewer_card).
+    Returns the path written (or the current one), "" when not applicable."""
+    if state.get("role") != "HOST" or state.get("transport") is None:
+        return ""
+    prefs = state.get("prefs")
+    if prefs is None or not getattr(prefs, "viewer_push", False) or not getattr(prefs, "enable_stream", True):
+        return ""
+    host_cm, rep_cm = state.get("cm") or {}, state.get("peer_cm") or {}
+    fmt = (state.get("peer_stream") or {}).get("format") or {}
+    colour = _cs.deep_link_params(host_cm, rep_cm, fmt)
+    _, passphrase = _secrets(prefs, state.get("transport"))
+    card = viewer_card.build(
+        name="Live · " + (bpy.path.basename(bpy.data.filepath) or "Blender"),
+        port=int(getattr(prefs, "viewer_port", 9998) or 9998),
+        latency_ms=int(getattr(prefs, "srt_latency_ms", 120) or 120),
+        passphrase=passphrase, colour=colour, rows=colour_rows(),
+        mismatches=state.get("cm_mismatches") or [], stream=state.get("peer_stream") or {},
+        note=state.get("note") or "",
+    )
+    digest = viewer_card.content_digest(card)
+    if not force and digest == state.get("viewer_card_digest") and state.get("viewer_card_path"):
+        return state["viewer_card_path"]
+    try:
+        path = viewer_card.write(card)
+    except OSError as exc:
+        if state.get("viewer_card_error") != str(exc):
+            state["viewer_card_error"] = str(exc)
+            timeline.mark("card.error", error=str(exc)[:160])
+        return ""
+    state["viewer_card_error"] = ""
+    state["viewer_card_digest"] = digest
+    state["viewer_card_path"] = path
+    timeline.mark("card.written", path=path, port=card["port"], ws=colour.get("ws"), view=colour.get("view"),
+                  cm_ok=colour.get("cm_ok"), replica_push=bool((state.get("peer_stream") or {}).get("push")))
+    return path
+
+
+def _stream_descriptor(prefs, stream_params) -> dict:
+    """The replica's stream as the host must know it (hello_reply and every
+    pong): where to find it and what is on the wire (DESIGN-NOTES pixels
+    wire) — additive; an older host ignores the format, an older replica
+    lacks it and the host reads that as the 0.2 screen stream."""
+    return {
+        "enabled": bool(getattr(prefs, "enable_stream", True)),
+        "port": prefs.srt_port,
+        "latency_ms": getattr(prefs, "srt_latency_ms", 120),
+        "source": _pixel_source(prefs),
+        "push": _push_block(),   # {} = this replica listens; else it calls the host's viewer
+        **stream_params.descriptor(),
+    }
+
+
+def _follow_working(prefs) -> bool:
+    """Replica, main thread: the working space Blender is in now vs the one
+    the encoder was given. When they differ (a bootstrap carried a file
+    with its own Working Space), rebuild the stream parameters, re-describe
+    the stream for the host, and restart the pixel path with the new
+    matrix. True when a restart was started (2026-10-28, the Rec.2020 file)."""
+    if state.get("role") != "REPLICA":
+        return False
+    working = (state.get("cm") or {}).get("working") or {}
+    params = state.get("stream_params")
+    if params is None or not working.get("name"):
+        return False
+    new = StreamParams.from_prefs(prefs).with_working(working)
+    if params.matrix is not None and new.matrix is not None and _cs.matrix_close(params.matrix, new.matrix) \
+            and params.working_space == new.working_space:
+        return False
+    state["stream_params"] = new
+    info = state.get("stream_info")
+    if isinstance(info, dict):
+        info.clear()
+        info.update(_stream_descriptor(prefs, new))
+    timeline.mark("working.changed", frm=params.working_space, to=new.working_space,
+                  source=working.get("source"), restart=pixel_path.status() != "off")
+    _start_pixel_path(prefs, restart=True)
+    return True
+
+
+def _start_pixel_path(prefs, restart: bool = False) -> None:
     """Sync-only mode (decision #17): no stream, the user views the replica
     through their own remote-desktop tool. Otherwise resolve ffmpeg through
     the chain (prefs → QCView's toolbox.json → PATH) and surface the
@@ -700,6 +903,8 @@ def _start_pixel_path(prefs) -> None:
     if state.get("pixel_resolving"):
         return
     state["pixel_resolving"] = True
+    timeline.mark("pixel.start_requested", source=_pixel_source(prefs), ring=engine_qcb.ring_name(),
+                  status=pixel_path.status())
     # bpy reads happen HERE, main thread; the worker gets plain strings.
     params = state.get("stream_params") or StreamParams.from_prefs(prefs)
     args = (
@@ -711,6 +916,8 @@ def _start_pixel_path(prefs) -> None:
 
     def _resolve_and_start():
         try:
+            if restart:
+                pixel_path.stop()   # off the main thread: the join may take seconds
             ffmpeg, source = toolbox.resolve_ffmpeg(args[0])
             if ffmpeg is None:
                 state["ffmpeg_note"] = f"stream OFF — ffmpeg {source}"
@@ -806,6 +1013,21 @@ def _push_paths_to_agent(prefs, transport) -> None:
         print(f"qcbridge: moved {', '.join(fields)} into the agent", flush=True)
 
 
+def _report_backing_scale(transport) -> None:
+    """Replica: tell the agent this display's backing scale once, so the
+    next launch's --window-geometry (points) lands on the stream's pixels."""
+    cfg = getattr(transport, "agent_config", None) or {}
+    if not getattr(transport, "agent_mode", False) or not cfg:
+        return
+    try:
+        scale = float(bpy.context.preferences.system.pixel_size)
+    except Exception:
+        return
+    if scale > 0 and abs(float(cfg.get("replica_backing_scale") or 0.0) - scale) > 0.01:
+        transport.set_config(replica_backing_scale=scale)
+        timeline.mark("agent.backing_scale", scale=scale)
+
+
 def _mirror_paths_from_agent(prefs, transport) -> None:
     """Main thread only. The addon's table and cache root follow the
     agent's, so the zmq fallback and a later move back into the agent
@@ -815,6 +1037,16 @@ def _mirror_paths_from_agent(prefs, transport) -> None:
         return
     if state.get("mirrored_paths_from") is cfg:
         return
+    # The replica's window = the stream's resolution (agent setting, 2026-10-28).
+    res = str(cfg.get("replica_resolution") or "")
+    state["replica_resolution"] = res
+    kiosk.set_fullscreen(res == "fullscreen")
+    try:
+        w = int(res.lower().split("x")[0]) if "x" in res else 0
+        if w and getattr(prefs, "stream_width", 0) != w:
+            prefs.stream_width = w
+    except (ValueError, AttributeError, TypeError):
+        pass
     state["mirrored_paths_from"] = cfg
     if "path_mappings" in cfg and not isinstance(prefs, dict) and hasattr(prefs, "path_mappings") \
             and hasattr(prefs.path_mappings, "add"):
@@ -844,7 +1076,12 @@ def on_project_loaded() -> None:
         kiosk.enter(first=False)
     if colour_state.refresh("REPLICA"):  # the scene just changed under us
         _recompute_mismatches()
-    _start_pixel_path(prefs)
+    timeline.mark("project.loaded", engine=bpy.context.scene.render.engine if bpy.context.scene else None,
+                  objects=len(bpy.data.objects), libraries=len(bpy.data.libraries), images=len(bpy.data.images),
+                  ws=((state.get("cm") or {}).get("working") or {}).get("name"),
+                  ws_source=((state.get("cm") or {}).get("working") or {}).get("source"))
+    if not _follow_working(prefs):
+        _start_pixel_path(prefs)
 
 
 def viewer_url() -> str:
@@ -909,6 +1146,7 @@ def shot_mode_toggle() -> str:
     if state["role"] != "HOST" or transport is None:
         return "not a running host session"
     state["shot_mode"] = not state["shot_mode"]
+    timeline.mark("shot", on=state["shot_mode"])
     transport.request_nowait({"kind": "shot", "on": state["shot_mode"]})
     return "ok"
 
@@ -928,7 +1166,7 @@ def force_resync() -> str:
     sync = state.get("sync")
     if state["role"] != "HOST" or sync is None:
         return "not a running host session"
-    sync.send_bootstrap()
+    sync.send_bootstrap("force resync")
     return "ok"
 
 

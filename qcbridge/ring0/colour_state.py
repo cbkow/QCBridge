@@ -27,7 +27,7 @@ except Exception as _exc:  # pragma: no cover - depends on the Blender build
 else:
     _IMPORT_ERROR = ""
 
-_cache: dict = {"env": None, "cfg": None, "identity": None, "working": None,
+_cache: dict = {"cache_id": None, "cfg": None, "identity": None, "working": None,
                 "displays": None, "looks": None, "display_cache": {}}
 
 _XYZ_ROLE = "cie_xyz_d65_interchange"
@@ -38,12 +38,15 @@ _XYZ_ROLE = "cie_xyz_d65_interchange"
 # ---------------------------------------------------------------------------
 
 def _load_config():
-    """The config Blender is running, cached by the OCIO env value."""
+    """The config Blender is running NOW, cached by its cache ID — not by
+    the OCIO env value: Blender 5.2 derives a new config when a file sets
+    its Working Space (`bpy.data.colorspace`), so the config changes under a
+    running process on every load (found 2026-10-27: a Linear Rec.2020 file
+    streamed through the Rec.709 matrix read from the default scene).
+    GetCurrentConfig()+getCacheID() cost ~1 µs; the derived values below are
+    recomputed only when the ID moves."""
     if OCIO is None:
         return None
-    env = os.environ.get("OCIO", "")
-    if _cache["cfg"] is not None and _cache["env"] == env:
-        return _cache["cfg"]
     try:
         cfg = OCIO.GetCurrentConfig()
     except Exception:
@@ -51,9 +54,28 @@ def _load_config():
             cfg = OCIO.Config.CreateFromEnv()
         except Exception:
             cfg = None
-    _cache.update({"env": env, "cfg": cfg, "identity": None, "working": None,
+    try:
+        cache_id = cfg.getCacheID() if cfg is not None else ""
+    except Exception:
+        cache_id = ""
+    if _cache["cfg"] is not None and _cache["cache_id"] == cache_id:
+        return _cache["cfg"]
+    _cache.update({"cache_id": cache_id, "cfg": cfg, "identity": None, "working": None,
                    "displays": None, "looks": None, "display_cache": {}})
     return cfg
+
+
+def file_working_space() -> tuple[str, str]:
+    """(name, interop id) of the file's Working Space (Blender 5.2
+    `bpy.data.colorspace`; the panel is Render › Color Management › Working
+    Space, the operator `wm.set_working_color_space`). ("", "") when the
+    build has no such thing."""
+    try:
+        bc = bpy.data.colorspace
+        return (str(getattr(bc, "working_space", "") or ""),
+                str(getattr(bc, "working_space_interop_id", "") or ""))
+    except Exception:
+        return "", ""
 
 
 def config_identity(cfg) -> dict:
@@ -92,7 +114,10 @@ def working_block(cfg) -> dict:
     linearity check (the role should be linear; say so if it is not)."""
     if _cache["working"] is not None:
         return dict(_cache["working"])
-    out = {"name": "", "to_xyz": None, "linear": None, "assumed": True}
+    out = {"name": "", "to_xyz": None, "linear": None, "assumed": True, "source": "config"}
+    f_name, f_interop = file_working_space()
+    if f_name:
+        out["source"] = "file:%s" % (f_interop or f_name)
     try:
         ws = cfg.getColorSpace(OCIO.ROLE_SCENE_LINEAR)
         name = ws.getName() if ws else ""
@@ -113,6 +138,7 @@ def working_block(cfg) -> dict:
         out["to_xyz"] = cs.matrix_rows(cs.M_709_TO_XYZ)
         out["assumed"] = True
         out["linear"] = True
+        out["source"] = "assumed"
     _cache["working"] = out
     return dict(out)
 

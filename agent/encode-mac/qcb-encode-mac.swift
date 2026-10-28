@@ -378,6 +378,7 @@ let submitTimes = NSMutableDictionary()  // pts value -> submit time (ns)
 
 var session: VTCompressionSession?
 var sessionW = 0, sessionH = 0
+var sessionStart = Date()   // keyframes at the idle floor for the first seconds of a session (2026-10-28)
 let startCode: [UInt8] = [0, 0, 0, 1]
 let audNal: [UInt8] = [0, 0, 0, 1, 0x46, 0x01, 0x50]  // NAL type 35, pic_type all
 
@@ -452,6 +453,7 @@ func setProp(_ key: CFString, _ value: Any, _ name: String) {
 }
 
 func makeSession(width: Int, height: Int) {
+    sessionStart = Date()
     if let old = session {
         VTCompressionSessionCompleteFrames(old, untilPresentationTimeStamp: .invalid)
         VTCompressionSessionInvalidate(old)
@@ -561,7 +563,10 @@ DispatchQueue.global().async {
 // re-sends the last frame a few times a second so an SRT viewer joining a
 // silent stream is not left in its demuxer probe (found 2026-09-23).
 let interval = 1.0 / Double(max(opts.fps, 1))
-let idleFloor = 1.0 / min(max(Double(opts.fps) / 8.0, 2.0), 10.0)
+// 10 Hz at 30 fps (was fps/8): a joining viewer's demuxer wants ~20 frames
+// before it opens (ffmpeg's rate probe on HEVC), so an idle stream at 3.75 Hz
+// cost it 5 s; a tiny P-frame ten times a second costs nothing (2026-10-28).
+let idleFloor = 1.0 / min(max(Double(opts.fps) / 3.0, 5.0), 10.0)
 var lastLatest: UInt64 = 0
 var lastSent = Date.distantPast
 var lastPixelBuffer: CVPixelBuffer?
@@ -581,6 +586,10 @@ while true {
         }
         keyLock.lock(); let wantKey = forceKey; keyLock.unlock()
         if let pb = lastPixelBuffer, wantKey || now.timeIntervalSince(lastSent) >= idleFloor {
+            // The first seconds of a session: idle re-sends are KEYframes, so
+            // the mux's probe and a joining viewer's probe complete on the
+            // first packets instead of waiting for bytes that never come.
+            if now.timeIntervalSince(sessionStart) < 3.0 { keyLock.lock(); forceKey = true; keyLock.unlock() }
             encode(pb); lastSent = now
         }
         usleep(1000)
@@ -590,23 +599,40 @@ while true {
         usleep(500)   // pace to the requested rate; the newest frame wins when we wake
         continue
     }
-    lastLatest = latest
     let slot = Int(latest & 0xFF)
-    if slot >= ring.header.slotCount { continue }
+    if slot >= ring.header.slotCount { lastLatest = latest; continue }
     ring.claim(slot)
     let seqBefore = ring.seqlock(slot)
-    if seqBefore & 1 == 1 { ring.release(); skippedStale += 1; continue }  // writer inside
+    if seqBefore & 1 == 1 {
+        // Writer inside: come back for THIS frame. Advancing the cursor here
+        // lost a still scene's only new frame (published once, then
+        // hash-skipped) and the idle re-send kept showing the previous
+        // picture at its previous size (found 2026-10-28, Shot Mode).
+        ring.release(); skippedStale += 1; usleep(500); continue
+    }
     let w = Int(ring.u32(slot, DESC_W)), h = Int(ring.u32(slot, DESC_H)), bpr = Int(ring.u32(slot, DESC_BPR))
     let pf = ring.u32(slot, DESC_PF)
     if pf != PF_RGBA32F || w < 16 || h < 16 || w % 2 != 0 || h % 2 != 0 || bpr * h > ring.header.pixelsCapacity {
-        ring.release(); log("bad frame desc \(w)x\(h) bpr=\(bpr) pf=\(pf)"); continue
+        ring.release(); lastLatest = latest; log("bad frame desc \(w)x\(h) bpr=\(bpr) pf=\(pf)"); continue
     }
-    framesIn += 1
-    if w != sessionW || h != sessionH { makeSession(width: w, height: h) }
+    if w != sessionW || h != sessionH {
+        if sessionW != 0 {
+            // A new frame size mid-stream: exit for a respawn (8). The mux
+            // (ffmpeg -c copy) keeps the stream parameters it saw at open,
+            // so a viewer joining after a size change was told the OLD size
+            // while the frames were the new one (found 2026-10-28, Shot
+            // Mode). A fresh pair costs the viewer one reconnect.
+            log("frame size \(sessionW)x\(sessionH) -> \(w)x\(h): exiting for a respawn")
+            ring.release(); exit(8)
+        }
+        makeSession(width: w, height: h)
+    }
     let pb = conv.convert(buffer: ringBuffer, offset: ring.slotOffset(slot) + ring.header.pixelsOffset, width: w, height: h, bpr: bpr)
     let seqAfter = ring.seqlock(slot)
     ring.release()
-    if seqAfter != seqBefore { skippedStale += 1; continue }   // overwritten mid-copy: drop
+    if seqAfter != seqBefore { skippedStale += 1; usleep(500); continue }   // overwritten mid-copy: retry
+    lastLatest = latest
+    framesIn += 1
     guard let pb else { continue }
     lastPixelBuffer = pb
     encode(pb)

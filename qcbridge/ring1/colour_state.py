@@ -86,7 +86,7 @@ def empty_cm(role: str = "", blender: str = "") -> dict:
         "v": CM_VERSION, "blender": blender, "role": role,
         "config": {"kind": "unknown", "name": "", "file": "", "cache_id": "", "bundled": None},
         "ocio": {"available": False, "version": "", "error": ""},
-        "working": {"name": "", "to_xyz": None, "linear": None, "assumed": True},
+        "working": {"name": "", "to_xyz": None, "linear": None, "assumed": True, "source": ""},
         "display": {"device": "", "emulation": None, "colorspace": "", "encoding": "",
                     "in_config": None, "xy": None, "gamma_est": None},
         "view": {"transform": "", "look": "", "exposure": 0.0, "gamma": 1.0,
@@ -106,7 +106,7 @@ def fallback_cm(role: str, blender: str, scene_fields: dict | None = None,
     cm = empty_cm(role, blender)
     cm["ocio"] = {"available": False, "version": "", "error": error}
     cm["working"] = {"name": "Linear Rec.709", "to_xyz": matrix_rows(M_709_TO_XYZ),
-                     "linear": True, "assumed": True}
+                     "linear": True, "assumed": True, "source": "assumed"}
     for key, val in (scene_fields or {}).items():
         if key in cm and isinstance(val, dict) and isinstance(cm[key], dict):
             cm[key].update(val)
@@ -155,32 +155,51 @@ def mismatches(host: dict | None, replica: dict | None) -> list[tuple[str, str, 
     if not replica:
         return [("warn", "peer_cm", "replica reports no colour state (older add-on)")]
 
-    hc, rc = host.get("config", {}), replica.get("config", {})
-    h_id = (hc.get("cache_id") or "", hc.get("name") or "")
-    r_id = (rc.get("cache_id") or "", rc.get("name") or "")
-    if h_id != r_id:
-        out.append(("error", "config",
-                    "⚠ OCIO configs differ: host %s · replica %s — material colours may not mean the same thing"
-                    % (_config_label(hc), _config_label(rc))))
-
+    # Compared by CONTENT (2026-10-28): a file's Working Space makes Blender
+    # derive a new config with a new cache ID on every load, so two Blenders
+    # on the same file never share an ID. What matters is whether the
+    # working space, display, view and look in use mean the same thing.
     hw, rw = host.get("working", {}), replica.get("working", {})
-    if (hw.get("name") or "") != (rw.get("name") or "") or not matrix_close(hw.get("to_xyz"), rw.get("to_xyz")):
-        out.append(("error", "working",
-                    "⚠ working space differs: host %s · replica %s"
-                    % (hw.get("name") or "?", rw.get("name") or "?")))
+    same_ws = ((hw.get("name") or "") == (rw.get("name") or "")
+               and matrix_close(hw.get("to_xyz"), rw.get("to_xyz")))
 
     device = _g(host, "display", "device", default="")
     view = _g(host, "view", "transform", default="")
     look = _g(host, "view", "look", default="")
     r_views = replica.get("views_available") or []
     r_views_known = bool(r_views) or bool(_g(replica, "display", "in_config", default=False))
-    if device and _g(replica, "display", "in_config") is False and _g(replica, "display", "device") == device:
+    display_missing = bool(device) and (
+        (_g(replica, "display", "in_config") is False and _g(replica, "display", "device") == device)
+        or (bool(replica.get("display_devices")) and device not in replica["display_devices"]))
+    view_missing = bool(view) and r_views_known and bool(r_views) and view not in r_views
+    look_missing = bool(look) and look != "None" and bool(replica.get("looks_available")) \
+        and look not in replica["looks_available"]
+
+    hc, rc = host.get("config", {}), replica.get("config", {})
+    h_id = (hc.get("cache_id") or "", hc.get("name") or "")
+    r_id = (rc.get("cache_id") or "", rc.get("name") or "")
+    if h_id != r_id:
+        if same_ws and not (display_missing or view_missing or look_missing):
+            out.append(("info", "config",
+                        "OCIO configs differ (host %s · replica %s) — the working space, display, view and look in use agree"
+                        % (_config_label(hc), _config_label(rc))))
+        else:
+            out.append(("warn", "config",
+                        "⚠ OCIO configs differ: host %s · replica %s"
+                        % (_config_label(hc), _config_label(rc))))
+
+    if not same_ws:
+        h_src = str(hw.get("source") or "")
+        why = " — the host file sets it" if h_src.startswith("file:") else ""
+        out.append(("error", "working",
+                    "⚠ working space differs: host %s · replica %s%s"
+                    % (hw.get("name") or "?", rw.get("name") or "?", why)))
+
+    if display_missing:
         out.append(("error", "display", "⚠ replica config has no display '%s'" % device))
-    elif device and replica.get("display_devices") and device not in replica["display_devices"]:
-        out.append(("error", "display", "⚠ replica config has no display '%s'" % device))
-    if view and r_views_known and r_views and view not in r_views:
+    if view_missing:
         out.append(("error", "view", "⚠ replica has no view '%s' on '%s'" % (view, device or "?")))
-    if look and look != "None" and replica.get("looks_available") and look not in replica["looks_available"]:
+    if look_missing:
         out.append(("warn", "look", "look '%s' missing on replica" % look))
 
     if _g(host, "wb", "on"):
@@ -280,6 +299,7 @@ def deep_link_params(host: dict | None, replica: dict | None, fmt: dict | None =
         "wire": wire,
         "input": replica_ws,
         "ws": _g(host, "working", "name", default=""),
+        "ws_source": str(_g(host, "working", "source", default="") or ""),
         "ws_assumed": _b(_g(host, "working", "assumed", default=True) or _g(replica, "working", "assumed", default=False)),
         "config": "%s:%s:%s" % (hc.get("kind") or "unknown", hc.get("name") or "", hc.get("cache_id") or ""),
         "config_bundled": _b(hc.get("bundled")),
@@ -318,6 +338,8 @@ def summary_rows(cm: dict | None) -> list[tuple[str, str]]:
     ws = _g(cm, "working", "name", default="") or "—"
     if _g(cm, "working", "assumed"):
         ws += " (assumed)"
+    elif str(_g(cm, "working", "source", default="") or "").startswith("file:"):
+        ws += " (file)"
     device = _g(cm, "display", "device", default="") or "—"
     emu = _g(cm, "display", "emulation")
     if emu:

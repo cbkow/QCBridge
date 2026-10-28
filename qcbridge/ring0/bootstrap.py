@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import bpy
 
-from ..ring1 import pathmap
+from ..ring1 import pathmap, timeline
 from . import kiosk
 
 
@@ -48,6 +49,8 @@ _PATH_COLLECTIONS = (
 
 _DEBUG = bool(os.environ.get("QCB_DEBUG"))
 
+last_unmapped: list[str] = []   # "name:path" of what the last apply_mainfile could not place
+
 
 def _is_foreign_form(filepath: str) -> bool:
     if pathmap.current_os_tag() == "win":
@@ -76,12 +79,14 @@ def localize_paths(datablocks, local_dir: str, mappings) -> tuple[int, int, int]
                 new = os.path.normpath(os.path.join(local_dir, *rel.split("/")))
             else:
                 unmapped += 1  # relative to a project dir this machine can't see
+                last_unmapped.append(f"{db.name}:{filepath}")
         else:
             local = pathmap.localize_any(filepath, mappings)
             if local != filepath:
                 new = local
             elif _is_foreign_form(filepath) or not os.path.exists(bpy.path.abspath(filepath)):
                 unmapped += 1  # no mapping matched and it is not here either
+                last_unmapped.append(f"{db.name}:{filepath}")
         if new and new != filepath:
             try:
                 db.filepath = new
@@ -213,12 +218,17 @@ def apply_mainfile(
     """
     path = Path(tempfile.gettempdir()) / f"qcb-in-{blob_tag}.blend"
     path.write_bytes(data)
+    last_unmapped.clear()
+    t_open = time.monotonic()
     try:
         bpy.ops.wm.open_mainfile(filepath=str(path), load_ui=False)
-    except Exception:
+    except Exception as exc:
         path.unlink(missing_ok=True)
+        timeline.mark("boot.open_mainfile.failed", exc=repr(exc)[:160])
         return 1, 0, ""
     path.unlink(missing_ok=True)
+    timeline.mark("boot.open_mainfile", s=time.monotonic() - t_open, bytes=len(data),
+                  libraries=len(bpy.data.libraries), images=len(bpy.data.images), objects=len(bpy.data.objects))
 
     local_dir = pathmap.from_canonical(project_dir, mappings) if project_dir else ""
     if local_dir and not os.path.isdir(local_dir):
@@ -226,6 +236,7 @@ def apply_mainfile(
         # paths and count them as fixed. Leave them relative, count them.
         if _DEBUG:
             print(f"qcb project dir not found here: {local_dir!r}", flush=True)
+        timeline.mark("project_dir.missing", local=local_dir, canonical=project_dir)
         local_dir = ""
     errors = 0
     unmapped = 0

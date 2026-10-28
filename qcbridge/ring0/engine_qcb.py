@@ -31,6 +31,7 @@ import gpu
 import numpy as np
 
 from ..ring1 import ring_layout as rl
+from ..ring1 import timeline
 from . import frame_ring
 
 _DEBUG = bool(os.environ.get("QCB_DEBUG"))
@@ -87,6 +88,7 @@ def adopt_scene(scene) -> None:
         want = map_engine(scene.render.engine)
         if scene.render.engine != want:
             scene.render.engine = want
+            timeline.mark("engine.adopted", scene=scene.name, engine=want)
     except Exception as exc:
         _st["errors"] += 1
         _st["last_error"] = f"engine: {exc!r}"
@@ -210,18 +212,38 @@ def _publish(arr: np.ndarray, flags: int, t0: float, t1: float) -> None:
     ring = _st["ring"]
     h, w = arr.shape[0], arr.shape[1]
     centre = arr[h // 4: 3 * h // 4: 16, w // 4: 3 * w // 4: 16]
+    warmup = False
     if not _st["seen_signal"]:
         if float(centre[..., :3].max()) <= 0.0:
-            return  # startup black (kernels compiling): not a frame yet
-        _st["seen_signal"] = True
-        flags |= rl.F_FIRST_AFTER_LOAD
-    digest = hashlib.blake2b(np.ascontiguousarray(centre).tobytes(), digest_size=8).digest()
-    if digest == _st["last_hash"]:
-        _st["unchanged_run"] += 1
-        _st["skipped"] += 1
-        return
-    _st["last_hash"] = digest
-    _st["unchanged_run"] = 0
+            # Start-up black (kernels compiling, textures loading): publish
+            # it at 2 fps so the stream exists and a viewer sees black, then
+            # the picture — as screen capture did (2026-10-28; skipping it
+            # left the viewer with nothing to connect to for 15 s and more).
+            now = time.monotonic()
+            if now - _st.get("warmup_last", 0.0) < 0.5:
+                return
+            _st["warmup_last"] = now
+            _st["black_frames"] = _st.get("black_frames", 0) + 1
+            if _st["black_frames"] == 1:
+                timeline.mark("frame.warmup_first", w=w, h=h)
+            flags |= rl.F_WARMUP
+            warmup = True
+        else:
+            _st["seen_signal"] = True
+            timeline.mark("frame.first_signal", w=w, h=h, warmup_frames=_st.get("black_frames", 0),
+                          read_ms=(t1 - t0) * 1000.0)
+            _st["black_frames"] = 0
+            flags |= rl.F_FIRST_AFTER_LOAD
+    if not warmup:
+        digest = hashlib.blake2b(np.ascontiguousarray(centre).tobytes(), digest_size=8).digest()
+        if digest == _st["last_hash"]:
+            _st["unchanged_run"] += 1
+            _st["skipped"] += 1
+            return
+        _st["last_hash"] = digest
+        _st["unchanged_run"] = 0
+    else:
+        _st["warmups"] = _st.get("warmups", 0) + 1
     if not ring.fits(w, h):
         _regrow(w, h)
         ring = _st["ring"]
@@ -235,6 +257,8 @@ def _publish(arr: np.ndarray, flags: int, t0: float, t1: float) -> None:
     if ok:
         _st["published"] += 1
         _st["size"] = (w, h)
+        if _st["published"] == 1:
+            timeline.mark("frame.first_published", w=w, h=h, ring=ring.name)
         ms = _st["read_ms"]
         ms.append((t1 - t0) * 1000.0)
         if len(ms) > 120:
@@ -256,6 +280,7 @@ def _regrow(w: int, h: int) -> None:
         _st["last_error"] = f"ring: {exc!r}"
         return
     _st["ring"] = new
+    timeline.mark("ring.regrow", w=w, h=h, ring=new.name)
     if old is not None:
         old.close()
     cb = _st["retire_cb"]
@@ -347,6 +372,20 @@ def _free_offscreen() -> None:
             pass
 
 
+def _free_before_teardown(*_args) -> None:
+    """Blender 5.2.3 on Windows crashed on EXIT twice on 2026-10-27, in
+    `BPyGPUOffScreen__tp_dealloc` → EEVEE's instance destructor → image
+    free, after the GPU context was gone: our offscreen was still alive
+    when Python finalised. Free it while the context exists: at `atexit`
+    (runs before interpreter finalisation) and before a file load (the
+    viewport is rebuilt anyway)."""
+    _free_offscreen()
+
+
+import atexit as _atexit
+_atexit.register(_free_before_teardown)
+
+
 # ── lifecycle ───────────────────────────────────────────────────────────────
 
 def start(width: int, shot_fn, retire_cb=None) -> str | None:
@@ -376,6 +415,9 @@ def start(width: int, shot_fn, retire_cb=None) -> str | None:
         adopt_scene(scene)
     if _st["handler"] is None:
         _st["handler"] = bpy.types.SpaceView3D.draw_handler_add(_offscreen_draw, (), "WINDOW", "POST_PIXEL")
+    if _free_before_teardown not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_free_before_teardown)
+    timeline.mark("engine.start", ring=_st["ring"].name, width=_st["width"], registered=_st["registered"])
     return _st["ring"].name
 
 
@@ -423,7 +465,7 @@ def status() -> dict:
     ms = sorted(_st["read_ms"])
     return {
         "engine": _st["engine"], "size": list(_st["size"]),
-        "published": _st["published"], "skipped": _st["skipped"],
+        "published": _st["published"], "skipped": _st["skipped"], "warmups": _st.get("warmups", 0),
         "read_ms": round(ms[len(ms) // 2], 2) if ms else None,
         "errors": _st["errors"], "last_error": _st["last_error"][:120],
         "ring": ring_name(),

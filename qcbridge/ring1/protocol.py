@@ -155,12 +155,17 @@ REPLICA_CAPS = ("fast_ack", "batch_apply", "delta_resync", "cm")
 def make_hello(
     token: str, epoch: str, blender_version: str, addon_version: str = "",
     seq: int = 0, seq_fast: int = 0, mappings: list | None = None,
-    shared_root: dict | None = None, cm: dict | None = None,
+    shared_root: dict | None = None, cm: dict | None = None, viewer: dict | None = None,
 ) -> dict:
     return {
         "kind": "hello",
         "caps": list(HOST_CAPS),
         "token": token,
+        # Where the host's viewer listens (2026-10-28: QCView on the host
+        # machine runs the SRT listener, the replica CALLS it): {"port",
+        # "latency_ms", "enabled"}. Absent or disabled: the replica listens
+        # as before and the host opens the legacy qcview://stream link.
+        "viewer": dict(viewer or {}),
         # The host's colour state (ring1/colour_state.py): config identity,
         # working space, display, view, look… so the replica can say where
         # the two ends disagree. Additive: an older replica ignores it.
