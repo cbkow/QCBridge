@@ -39,6 +39,8 @@ while time.monotonic() - start < TIMEOUT:
         s = replica.get("stats", {})
         if s.get("bootstraps", 0) >= 1:
             note("boot", s["bootstraps"])
+        if "SwitchMarker" in (replica.get("object_names") or []):
+            note("file_switched", s.get("bootstraps"))
         if replica.get("cam_parent") == "RigNull":
             note("cam_parented", True)
         for ctype, target, infl in replica.get("cam_constraints", []):
@@ -136,6 +138,18 @@ else:
     checks["batch_apply_once"] = (d["applied_t2"] == 6 and d["batches"] == 1
                                   and d["evaluations"] <= 2)
     milestones["batch_deltas"] = d
+# The host opened another file mid-session: the replica holds it, after
+# exactly one more bootstrap and no re-handshake (the storm of 2026-10-28).
+checks["file_switch_applied"] = "file_switched" in milestones
+if host and host.get("switch_boot_before") is not None and replica:
+    s_final = replica.get("stats", {})
+    checks["file_switch_one_bootstrap"] = s_final.get("bootstraps") == host["switch_boot_before"] + 1
+    checks["file_switch_no_rehandshake"] = host.get("switch_hs_after") == host.get("switch_hs_before")
+    milestones["file_switch"] = {"boot_before": host["switch_boot_before"], "boot_after": s_final.get("bootstraps"),
+                                 "hs_before": host.get("switch_hs_before"), "hs_after": host.get("switch_hs_after")}
+else:
+    checks["file_switch_one_bootstrap"] = False
+    checks["file_switch_no_rehandshake"] = False
 
 verdict = {"pass": bool(checks) and all(checks.values()),
            "checks": checks, "milestones": milestones,

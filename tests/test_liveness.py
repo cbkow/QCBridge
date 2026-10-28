@@ -103,6 +103,20 @@ def test_decide_delta_when_the_replica_can_take_one():
     assert p.decide(st, 0.0, ("fast_ack",), None, "ready") == "full"
 
 
+def test_reset_with_the_handshake_state_waits_for_the_handshake_bootstrap():
+    """2026-10-28: a want_resync the replica raised BEFORE the handshake
+    must not draw a second full file right after the handshake's own."""
+    p = ResyncPolicy(min_interval=10.0)
+    st = {"want_resync": True, "gap_lane": "cold", "bootstraps": 1, "resyncs": 0}
+    p.reset((1, 0))
+    assert p.decide(st, 0.0, (), None, None) == "none"      # served by the handshake bootstrap
+    st2 = dict(st, bootstraps=2)                              # it landed, the flag is still up
+    assert p.decide(st2, 0.5, (), None, None) == "full"
+    p2 = ResyncPolicy(min_interval=10.0)
+    p2.reset(None)
+    assert p2.decide(st, 0.0, (), None, None) == "full"       # no state known: the old behaviour
+
+
 def test_delta_that_plans_nothing_is_rate_limited_like_a_full_bootstrap():
     """2026-10-28: a persistent structure difference used to re-ship the
     file at the 1 s fast cadence through the delta fallback."""

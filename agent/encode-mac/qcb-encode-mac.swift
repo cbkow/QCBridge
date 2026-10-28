@@ -433,7 +433,15 @@ func outputCallback(_: UnsafeMutableRawPointer?, _ refcon: UnsafeMutableRawPoint
         }
     }
     outLock.lock()
-    out.write(au)
+    do {
+        try out.write(contentsOf: au)
+    } catch {
+        // The mux left (a viewer went away, a respawn): EPIPE on stdout.
+        // That is an exit, not an uncaught exception and a crash report
+        // (four of those on 2026-10-28 from the smokes alone).
+        outLock.unlock()
+        exit(0)
+    }
     framesOut += 1
     bytesOut += au.count
     if key { keysOut += 1 }

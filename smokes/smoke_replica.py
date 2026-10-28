@@ -48,6 +48,7 @@ def _dump():
         bpy.context.view_layer.update()
         scene = bpy.context.scene
         d["frame"] = scene.frame_current
+        d["object_names"] = sorted(o.name for o in bpy.data.objects)[:60]
         objs = bpy.data.objects
         cam = objs.get("Camera")
         if cam is not None:

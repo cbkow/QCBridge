@@ -306,6 +306,34 @@ def step_finalize():
     results["box_matrix"] = mat(box)
     results["cam_influence"] = round(cam.constraints[0].influence, 4)
     results["host_unbaked"] = not cloth.point_cache.is_baked
+
+
+def _handshakes_sent() -> int:
+    from qcbridge.ring1 import timeline
+    return sum(1 for line in timeline.tail(1000) if " handshake.sent " in line)
+
+
+def step_file_switch():
+    """The host opens ANOTHER file mid-session (a saved copy of this scene
+    plus a marker cube): load_post reships the file once — one bootstrap,
+    no re-handshake, no storm (2026-10-28: a 67 MB project went seven
+    times because pongs starved during the transfer and the host called
+    the replica lost). Everything above is dead after open_mainfile, so
+    this is the last step; step_switch_done closes the run."""
+    bpy.ops.mesh.primitive_cube_add(size=0.25, location=(0, 0, 9))
+    bpy.context.active_object.name = "SwitchMarker"
+    path = os.path.join(OUT, "switched.blend")
+    bpy.ops.wm.save_as_mainfile(filepath=path, copy=True)
+    ps = getattr(session.state["transport"], "peer_status", {}) or {}
+    results["switch_boot_before"] = int(ps.get("bootstraps") or 0)
+    results["switch_hs_before"] = _handshakes_sent()
+    bpy.ops.wm.open_mainfile(filepath=path, load_ui=False)
+
+
+def step_switch_done():
+    results["switch_hs_after"] = _handshakes_sent()
+    ps = getattr(session.state["transport"], "peer_status", {}) or {}
+    results["switch_boot_after"] = int(ps.get("bootstraps") or 0)
     results["done"] = True
 
 
@@ -315,6 +343,7 @@ STEPS = [
     step_gn_add, step_gn_tweak, step_rail_add, step_rail_retime,
     step_ctrl_props, step_ctrl_tweak, step_shapekeys, step_shapekeys2,
     step_lattice, step_armature, step_batch6, step_finalize,
+    step_file_switch, step_switch_done,
 ]
 SETTLE = 3.0  # sweep (0.5 s) + debounce + tier-2 flight, with margin
 

@@ -392,7 +392,8 @@ def _start_host(prefs) -> None:
                 timeline.mark("handshake.ok", peer_addon=state["peer_addon"], caps=list(state["peer_caps"]),
                               stream=(state["peer_stream"] or {}).get("source"),
                               port=(state["peer_stream"] or {}).get("port"))
-                state["resync_policy"].reset()
+                _ps = getattr(transport, "peer_status", None) or {}
+                state["resync_policy"].reset((_ps.get("bootstraps"), _ps.get("resyncs", 0)) if _ps else None)
                 # Fresh handshake = fresh epoch pairing → full bootstrap
                 # (decision #16). Transport blips re-handshake too, with a
                 # fresh host epoch, because frames sent into the outage are
@@ -435,6 +436,15 @@ def _start_host(prefs) -> None:
 
     def _on_peer(alive: bool) -> None:
         if not alive:
+            # Pongs starve while a big bootstrap crosses the cold lane (the
+            # replica's IO thread is busy taking 4 MB chunks); with the QUIC
+            # link itself up that is not a lost replica, and declaring it
+            # one re-handshakes and ships the file AGAIN (2026-10-28: a
+            # 67 MB project went seven times). Wait it out instead.
+            sync = state.get("sync")
+            if getattr(transport, "_link_up", False) and sync is not None and sync.boot_in_flight():
+                timeline.mark("liveness.deferred", why="pongs late while a bootstrap is in flight")
+                return
             flags["lost"] = True
         elif flags["lost"]:
             flags["reconnect"] = True

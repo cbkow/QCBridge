@@ -110,6 +110,11 @@ class ResyncPolicy:
         know nothing about lanes."""
         return self.decide(status, now) == "full"
 
-    def reset(self) -> None:
-        """A fresh handshake resets the pairing; serve the next request anew."""
-        self._served_for = None
+    def reset(self, served_for: tuple | None = None) -> None:
+        """A fresh handshake resets the pairing. `served_for` = the replica's
+        (bootstraps, resyncs) as of the handshake: the handshake's own
+        bootstrap answers any want_resync the replica reported before it,
+        so nothing is served until that bootstrap has landed (2026-10-28:
+        a stale flag used to draw a second 67 MB file 0.1 s after the
+        first)."""
+        self._served_for = served_for

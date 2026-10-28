@@ -35,6 +35,7 @@ from . import bootstrap, identity, tier2_io
 _FLUSH_TICK = 0.025   # was 0.05: up to a tick of latency on every delta
 _SWEEP_INTERVAL = 0.25  # was 0.5: eye toggles, renames, custom props ride this
 _AUTO_BOOT_DEBOUNCE = 1.0    # wait for the burst of Scene edits to end
+_AUTO_BOOT_COVERED_S = 10.0    # a bootstrap this recent already carries the change
 _AUTO_BOOT_MIN_INTERVAL = 5.0  # never more than one automatic bootstrap per
 _T2_PER_TICK = 2  # libraries.write is a main-thread stall; spread a storm over ticks (D3)
 _DEBUG = bool(os.environ.get("QCB_DEBUG"))
@@ -120,6 +121,8 @@ class HostSync:
         # Library files the replica asked for (0.4): queued chunks, and what
         # was answered (shipped / missing) so a request is served once.
         self._lib_outbox: list[tuple[dict, bytes]] = []
+        self._boot_queued_at = 0.0   # monotonic; the last send_bootstrap
+        self._boot_sent_at = 0.0     # monotonic; the last boot's last chunk left
         self._libs_served: dict[str, str] = {}
         self.libs_shipped = 0
         # Tier-2 blobs mid-flight under backpressure, per uuid: the next
@@ -368,7 +371,7 @@ class HostSync:
         self._uuid_to_db = {}
         self._boot_outbox.clear()
         self._initial_scan()
-        self.send_bootstrap()
+        self.send_bootstrap("file loaded")
         # send_bootstrap serialized the NEW file just now (inside
         # load_post), but the whole-scene depsgraph flood for that file
         # evaluates AFTER load_post returns — one batch, fully covered by
@@ -464,6 +467,12 @@ class HostSync:
         """Queue the full mainfile for the wire (tier 3 — session bootstrap
         and force-resync). Chunks drain through flush_tick under
         backpressure; explicit, so it proceeds even while paused."""
+        if self._boot_outbox:
+            # A newer file supersedes chunks still queued: drop them (seqs
+            # are taken at send time, so nothing goes missing on the wire).
+            timeline.mark("boot.superseded", chunks_dropped=len(self._boot_outbox))
+            self._boot_outbox.clear()
+        self._boot_queued_at = time.monotonic()
         t_ser = time.monotonic()
         data = bootstrap.serialize_mainfile(compress=self._blend_compress())
         self.last_bootstrap_bytes = len(data)
@@ -532,6 +541,7 @@ class HostSync:
                 self._boot_outbox.pop(0)
                 if not self._boot_outbox:
                     self._boot_last_seq = header["seq"]
+                    self._boot_sent_at = time.monotonic()
                     timeline.mark("boot.sent", seq=header["seq"], n=self.sent_boot - 1)
                     self._uuid_cold_seq.clear()  # the file supersedes every blob
                     self.bake_note = ""  # the full file carries every baked cache
@@ -559,11 +569,17 @@ class HostSync:
             return _FLUSH_TICK  # the repair first; edits queue behind it
         self._send_manifest_batch(now)
         if self._auto_boot_at and now >= self._auto_boot_at:
-            if now - self._last_auto_boot >= _AUTO_BOOT_MIN_INTERVAL:
+            if now - self._boot_queued_at < _AUTO_BOOT_COVERED_S:
+                # A bootstrap went out moments ago (a file load, a
+                # handshake): it carries whatever the unsupported type
+                # changed. Don't ship the file twice (2026-10-28).
+                self._auto_boot_at = 0.0
+                timeline.mark("boot.auto_skipped", why="a bootstrap just went out")
+            elif now - self._last_auto_boot >= _AUTO_BOOT_MIN_INTERVAL:
                 self._auto_boot_at = 0.0
                 self._last_auto_boot = now
                 self.auto_boots += 1
-                self.send_bootstrap()
+                self.send_bootstrap("auto: a tier-2 type we do not resend changed")
                 return _FLUSH_TICK  # drain it first
             # else: keep it pending until the interval allows
         if now - self._last_sweep >= _SWEEP_INTERVAL:
@@ -722,6 +738,11 @@ class HostSync:
             if path not in current:
                 if self._send_cold_msg({"kind": "unlink", "lib": path}):
                     del self._lib_state[path]
+
+    def boot_in_flight(self, grace_s: float = 30.0) -> bool:
+        """Chunks still queued, or the last chunk left within `grace_s` (the
+        replica is still taking it in): pong starvation is expected."""
+        return bool(self._boot_outbox) or (self._boot_sent_at > 0 and time.monotonic() - self._boot_sent_at < grace_s)
 
     LIB_FILE_MAX = 64 * 1024 * 1024
 

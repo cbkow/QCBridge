@@ -373,13 +373,16 @@ def _free_offscreen() -> None:
 
 
 def _free_before_teardown(*_args) -> None:
-    """Blender 5.2.3 on Windows crashed on EXIT twice on 2026-10-27, in
-    `BPyGPUOffScreen__tp_dealloc` → EEVEE's instance destructor → image
-    free, after the GPU context was gone: our offscreen was still alive
-    when Python finalised. Free it while the context exists: at `atexit`
-    (runs before interpreter finalisation) and before a file load (the
-    viewport is rebuilt anyway)."""
+    """Blender crashed on EXIT in `BPyGPUOffScreen__tp_dealloc` → EEVEE's
+    instance destructor → image free, inside Py_Finalize, when the image
+    cache limiter was already gone: our offscreen was still alive. Free it
+    on `exit_pre` (before WM_exit's teardown) and before a file load (the
+    viewport is rebuilt anyway); atexit stays as a no-op fallback."""
     _free_offscreen()
+    try:
+        timeline.mark("offscreen.freed_before_teardown")
+    except Exception:
+        pass
 
 
 import atexit as _atexit
@@ -417,6 +420,13 @@ def start(width: int, shot_fn, retire_cb=None) -> str | None:
         _st["handler"] = bpy.types.SpaceView3D.draw_handler_add(_offscreen_draw, (), "WINDOW", "POST_PIXEL")
     if _free_before_teardown not in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.append(_free_before_teardown)
+    # exit_pre (Blender 4.2+) runs before WM_exit tears the image cache
+    # down; atexit runs inside Py_Finalize, which is already too late — the
+    # offscreen's EEVEE instance frees an image into a cache limiter that
+    # is gone (the quit crash, Mac replica 2026-10-27 13:56, box twice).
+    exit_pre = getattr(bpy.app.handlers, "exit_pre", None)
+    if exit_pre is not None and _free_before_teardown not in exit_pre:
+        exit_pre.append(_free_before_teardown)
     timeline.mark("engine.start", ring=_st["ring"].name, width=_st["width"], registered=_st["registered"])
     return _st["ring"].name
 
