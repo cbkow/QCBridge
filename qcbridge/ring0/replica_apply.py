@@ -55,6 +55,10 @@ stats = {
     "applied_t2": 0,
     "bootstraps": 0,
     "unmapped_paths": 0,
+    "unmapped_names": [],    # names of what the last bootstrap / link could not place (first few)
+    "need_libs": [],         # host paths of libraries to ask the host for (rides the pong)
+    "libs_cached": 0,        # library files received and relinked from the local cache
+    "libs_missing_on_host": [],   # names the host could not ship either
     "host_ended": False,
     "applying": "",  # datablock name during an indivisible apply
     "last_error": "",
@@ -467,6 +471,93 @@ def _apply_tombstone(header: dict) -> None:
     _last_hot = None  # same camera-view risk as a t2 apply (see above)
 
 
+_lib_cache_dir_cache: str | None = None
+
+
+def _lib_cache_dir() -> str:
+    global _lib_cache_dir_cache
+    if _lib_cache_dir_cache is None:
+        try:
+            base = bpy.utils.user_resource("CONFIG", create=True)
+        except Exception:
+            import tempfile
+            base = tempfile.gettempdir()
+        _lib_cache_dir_cache = os.path.join(base, "qcbridge-libcache")
+    return _lib_cache_dir_cache
+
+
+def _request_lib(host_path: str) -> None:
+    """Ask the host (through the pong) for a library file this machine
+    cannot place — once per path, never for one the host said it lacks."""
+    host_path = str(host_path or "")
+    if not host_path or host_path in stats["need_libs"]:
+        return
+    name = os.path.basename(host_path.replace("\\", "/")) or host_path
+    if name in stats["libs_missing_on_host"]:
+        return
+    stats["need_libs"].append(host_path)
+    timeline.mark("lib.requested", lib=name)
+
+
+def _lib_missing_on_host(host_path: str, why: str) -> None:
+    name = os.path.basename(host_path.replace("\\", "/")) or host_path
+    if host_path in stats["need_libs"]:
+        stats["need_libs"].remove(host_path)
+    if name not in stats["libs_missing_on_host"]:
+        stats["libs_missing_on_host"].append(name)
+    timeline.mark("lib.missing_on_host", lib=name, why=why)
+
+
+def _apply_libfile(header: dict, data: bytes) -> None:
+    """A library file from the host: verify, cache under this machine's
+    config dir, point every library that names it there, reload."""
+    import hashlib
+    # chunk_blob spreads the meta keys into every chunk's header.
+    host_path = str(header.get("lib") or "")
+    name = str(header.get("name") or os.path.basename(host_path.replace("\\", "/")) or "library.blend")
+    sha1 = hashlib.sha1(data).hexdigest()
+    if header.get("sha1") and header["sha1"] != sha1:
+        stats["apply_errors"] += 1
+        stats["last_error"] = f"library {name}: digest mismatch"
+        timeline.mark("lib.bad_digest", lib=name)
+        return
+    cache_dir = _lib_cache_dir()
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        cached = os.path.join(cache_dir, f"{sha1[:16]}-{name}")
+        if not os.path.exists(cached):
+            tmp = cached + ".part"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, cached)
+    except OSError as exc:
+        stats["apply_errors"] += 1
+        stats["last_error"] = f"library cache: {exc!r}"
+        timeline.mark("lib.cache_error", lib=name, error=repr(exc)[:120])
+        return
+    from ..ring1 import pathmap
+    local = pathmap.localize_any(host_path, _mappings) if host_path else ""
+    wanted = {host_path, local, name}
+    relinked = 0
+    for lib in bpy.data.libraries:
+        lp = bpy.path.abspath(lib.filepath)
+        if lp in wanted or os.path.basename(lp.replace("\\", "/")) == name and not os.path.exists(lp):
+            try:
+                lib.filepath = cached
+                lib.reload()
+                relinked += 1
+            except Exception as exc:  # noqa: BLE001
+                stats["apply_errors"] += 1
+                stats["last_error"] = f"library {name}: {exc!r}"
+    if host_path in stats["need_libs"]:
+        stats["need_libs"].remove(host_path)
+    stats["libs_cached"] += 1
+    if stats["unmapped_paths"] and relinked:
+        stats["unmapped_paths"] = max(0, stats["unmapped_paths"] - relinked)
+        stats["unmapped_names"] = [n for n in stats["unmapped_names"] if n != name]
+    timeline.mark("lib.cached", lib=name, bytes=len(data), relinked=relinked, path=cached)
+
+
 def _apply_link(header: dict) -> None:
     """Link (or drop) datablocks from another .blend, by the replica's
     mapped path. Linked IDs are never stamped, so membership and pointers
@@ -483,7 +574,10 @@ def _apply_link(header: dict) -> None:
     if not os.path.exists(local):
         stats["unmapped_paths"] += 1
         stats["last_error"] = f"library not found here: {local}"
+        if local not in stats["unmapped_names"] and len(stats["unmapped_names"]) < 6:
+            stats["unmapped_names"].append(os.path.basename(local) or local)
         timeline.mark("link.missing", host=host_path, local=local)
+        _request_lib(host_path)
         return
     want_objects = set(header.get("objects") or [])
     want_colls = set(header.get("collections") or [])
@@ -576,6 +670,11 @@ def _apply_one(header: dict, blob: bytes) -> str | None:
         stats["bootstraps"] += 1
         stats["apply_errors"] += errors
         stats["unmapped_paths"] = unmapped
+        stats["unmapped_names"] = [n.split(":", 2)[1] for n in bootstrap.last_unmapped[:6] if n.count(":") >= 2]
+        for entry in bootstrap.last_unmapped:
+            parts = entry.split(":", 2)
+            if len(parts) == 3 and parts[0] == "Library":
+                _request_lib(parts[2])
         stats["host_ended"] = False
         stats["want_resync"] = False  # the full file is the answer
         _unknown_gap = False
@@ -855,6 +954,15 @@ def _dispatch(header: dict, payload: bytes, seq) -> None:
     elif kind in ("link", "unlink"):
         _apply_link(header)
         _release(_merger.cold_done(seq))
+    elif kind == "lib_missing":
+        _lib_missing_on_host(header.get("lib") or "", header.get("why") or "")
+        _release(_merger.cold_done(seq))
+    elif kind == "libfile":
+        blob_id = header["blob"]["id"]
+        done = _reassembler.feed(header, payload)
+        if done is not None:
+            _apply_libfile(done[0], done[1])
+            _release(_merger.cold_done(seq))
     elif kind in ("t2", "boot"):
             uuid = header.get("uuid", "")
             blob_id = header["blob"]["id"]
@@ -1353,6 +1461,7 @@ def start(transport, mappings=()) -> None:
         unknown_uuid=0, bootstraps=0, unmapped_paths=0, applying="", last_error="",
         want_resync=False, frozen_caches=0, seq_fast=0, parked=0,
         batches=0, evaluations=0,
+        unmapped_names=[], need_libs=[], libs_cached=0, libs_missing_on_host=[],
     )
     _rebuild_uuid_map()
     _touched.clear()

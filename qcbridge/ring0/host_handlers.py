@@ -117,6 +117,11 @@ class HostSync:
         self.cache_note = ""
         self.externalized = 0
         self._boot_outbox: list[tuple[dict, bytes]] = []
+        # Library files the replica asked for (0.4): queued chunks, and what
+        # was answered (shipped / missing) so a request is served once.
+        self._lib_outbox: list[tuple[dict, bytes]] = []
+        self._libs_served: dict[str, str] = {}
+        self.libs_shipped = 0
         # Tier-2 blobs mid-flight under backpressure, per uuid: the next
         # tick resumes from the chunk that was refused instead of
         # re-serializing and restarting from chunk 0 (DESIGN-NOTES sync B3). A
@@ -536,6 +541,15 @@ class HostSync:
                 return _FLUSH_TICK  # backpressure: try again next tick
         if self._suppress_marks:
             return _FLUSH_TICK  # pre-handshake: the bootstrap will cover it
+        while self._lib_outbox:
+            header, payload = self._lib_outbox[0]
+            self.seq += 1
+            header["seq"] = self.seq
+            if self.transport.send_cold(header, payload):
+                self._lib_outbox.pop(0)
+            else:
+                self.seq -= 1
+                return _FLUSH_TICK
         if not self._drain_t2_outbox():
             return _FLUSH_TICK  # backpressure mid-blob: resume next tick
         if self._fast_resend_queue or self._fast_resend_end:
@@ -708,6 +722,44 @@ class HostSync:
             if path not in current:
                 if self._send_cold_msg({"kind": "unlink", "lib": path}):
                     del self._lib_state[path]
+
+    LIB_FILE_MAX = 64 * 1024 * 1024
+
+    def serve_lib_requests(self, paths) -> None:
+        """The replica could not place these libraries (its pong's
+        `need_libs`, host-native paths from the link headers / the file).
+        Ship each readable one once as a "libfile" blob (cached and
+        relinked there), answer "lib_missing" for the rest — a library the
+        host lacks too, or one too big to ship (2026-10-28)."""
+        import hashlib
+        for path in list(paths or []):
+            path = str(path)
+            if not path or path in self._libs_served:
+                continue
+            try:
+                size = os.path.getsize(path) if os.path.isfile(path) else -1
+            except OSError:
+                size = -1
+            if size < 0 or size > self.LIB_FILE_MAX:
+                why = "not on the host" if size < 0 else f"too big ({size // (1024 * 1024)} MB)"
+                if self._send_cold_msg({"kind": "lib_missing", "lib": path, "why": why}):
+                    self._libs_served[path] = "missing"
+                    timeline.mark("lib.missing_on_host", lib=os.path.basename(path), why=why)
+                continue
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError as exc:
+                if self._send_cold_msg({"kind": "lib_missing", "lib": path, "why": f"unreadable: {exc}"}):
+                    self._libs_served[path] = "missing"
+                continue
+            sha1 = hashlib.sha1(data).hexdigest()
+            blob_id = f"lib.{self.libs_shipped}.{self.seq + 1}"
+            meta = {"lib": path, "sha1": sha1, "name": os.path.basename(path)}
+            self._lib_outbox.extend(protocol.chunk_blob("libfile", blob_id, data, meta=meta))
+            self._libs_served[path] = "shipped"
+            self.libs_shipped += 1
+            timeline.mark("lib.shipped", lib=meta["name"], bytes=len(data), sha1=sha1[:12])
 
     def _send_cold_msg(self, header: dict) -> bool:
         self.seq += 1

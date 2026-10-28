@@ -49,7 +49,7 @@ _PATH_COLLECTIONS = (
 
 _DEBUG = bool(os.environ.get("QCB_DEBUG"))
 
-last_unmapped: list[str] = []   # "name:path" of what the last apply_mainfile could not place
+last_unmapped: list[str] = []   # "Type:name:path" of what the last apply_mainfile could not place
 
 
 def _is_foreign_form(filepath: str) -> bool:
@@ -79,14 +79,14 @@ def localize_paths(datablocks, local_dir: str, mappings) -> tuple[int, int, int]
                 new = os.path.normpath(os.path.join(local_dir, *rel.split("/")))
             else:
                 unmapped += 1  # relative to a project dir this machine can't see
-                last_unmapped.append(f"{db.name}:{filepath}")
+                last_unmapped.append(f"{type(db).__name__}:{db.name}:{filepath}")
         else:
             local = pathmap.localize_any(filepath, mappings)
             if local != filepath:
                 new = local
             elif _is_foreign_form(filepath) or not os.path.exists(bpy.path.abspath(filepath)):
                 unmapped += 1  # no mapping matched and it is not here either
-                last_unmapped.append(f"{db.name}:{filepath}")
+                last_unmapped.append(f"{type(db).__name__}:{db.name}:{filepath}")
         if new and new != filepath:
             try:
                 db.filepath = new

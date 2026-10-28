@@ -206,8 +206,12 @@ def check_hello(msg: dict, expected_token: str) -> tuple[bool, str]:
 # ── cold channel ─────────────────────────────────────────────────────────────
 # Message kinds: "t1" (property deltas), "t2" (datablock blob), "tomb"
 # (tombstone), "boot" (bootstrap blob), "resync_end" (a repair that was not
-# a bootstrap is complete; on either lane). Fast-lane messages ("t1", "tomb")
-# carry lane="f" and `after` (ring1/merge.py).
+# a bootstrap is complete; on either lane), "link"/"unlink" (library usage),
+# "libfile" (a library .blend the replica could not place, shipped once —
+# meta {lib: host path, sha1, name}; 0.4, 2026-10-28) and "lib_missing"
+# (the host cannot read it either: {lib, why}). The replica asks for
+# library files through its pong (`need_libs`). Fast-lane messages
+# ("t1", "tomb") carry lane="f" and `after` (ring1/merge.py).
 
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024
 

@@ -6,7 +6,65 @@ matching versions on **both machines**: the ends now tell each other their
 version at connect, and the panel warns if they don't match. Mismatched ends
 mostly work, but they degrade in confusing ways — update both.
 
-## 0.3.0 — 2026-10-27
+## 0.4.0 — in progress (folds in the unpublished 0.3.0 of 2026-10-27)
+
+**QCView listens; the replica calls; nothing launches QCView.** The host
+add-on writes QCView a card (`Inputs/blender.json` in QCView's application
+folder: `%ProgramData%\QCView\Inputs` on Windows, `~/Library/Application
+Support/QCView/Inputs` on macOS) with the port, the passphrase, the colour
+chain and the mismatch rows, rewrites it when any of that changes and
+removes it when the session stops. QCView 2.7 watches the folder, opens an
+SRT listener on the card's port and applies the chain; the replica's
+encoder calls that listener (the host's address comes from the agent, the
+port from the hello). A viewer that joins later gets a picture within a
+second: the muxer's input probe no longer waits for 64 KB, 20 frames or
+five seconds (`-analyzeduration 0` meant the default), the helpers send
+keyframes at the idle floor for the first seconds and re-send idle frames
+at 10 Hz, and start-up black is published rather than skipped. The legacy
+`qcview://stream` link stays for the manual flow, launched without
+Blender's own OCIO variable. Preferences: "Stream to QCView here" and the
+QCView port.
+
+**The stream follows the file's working space.** Blender 5.2's per-file
+Working Space (Render › Color Management › Working Space) derives a new
+OCIO config on every load; the colour state used to read the config once
+and a Linear Rec.2020 file went out through the Rec.709 matrix. Both ends
+re-read whenever the config's identity moves, the block says where the
+working space comes from ("Linear Rec.2020 (file)"), the replica restarts
+its encoder with the new matrix and re-describes the stream on every pong,
+and configs are compared by content: a different config is an error only
+when the working space, display, view or look in use differ.
+
+**The replica window is the stream.** The agent's Resolution setting
+(1920x1080 default, 2560x1440, 1280x720, fullscreen, or any WxH) opens
+Blender's window at that size (points on a Retina Mac), so the viewport,
+the ring and the encoder mean the same number; kiosk keeps the maximised
+chrome-free viewport and only goes OS-fullscreen for the fullscreen preset.
+Cycles no longer renders a 4K screen for a 2560 stream.
+
+**Library files on demand.** A linked library the replica cannot place —
+no mapping, or a mapped path that is not there — is asked for through the
+pong; the host ships it once (up to 64 MB) as a cold blob, the replica
+caches it under its config folder and relinks. A library the host cannot
+read either is reported as "missing on the host too" and never asked for
+again. The status names the files the replica could not place instead of
+counting "unmapped paths".
+
+**Smaller fixes from the audit.** A frame read while the producer was
+still writing is retried instead of dropped (a still scene's only new
+frame could be lost, leaving the previous picture on the stream); a frame
+size change mid-stream respawns the encoder pair (ffmpeg kept the stream
+parameters it opened with, so a joining viewer was told the old size); a
+delta repair that plans nothing obeys the 10 s bootstrap rate limit; the
+handshake waits 8 s for a replica still loading a file; the offscreen
+buffer is freed at exit and before a load (Blender crashed on quit on
+Windows); the agent logs a failing phonebook folder once a minute; a
+per-stage timeline of every session is written on each end
+(`qcbridge-timeline-<role>.log` in Blender's config folder). New icons:
+the revised mark on a dark plate for the app, the grey mark with status
+dots in the menu bar and tray.
+
+### 0.3.0 (built 2026-10-27, not published)
 
 **No screen capture.** The replica's viewport leaves Blender from the
 inside: for Cycles the extension registers its own render engine, a

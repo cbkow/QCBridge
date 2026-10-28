@@ -492,6 +492,8 @@ def _start_host(prefs) -> None:
                               errors=status.get("errors"), unmapped=status.get("unmapped"),
                               unknown=status.get("unknown"), local_edits=status.get("local_edits"))
         sync = state.get("sync")
+        if sync is not None and not pending["armed"] and status.get("need_libs"):
+            sync.serve_lib_requests(status.get("need_libs"))
         if sync is not None and not pending["armed"]:
             caps = state.get("peer_caps") or ()
             delta_state = None
@@ -667,6 +669,12 @@ def _start_replica(prefs) -> None:
             "applied_t1": replica_apply.stats["applied_t1"],
             "bootstraps": replica_apply.stats["bootstraps"],
             "unmapped": replica_apply.stats["unmapped_paths"],
+            "unmapped_names": list(replica_apply.stats.get("unmapped_names") or [])[:6],
+            # Library files this replica could not place: the host ships them
+            # once (0.4, host_handlers.serve_lib_requests).
+            "need_libs": list(replica_apply.stats.get("need_libs") or [])[:8],
+            "libs_cached": replica_apply.stats.get("libs_cached", 0),
+            "libs_missing_on_host": list(replica_apply.stats.get("libs_missing_on_host") or [])[:6],
             "frozen": replica_apply.stats["frozen_caches"],
             "last_error": replica_apply.stats["last_error"][:120],
             "local_edits": replica_apply.stats["local_edits"],
@@ -1203,7 +1211,8 @@ def _replica_overlay_text() -> str:
     if stats["want_resync"]:
         bits.append("⟳ resync requested")
     if stats["unmapped_paths"]:
-        bits.append(f"⚠ {stats['unmapped_paths']} unmapped paths")
+        names = ", ".join(str(n) for n in (stats.get("unmapped_names") or [])[:3])
+        bits.append(f"⚠ {stats['unmapped_paths']} file(s) not found here" + (f": {names}" if names else ""))
     # Colour awareness: what this replica renders through, and where the
     # host disagrees (the host panel has the long form).
     cm = state.get("cm") or {}
@@ -1293,7 +1302,18 @@ def status_text() -> str:
         if getattr(sync, "t2_skipped", 0):
             bits.append(f"unchanged blobs skipped {sync.t2_skipped}")
         if peer.get("unmapped"):
-            bits.append(f"⚠ replica: {peer['unmapped']} unmapped paths — check path mappings")
+            # Files the replica could not place: a mapping that matched
+            # nothing, OR a mapped path that is not there either (a library
+            # broken on the host too, a share the replica cannot see). Named,
+            # so the artist knows which (2026-10-28).
+            names = ", ".join(str(n) for n in (peer.get("unmapped_names") or [])[:4])
+            bits.append(f"⚠ replica: {peer['unmapped']} file(s) not found there"
+                        + (f" — {names}" if names else " — check path mappings"))
+        if peer.get("libs_cached"):
+            bits.append(f"{peer['libs_cached']} librar{'y' if peer['libs_cached'] == 1 else 'ies'} shipped to the replica")
+        if peer.get("libs_missing_on_host"):
+            miss = peer["libs_missing_on_host"]
+            bits.append(f"⚠ {len(miss)} librar{'y' if len(miss) == 1 else 'ies'} missing on the host too: " + ", ".join(str(m) for m in miss[:3]))
         if peer.get("frozen"):
             bits.append(f"⚠ replica: {peer['frozen']} disk caches frozen — use an external cache path")
         if peer.get("last_error"):

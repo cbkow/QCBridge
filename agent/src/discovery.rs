@@ -303,9 +303,17 @@ pub fn phonebook_write_at(dir: &Path, b: &Beacon) -> std::io::Result<()> {
 }
 
 fn phonebook_write(cfg: &SharedConfig, id: &Identity) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_FAIL_LOG: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = phonebook_dir(cfg) {
         if let Err(e) = phonebook_write_at(&dir, &beacon_for(cfg, id)) {
-            crate::log!("[discovery] phonebook write failed: {e}");
+            // Once a minute, not every beacon: a phonebook on an unmounted
+            // drive filled agent.log with one line every 10 s (2026-10-27).
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            if now.saturating_sub(LAST_FAIL_LOG.load(Ordering::Relaxed)) >= 60 {
+                LAST_FAIL_LOG.store(now, Ordering::Relaxed);
+                crate::log!("[discovery] phonebook write failed: {e} ({}) — is the folder mounted? said once a minute", dir.display());
+            }
         }
     }
 }

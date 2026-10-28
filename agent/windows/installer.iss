@@ -6,7 +6,7 @@
 ;   "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" agent\windows\installer.iss
 ; → agent\dist\QCBridge-Agent-<version>-Setup-x64.exe
 #define MyAppName "QCBridge Agent"
-#define MyAppVersion "0.3.0"
+#define MyAppVersion "0.4.0"
 #define MyAppPublisher "cbkow"
 #define MyAppURL "https://github.com/cbkow/QCBridge"
 #define MyAppExeName "qcbridge-agent.exe"
