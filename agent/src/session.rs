@@ -786,6 +786,10 @@ async fn run_lanes(ctx: Arc<Ctx>, conn: quinn::Connection, lanes: Lanes) -> Resu
                 let (tx, rx) = (s.udp_tx.bytes, s.udp_rx.bytes);
                 let v = json!({
                     "event": "stats",
+                    // The peer's address, every second: the addon needs it
+                    // to aim the replica's stream at the host's viewer, and
+                    // a one-shot event can land before the addon attaches.
+                    "peer_addr": stats_conn.remote_address().to_string(),
                     "rtt_ms": s.path.rtt.as_secs_f64() * 1000.0,
                     "quic_lost": s.path.lost_packets,
                     "quic_cwnd": s.path.cwnd,

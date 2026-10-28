@@ -775,8 +775,20 @@ class HostTransportAgent:
         elif name == "peer_addr":   # the other agent's "ip:port" as ours sees it (any observer)
             if event.get("addr"):
                 self.peer_addr = str(event.get("addr"))
+                try:
+                    from . import timeline
+                    timeline.mark("agent.peer_addr", addr=self.peer_addr)
+                except Exception:
+                    pass
         elif name == "stats":
             self.stats = event
+            if event.get("peer_addr") and str(event.get("peer_addr")) != self.peer_addr:
+                self.peer_addr = str(event.get("peer_addr"))
+                try:
+                    from . import timeline
+                    timeline.mark("agent.peer_addr", addr=self.peer_addr, via="stats")
+                except Exception:
+                    pass
         elif name == "cold_dropped":
             # The agent had to discard a cold frame (session down or its
             # queue full) and credited it back so we would not stall. The
@@ -957,6 +969,8 @@ class ReplicaTransportAgent:
                 self.agent_version = event.get("version", "")
                 self.agent_exe = event.get("exe", "")
                 self.agent_config = dict(event.get("config") or {})
+                if event.get("peer_addr"):
+                    self._note_peer_addr(str(event["peer_addr"]), "attached")
                 self._ready.set()
             elif name == "config":
                 self.agent_config = dict(event.get("config") or self.agent_config)
@@ -977,10 +991,30 @@ class ReplicaTransportAgent:
                 self.link_note = "" if event.get("up") else (event.get("reason") or "")
                 if not event.get("up"):
                     self._last_ping = 0.0
+                elif event.get("addr"):
+                    self._note_peer_addr(str(event["addr"]), "peer")
+            elif name == "peer_addr":
+                if event.get("addr"):
+                    self._note_peer_addr(str(event["addr"]), "event")
             elif name == "stats":
                 self.stats = event
+                if event.get("peer_addr"):
+                    self._note_peer_addr(str(event["peer_addr"]), "stats")
             elif name == "error":
                 self.link_note = event.get("msg") or ""
+
+    def _note_peer_addr(self, addr: str, via: str) -> None:
+        """The host's 'ip:port' as our agent sees it (0.4): the replica aims
+        its stream at the host's viewer with it. Any of the attach reply,
+        the peer event, the peer_addr event or the once-a-second stats may
+        bring it first; marked once per value."""
+        if addr and addr != self.peer_addr:
+            self.peer_addr = addr
+            try:
+                from . import timeline
+                timeline.mark("agent.peer_addr", addr=addr, via=via)
+            except Exception:
+                pass
 
     def _stash_reply(self, event: dict) -> None:
         req = event.get("req")
