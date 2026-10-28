@@ -198,6 +198,83 @@ on the GPU and encodes HEVC Main10; ffmpeg only muxes to SRT.
   scene: wire vs Blender's linear render (PSNR > 30 dB, dE mean < 1 —
   viewport vs final render bottoms near 34 dB), QCView's picture vs the
   host's view for the host's display (dE mean < 1.5, p99 < 4).
+- **the file's working space (0.4).** Blender 5.2 lets a FILE choose its
+  Working Space (`bpy.data.colorspace`, Render › Color Management); on
+  load Blender derives a new OCIO config (new cache ID, `scene_linear`
+  moved). The colour state is therefore re-read whenever the current
+  config's cache ID moves — `GetCurrentConfig()` + `getCacheID()` cost a
+  microsecond — and on `load_post` / after every bootstrap; the block says
+  `working.source` ("file:lin_rec2020_scene" or "config"). The replica
+  rebuilds its stream parameters and restarts the encoder with the new
+  matrix, and re-describes the stream on every pong. Found 2026-10-27: a
+  Linear Rec.2020 file streamed through the Rec.709 matrix read from the
+  default scene, "desaturated like 709 vs 2020". Configs are compared by
+  CONTENT (working space, display, view, look in use), never by cache ID:
+  two Blenders on the same file never share one.
+- **the probe (0.4).** ffmpeg opens its OUTPUT only after its input probe:
+  `probesize` bytes, 20 frames (HEVC's rate probe) or `analyzeduration`
+  — and `-analyzeduration 0` means the 5 s default (demux.c). An idle
+  encoder (one small keyframe, tiny P-frames a few times a second) kept
+  the old 64 KB probe waiting a minute; viewers calling meanwhile got
+  "Input/output error". Now `-probesize 32 -analyzeduration 1
+  -fpsprobesize 0 -use_wallclock_as_timestamps 1`, the helpers send
+  KEYframes at the idle floor for the first 3 s of a session and re-send
+  idle frames at 10 Hz, start-up black is published at 2 fps (`F_WARMUP`)
+  instead of skipped, and QCView's decoder opens with `fpsprobesize 0`
+  (the same 20-frame wait cost it 5 s a join). Pixel smoke:
+  `viewer_connects_fast` (a retrying caller has a frame within 5 s).
+- **stale stream parameters (0.4).** `ffmpeg -c copy` keeps the stream
+  parameters it opened with: after a mid-stream frame-size change
+  (Shot Mode) a joining viewer was told the old size while the frames
+  were the new one. The helper exits (8) on a size change and the pair
+  respawns, one reconnect for the viewer. And a frame read while the
+  producer is still writing is retried, never dropped with the cursor
+  advanced: a still scene publishes its new frame once, and losing it
+  left the previous picture on the stream.
+- **the replica window IS the stream (0.4).** The ring takes the viewport's
+  size, so a fullscreen kiosk had Cycles rendering 3840x2160 for a 2560
+  stream. The agent's `replica_resolution` (1920x1080 default, 2560x1440,
+  1280x720, fullscreen, WxH) launches Blender with `--window-geometry`
+  (POINTS: pixels / the backing scale the add-on reports once), kiosk
+  maximises the area and strips chrome, and OS fullscreen is only the
+  `fullscreen` preset. The add-on's stream width mirrors the agent's
+  setting. Measured: a 960x540-point window on the Retina Mac gives a
+  1920x1080 framebuffer after `screen_full_area`; 1:1 on the box.
+- **QCView listens; the card (0.4).** QCView is never launched by Blender
+  (the launch inherited Blender's own `OCIO` variable, and QCView loaded
+  Blender's bundled config under the name "$OCIO"). The host add-on
+  writes `blender.json` into QCView's Inputs folder on the host machine
+  (`%ProgramData%\QCView\Inputs` on Windows — ProgramData is never
+  virtualized, the Store build reads its output manifests there;
+  `~/Library/Application Support/QCView/Inputs` on macOS): port,
+  passphrase (the same derivation as the link), the colour block as the
+  link's keys, the panel rows and mismatch rows; rewritten on change (1 Hz
+  digest), removed on stop. QCView watches the folder and opens an SRT
+  LISTENER on the port; the replica's mux CALLS it — the hello carries the
+  viewer port, the agent tells the add-on the peer's address (`peer_addr`),
+  the stream descriptor carries `push`. The replica listens as before when
+  the host has no viewer block (an older host) or the preference is off,
+  and the legacy `qcview://stream` launch scrubs `OCIO`. The AE/Premiere
+  bridges hand off through shared memory on one machine; this is the
+  file-shaped equivalent for a stream that crosses the network.
+- **library files on demand (0.4).** A linked library the replica cannot
+  place — no mapping matched, or a mapped path that is not there — goes
+  into its pong (`need_libs`, host-native paths from the link headers and
+  the bootstrap's unplaced list). The host ships each readable one once
+  (`libfile` cold blob, ≤ 64 MB, meta lib/sha1/name) or answers
+  `lib_missing` (not on the host either, too big); the replica stores it
+  under `<config>/qcbridge-libcache/<sha1>-<name>` and relinks. Textures
+  are NOT shipped: the path mapping serves them from the share (1.3 GB in
+  the audited project). The status names the files it could not place
+  and the libraries missing on the host too, instead of "N unmapped
+  paths" (the audited project's four were broken on the host).
+- **the timeline (0.4).** Every session writes one line per stage on each
+  end (`ring1/timeline.py`, `qcbridge-timeline-<role>.log` in Blender's
+  config folder): agent, handshake, every bootstrap with its reason and
+  bytes, deltas, gaps, apply errors, engine adoption, first signal and
+  first published frame, encoder spawns and exits with why, the card,
+  Shot Mode. The audit of 2026-10-27 took hours without it; with it the
+  second run took one read.
 
 ## Caches
 

@@ -21,7 +21,15 @@ FF="${QCB_HARNESS_FFMPEG:-$(dirname "$QCV_APP")/../Helpers/ffmpeg}"
 export QCB_HARNESS_FFMPEG="$FF"
 PYNUMPY="${BLENDER_PYTHON:-$(ls -d /Applications/Blender.app/Contents/Resources/*/python/bin/python3* 2>/dev/null | head -1)}"
 rm -f "$SCRATCH"/host.json "$SCRATCH"/replica.json "$SCRATCH"/harness.json "$SCRATCH"/wire.yuv "$SCRATCH"/qcv_capture.png
-mkdir -p "$SCRATCH/bl_replica" "$SCRATCH/bl_host" "$SCRATCH/qcv-settings"
+mkdir -p "$SCRATCH/bl_replica" "$SCRATCH/bl_host" "$SCRATCH/qcv-settings" "$SCRATCH/qcv-inputs"
+# 0.4: the host writes QCView's card into this Inputs folder (QCV_INPUTS_DIR
+# on both the add-on and QCView); QCView listens on the viewer port and the
+# replica calls it. The wire grab below is a listener on that port too,
+# before QCView takes it.
+export QCV_INPUTS_DIR="$SCRATCH/qcv-inputs"
+VIEWER_PORT="${QCB_HARNESS_VIEWER_PORT:-19997}"
+export QCB_HARNESS_VIEWER_PORT="$VIEWER_PORT"
+rm -f "$SCRATCH/qcv-inputs/blender.json"
 pkill -f 'srt://127.0.0.1:19998\?mode=listener' 2>/dev/null
 pkill -f 'qcb-encode-(mac|win)(\.exe)? --shm qcb-' 2>/dev/null
 
@@ -61,7 +69,8 @@ t0 = time.time()
 while time.time() - t0 < 180:
     h, r = load("host.json"), replica_view()
     if (h.get("deep_link") and h.get("shot") and "streaming" in (r.get("pixel") or "")
-            and (r.get("readback") or {}).get("published", 0) >= 5):   # a STILL scene: the hash skip keeps this low
+            and (r.get("readback") or {}).get("published", 0) >= 5    # a STILL scene: the hash skip keeps this low
+            and (h.get("viewer_card_path") or os.environ.get("QCB_HARNESS_PUSH") == "0")):
         break
     time.sleep(0.5)
 else:
@@ -78,8 +87,16 @@ h = load("host.json")
 open(f"{S}/link.txt", "w").write(h["deep_link"])
 import urllib.parse
 q = urllib.parse.parse_qs(urllib.parse.urlsplit(h["deep_link"]).query)
-open(f"{S}/url.txt", "w").write(q["url"][0])
-print("rig up:", h.get("display"), h.get("view"), "| mismatches:", h.get("cm_mismatches"))
+push = (h.get("peer_stream") or {}).get("push") or {}
+if push:
+    # the replica calls the viewer port on this machine: the wire grab (and
+    # then QCView) LISTENS there, with the same passphrase the caller carries
+    card = json.load(open(h["viewer_card_path"]))
+    open(f"{S}/url.txt", "w").write(card["url"].replace("0.0.0.0", "127.0.0.1"))
+    open(f"{S}/card.json", "w").write(json.dumps(card, indent=1))
+else:
+    open(f"{S}/url.txt", "w").write(q["url"][0])
+print("rig up:", h.get("display"), h.get("view"), "| push:", bool(push), "| mismatches:", h.get("cm_mismatches"))
 EOF
 RC=$?
 if [ $RC -ne 0 ]; then kill $HOST_PID $REPLICA_PID 2>/dev/null; exit 2; fi
@@ -100,20 +117,23 @@ for attempt in 1 2 3 4 5; do
   sleep 3
 done
 
-# 4. QCView through the link: the capture is the host's view for the host's
-#    display, as shown (captureScreenshot runs the SDR capture chain).
+# 4. QCView: with the card (0.4) it listens for the replica by itself and
+#    applies the chain from the card; the legacy link path (QCB_HARNESS_PUSH=0)
+#    opens the link. The capture is the host's view for the host's display,
+#    as shown (captureScreenshot runs the SDR capture chain).
 LINK="$(cat "$SCRATCH/link.txt")"
-sleep 5   # the listener relistens after the grab's viewer left
+if [ -f "$SCRATCH/card.json" ]; then LINK=""; fi
+sleep 5   # the replica re-dials once the grab's listener is gone
 # QCView runs on its bundled configs whatever the shell's OCIO says (the
 # Blenders keep it): the decision of 2026-10-27. The capture waits for the
 # decoder to be live; the connect itself can take a retry or two.
 env -u OCIO QCV_SETTINGS_DIR="$SCRATCH/qcv-settings" QCV_CAPTURE_PNG="$SCRATCH/qcv_capture.png@40" \
   QCV_QML_EVAL='38:("engine " + WindowManager.ocio.engine + " engaged " + WindowManager.ocio.engaged + " host " + JSON.stringify(WindowManager.ocio.clipHostDisplay(WindowManager.project.activeItemId)))' \
-  "$QCV_APP" "$LINK" > "$SCRATCH/qcview.log" 2>&1 &
+  "$QCV_APP" $LINK > "$SCRATCH/qcview.log" 2>&1 &
 Q=$!
 sleep 46
 kill $Q 2>/dev/null
-grep -E 'QCV_QML_EVAL|QCV_CAPTURE|openProjectLink: (host display|stream colour)|LiveStreamDecoder: LIVE' "$SCRATCH/qcview.log" | cut -c1-200
+grep -E 'QCV_QML_EVAL|QCV_CAPTURE|openProjectLink: (host display|stream colour)|LiveStreamDecoder: LIVE|blenderInput' "$SCRATCH/qcview.log" | cut -c1-200
 
 # 5. compare
 "$PYNUMPY" "$HERE/harness_colour.py" "$SCRATCH"

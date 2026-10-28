@@ -597,6 +597,7 @@ def _start_replica(prefs) -> None:
                 # pixel path (a caller instead of a listener) on its next tick.
                 viewer = dict(msg.get("viewer") or {})
                 addr = _host_of(getattr(transport, "peer_addr", "") or "")
+                timeline.mark("hello.viewer", enabled=viewer.get("enabled"), port=viewer.get("port"), addr=addr or "(unknown yet)")
                 if viewer != state.get("viewer") or addr != state.get("viewer_addr"):
                     state["viewer"] = viewer
                     state["viewer_addr"] = addr
@@ -708,6 +709,12 @@ def _start_replica(prefs) -> None:
     def _viewer_watch():
         if state["transport"] is not transport:
             return None
+        # The agent's peer-address event and the hello race on the IO
+        # thread: when the address shows up after the hello, re-aim.
+        addr_now = _host_of(getattr(transport, "peer_addr", "") or "")
+        if (state.get("viewer") or {}).get("enabled") and addr_now and addr_now != state.get("viewer_addr"):
+            state["viewer_addr"] = addr_now
+            state["viewer_pending"] = True
         if state.get("viewer_pending"):
             state["viewer_pending"] = False
             url = _replica_srt_url(prefs)

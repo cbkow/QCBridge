@@ -772,6 +772,9 @@ class HostTransportAgent:
             else:
                 self.link_note = event.get("reason") or ""
                 self._last_pong = 0.0
+        elif name == "peer_addr":   # the other agent's "ip:port" as ours sees it (any observer)
+            if event.get("addr"):
+                self.peer_addr = str(event.get("addr"))
         elif name == "stats":
             self.stats = event
         elif name == "cold_dropped":

@@ -351,6 +351,9 @@ pub async fn serve_one(ctx: Arc<Ctx>, endpoint: &quinn::Endpoint) -> Result<()> 
         }
     }
 
+    // The peer's address reaches the addon whatever the observer (the
+    // unsupervised replica of the smokes has none): its own event.
+    ctx.link.event_try(serde_json::json!({"event": "peer_addr", "addr": conn.remote_address().to_string()}));
     ctx.observer().peer_up(None, Some(conn.remote_address().to_string()));
     let lanes = Lanes {
         control_send,
@@ -461,6 +464,7 @@ pub async fn connect_one(ctx: Arc<Ctx>, target: &HostTarget) -> Result<()> {
             return Err(e);
         }
     };
+    ctx.link.event_try(serde_json::json!({"event": "peer_addr", "addr": conn.remote_address().to_string()}));
     ctx.observer().peer_up(fingerprint, Some(conn.remote_address().to_string()));
     let r = run_lanes(ctx.clone(), conn, lanes).await;
     ctx.observer().peer_down(r.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default());

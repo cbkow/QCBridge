@@ -29,6 +29,8 @@ prefs = SimpleNamespace(
     enable_stream=True, srt_port=19998, srt_url="", srt_latency_ms=120,
     pixel_source="readback", stream_bitrate_mbps=50, stream_width=1280, stream_fps=30,
     ffmpeg_path="", replica_kiosk=False, path_mappings=[],
+    # 0.4: QCView listens on this machine (the card), the replica calls.
+    viewer_push=os.environ.get("QCB_HARNESS_PUSH", "1") == "1", viewer_port=int(os.environ.get("QCB_HARNESS_VIEWER_PORT", "19997")),
 )
 
 
@@ -53,6 +55,8 @@ if True:  # Blender runs this file as the script; the scene lives in harness_col
             json.dump({"seq": sync.seq, "note": session.state["note"],
                        "viewer_url": session.viewer_url(), "deep_link": session.qcview_deep_link(),
                        "peer_stream": session.state.get("peer_stream"),
+                       "viewer_card_path": session.state.get("viewer_card_path"),
+                       "viewer_card_error": session.state.get("viewer_card_error"),
                        "peer_status": getattr(session.state["transport"], "peer_status", {}),
                        "cm_host": session.state.get("cm"), "cm_replica": session.state.get("peer_cm"),
                        "cm_mismatches": session.state.get("cm_mismatches"),
