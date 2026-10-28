@@ -219,9 +219,36 @@ def agent_socket_info(role: str) -> tuple[str, int, str] | None:
     try:
         with open(path, encoding="utf-8") as f:
             info = json.load(f)[role]
-        return ("127.0.0.1", int(info["port"]), str(info["secret"]))
+        port = int(info["port"])
+        if not _port_answers(port):
+            # agent.json outlives a quit agent (2026-10-28: the old 0.3.0
+            # was quit after the 0.4.0 install, the file still named its
+            # port, Start Session attached to nothing and raised instead
+            # of launching the new one). A port nobody answers = no agent.
+            return None
+        return ("127.0.0.1", port, str(info["secret"]))
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+_port_probe: dict[int, tuple[float, bool]] = {}   # port -> (checked at, answers)
+
+
+def _port_answers(port: int, max_age: float = 1.0) -> bool:
+    """A quick connect to the agent's addon socket (cached a second: the
+    panel asks on every redraw)."""
+    import socket
+    now = time.monotonic()
+    hit = _port_probe.get(port)
+    if hit and now - hit[0] < max_age:
+        return hit[1]
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            ok = True
+    except OSError:
+        ok = False
+    _port_probe[port] = (now, ok)
+    return ok
 
 
 def use_agent(role: str) -> bool:
@@ -400,7 +427,20 @@ class _AgentLink(_FrameLink):
         import socket
 
         host, port, secret = self._info
-        self._sock = socket.create_connection((host, port), timeout=5.0)
+        # A just-launched agent registers before its socket listens (seen
+        # up to ~70 s on a cold start while it tries its peer first): keep
+        # trying instead of raising a Python error into the panel.
+        last_exc: Exception | None = None
+        deadline = time.monotonic() + 20.0
+        while True:
+            try:
+                self._sock = socket.create_connection((host, port), timeout=5.0)
+                break
+            except OSError as exc:
+                last_exc = exc
+                if time.monotonic() >= deadline:
+                    raise ConnectionError(f"agent at 127.0.0.1:{port} did not answer for 20 s: {exc}") from exc
+                time.sleep(0.5)
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock.settimeout(None)
         self._sendall_parts(self._frame(T_CMD, json.dumps(
