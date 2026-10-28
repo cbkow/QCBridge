@@ -289,6 +289,7 @@ def _supervise_native(cap_cmd_fn, mux_cmd: list[str], log_path: Path) -> None:
             except OSError:
                 pass
             _status = "streaming (readback)"
+            calling = "mode=caller" in " ".join(mux_cmd)
             pumps = [
                 threading.Thread(target=_pump_log, args=(_proc, log), name="qcb-pixel-log", daemon=True),
                 threading.Thread(target=_pump_prefixed, args=(_cap_proc, log, b""), name="qcb-capture-log", daemon=True),
@@ -297,6 +298,12 @@ def _supervise_native(cap_cmd_fn, mux_cmd: list[str], log_path: Path) -> None:
                 t.start()
             while not _stop.is_set() and _proc.poll() is None and _cap_proc.poll() is None:
                 _stop.wait(0.25)
+                # Calling the host's viewer (0.4): a mux that has lived a few
+                # seconds was answered (a refused call ends it in ~3 s). The
+                # pong carries this word to the host panel's one-line state.
+                if calling and _status == "streaming (readback)" and time.monotonic() - spawned_at > 5.0:
+                    _status = "streaming (readback) · viewer connected"
+                    timeline.mark("pixel.viewer_connected")
             mux_exited_first = _proc.poll() is not None and _cap_proc.poll() is None
             for child in (_proc, _cap_proc):
                 if child.poll() is None:

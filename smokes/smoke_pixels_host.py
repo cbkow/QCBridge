@@ -60,6 +60,7 @@ def dump():
     with open(tmp, "w") as f:
         json.dump({"seq": sync.seq, "note": session.state["note"],
                    "viewer_url": session.viewer_url(), "deep_link": session.qcview_deep_link(),
+                       "summary": session.summary_line(), "status_rows": session.status_rows(),
                    "peer_stream": session.state.get("peer_stream"),
                    "peer_status": getattr(session.state["transport"], "peer_status", {}),
                    "cm_host": session.state.get("cm"), "cm_replica": session.state.get("peer_cm"),

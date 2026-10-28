@@ -1252,6 +1252,66 @@ def _replica_overlay_text() -> str:
     return " · ".join(bits)
 
 
+def summary_line() -> tuple[str, bool]:
+    """The panel's one line (2026-10-28, with chris): what matters now, red
+    only when something is wrong. The long readout lives in Details."""
+    if not running():
+        return "Not running", False
+    note = state.get("note") or ""
+    role = state.get("role")
+    if note != "connected":
+        bad = any(w in note for w in ("lost", "denied", "unreachable", "ended"))
+        return (note[:1].upper() + note[1:]), bad
+    warns: list[str] = []
+    if role == "HOST":
+        transport = state.get("transport")
+        peer = getattr(transport, "peer_status", {}) or {}
+        pixel = str(peer.get("pixel") or "")
+        rb = peer.get("readback") or {}
+        size = rb.get("size") or []
+        prefs = state.get("prefs")
+        push_on = bool(getattr(prefs, "viewer_push", False)) and bool(getattr(prefs, "enable_stream", True))
+        if "streaming" in pixel:
+            head = "● Live"
+            if len(size) == 2 and size[0]:
+                head += f" · {size[0]}x{size[1]}"
+            if push_on:
+                if "viewer connected" in pixel:
+                    head += " · QCView connected"
+                elif (state.get("peer_stream") or {}).get("push"):
+                    head += " · calling QCView, nothing answering yet"
+                else:
+                    head += " · replica listens (older replica)"
+        elif not getattr(prefs, "enable_stream", True):
+            head = "● Connected · stream off"
+        else:
+            head = "● Connected · stream starting" + (f" ({pixel})" if pixel and pixel != "off" else "")
+        for lv, _key, text in state.get("cm_mismatches") or []:
+            if lv == "error":
+                warns.append(text.replace("⚠ ", "").split(" — ")[0])
+                break
+        if peer.get("unmapped"):
+            warns.append(f"{peer['unmapped']} file(s) not found on the replica")
+        if peer.get("libs_missing_on_host"):
+            warns.append(f"{len(peer['libs_missing_on_host'])} librar{'y' if len(peer['libs_missing_on_host']) == 1 else 'ies'} missing on the host too")
+        if peer.get("want_resync"):
+            warns.append("resync recommended")
+        if peer.get("local_edits"):
+            warns.append(f"replica edited locally: {peer.get('last_local_edit') or '?'}")
+        if _version_warning():
+            warns.append(_version_warning().replace("⚠ ", ""))
+    else:
+        head = "● Connected"
+    if warns:
+        return head + " · ⚠ " + warns[0] + (f" (+{len(warns) - 1})" if len(warns) > 1 else ""), True
+    return head, False
+
+
+def status_rows() -> list[str]:
+    """The long readout, one fact per row (the Details sub-panel)."""
+    return [b for b in status_text().split(" · ") if b]
+
+
 def status_text() -> str:
     if not running():
         return "idle"

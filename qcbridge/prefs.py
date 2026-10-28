@@ -651,9 +651,7 @@ def _draw_colour(layout) -> None:
     st = session.state
     host_cm = st.get("cm") if st.get("role") == "HOST" else st.get("peer_cm")
     rep_cm = st.get("peer_cm") if st.get("role") == "HOST" else st.get("cm")
-    box = layout.box()
-    head = box.row()
-    head.label(text="Colour", icon="COLOR")
+    box = layout
     split = box.split(factor=0.34)
     labels, hcol, rcol = split.column(), split.column(), split.column()
     labels.label(text="")
@@ -691,7 +689,12 @@ class QCB_PT_main(Panel):
             layout.label(text=f"Role: {prefs.role.title()}")
         else:
             layout.prop(prefs, "role", text="Role")
-        layout.label(text=f"Status: {session.status_text()}")
+        # One line that says what matters now (2026-10-28, with chris); the
+        # long readout and the colour columns live in the sub-panels below.
+        text, alert = session.summary_line()
+        row = layout.row()
+        row.alert = alert
+        row.label(text=text, icon="ERROR" if alert else "NONE")
         # A receiving machine's Blender is the agent's: launched when the
         # host starts a session, closed when it ends (2026-09-25). Nothing
         # to start or stop here — the panel is status, plus the way to get
@@ -701,33 +704,75 @@ class QCB_PT_main(Panel):
             layout.operator("qcbridge.kiosk_toggle", text=label, icon="FULLSCREEN_ENTER")
             return
         if session.running():
-            _draw_colour(layout)
             layout.operator("qcbridge.session_stop", icon="PAUSE")
             if prefs.role == "HOST":
-                label = "Resume Sync" if session.state["paused"] else "Pause Sync"
-                layout.operator("qcbridge.session_pause", text=label)
-                layout.operator("qcbridge.force_resync", icon="FILE_REFRESH")
+                # Shot Mode with the replica zoom beside it: the zoom only
+                # means something inside the fitted camera frame.
                 row = layout.row(align=True)
-                row.operator("qcbridge.open_qcview", icon="PLAY")
-                row.operator("qcbridge.copy_stream_url", text="", icon="COPYDOWN")
-                layout.operator(
-                    "qcbridge.shot_mode",
-                    icon="CAMERA_DATA",
-                    depress=session.state["shot_mode"],
-                )
-                row = layout.row(align=True)
-                row.label(text="Replica Zoom")
+                row.operator("qcbridge.shot_mode", icon="CAMERA_DATA", depress=session.state["shot_mode"])
                 op = row.operator("qcbridge.replica_zoom", text="", icon="REMOVE")
                 op.delta = -6.0
                 op = row.operator("qcbridge.replica_zoom", text="", icon="ADD")
                 op.delta = 6.0
                 op = row.operator("qcbridge.replica_zoom", text="", icon="LOOP_BACK")
                 op.reset = True
+                row = layout.row(align=True)
+                label = "Resume Sync" if session.state["paused"] else "Pause Sync"
+                row.operator("qcbridge.session_pause", text=label)
+                row.operator("qcbridge.force_resync", icon="FILE_REFRESH")
+                # Streaming is a property of a running session: with "Stream
+                # to QCView here" QCView picks it up by itself and there is
+                # nothing to press. The legacy link only when that is off.
+                if not getattr(prefs, "viewer_push", True):
+                    row = layout.row(align=True)
+                    row.operator("qcbridge.open_qcview", icon="PLAY")
+                    row.operator("qcbridge.copy_stream_url", text="", icon="COPYDOWN")
         else:
             layout.operator("qcbridge.session_start", icon="PLAY")
         if (_agent_role_label(prefs).startswith("Receive") if agent_mode else prefs.role == "REPLICA"):
             label = "Exit Minimal Mode" if kiosk.active() else "Minimal Mode"
             layout.operator("qcbridge.kiosk_toggle", text=label, icon="FULLSCREEN_ENTER")
+
+
+class QCB_PT_colour(Panel):
+    """Colour awareness, collapsed by default: the two columns and every
+    disagreement. Error rows are lifted into the main panel's line too, so
+    a closed panel never hides one."""
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "QC Bridge"
+    bl_parent_id = "QCB_PT_main"
+    bl_label = "Colour"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return session.running()
+
+    def draw(self, context):
+        _draw_colour(self.layout)
+
+
+class QCB_PT_details(Panel):
+    """The long readout, one fact per row: transport, versions, counters,
+    the replica's stream state and what it could not find."""
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "QC Bridge"
+    bl_parent_id = "QCB_PT_main"
+    bl_label = "Details"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return session.running()
+
+    def draw(self, context):
+        col = self.layout.column(align=True)
+        for bit in session.status_rows():
+            row = col.row()
+            row.alert = bit.startswith("⚠")
+            row.label(text=bit)
 
 
 def get_prefs(context) -> QCBridgePreferences:
@@ -753,6 +798,8 @@ _classes = (
     QCB_OT_copy_stream_url,
     QCBridgePreferences,
     QCB_PT_main,
+    QCB_PT_colour,     # sub-panels after their parent
+    QCB_PT_details,
 )
 
 

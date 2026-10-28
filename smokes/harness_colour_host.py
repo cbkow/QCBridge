@@ -54,6 +54,7 @@ if True:  # Blender runs this file as the script; the scene lives in harness_col
         with open(tmp, "w") as f:
             json.dump({"seq": sync.seq, "note": session.state["note"],
                        "viewer_url": session.viewer_url(), "deep_link": session.qcview_deep_link(),
+                       "summary": session.summary_line(), "status_rows": session.status_rows(),
                        "peer_stream": session.state.get("peer_stream"),
                        "viewer_card_path": session.state.get("viewer_card_path"),
                        "viewer_card_error": session.state.get("viewer_card_error"),
