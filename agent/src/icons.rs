@@ -1,8 +1,10 @@
-//! The icons, embedded: QCView's "Q" glyph in mid grey (tray) and near
-//! white on the dark square (window and app), rendered by
+//! The icons, embedded: QCView's "Q" glyph in mid grey (tray) and in the
+//! family's accent blue (#0189f1) on the dark square (window and app - the
+//! owner, 2026-11-19: "lets just use the regular QCView logo with a different
+//! color ... the blue"; the QB mark of `revisedLogo.svg` was tried the same
+//! day and set aside), rendered by
 //! `tools/icons` into `assets/icons/` (decided 2026-09-24). The tray icon
-//! carries NO status dot (the owner, 2026-11-19: the revised QB mark fills the
-//! icon and a dot covers part of it wherever it sits - "maybe the dot is not
+//! carries NO status dot (the owner, 2026-11-19: "maybe the dot is not
 //! needed and we just have status in the menu"): how the agent stands is the
 //! menu's first line and the tooltip.
 
