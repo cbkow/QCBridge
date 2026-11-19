@@ -6,6 +6,47 @@ matching versions on **both machines**: the ends now tell each other their
 version at connect, and the panel warns if they don't match. Mismatched ends
 mostly work, but they degrade in confusing ways — update both.
 
+## 0.5.0 — 2026-11-19
+
+**A session starts faster and its picture does not freeze.** Measured over a
+VPN, Mac to Windows: the receiver's sender was started four times in the first
+seven seconds of a session and each restart cost the viewer a dead connection
+of about five seconds, because the muxer was ended before its encoder and
+never closed SRT. Now the encoder is ended first and the muxer closes the
+connection itself; the first start waits for the sender's hello, and the
+re-aim, the first start and the loaded file's working space are one start when
+the project has loaded. A hello that timed out is sent again at once, a hello
+is not sent before the agent's secret is in, and a receiver that is still
+starting says so instead of "token mismatch". SRT itself was 0.4 s of a
+21 s start; nothing about the transport changed.
+
+**Simulation-zone bakes are read on the receiver, and stay read.** Blender 5.3
+does not read a disk bake whose folder is corrected after the file is loaded,
+and an object that is sent again arrives without its bake folder. The receiver
+now resets a repointed bake so it is read, keeps each modifier's folder and
+gives it back to an arrival that has none. Its timeline says what it found in
+each bake folder. Blender's own bundled asset libraries (Essentials) are no
+longer rewritten: every load of a file using them counted six errors.
+
+**The agent.**
+- Its settings window is rebuilt on the family's UI kit (the one QCView 3,
+  minNotes, minRender and UFB use). Same settings; a path-mapping row whose
+  Windows or macOS column cannot be one is flagged; one window at a time;
+  Diagnostics has Open log and the last problem; the unused wire-rate cap is
+  gone.
+- Blender on Windows is found again after an upgrade: when the configured
+  path is gone, the newest Blender installed is launched.
+- Blender is kept open five minutes after a session (was 20 s), so the next
+  start does not pay a cold launch.
+- An address the machine cannot listen on no longer makes the agent
+  unreachable for its own settings window.
+- Messages that waited more than 20 s for a Blender that was not there are
+  not replayed when it attaches.
+- The icon is QCView's Q in blue; the tray icon carries no status dot (the
+  state is the menu's first line) and follows the menu bar's colour on macOS.
+
+Install 0.5.0 on **both machines**.
+
 ## 0.4.0 — 2026-10-28 (folds in the unpublished 0.3.0 of 2026-10-27)
 
 **QCView listens; the replica calls; nothing launches QCView.** The host
