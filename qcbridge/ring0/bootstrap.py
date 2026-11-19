@@ -49,6 +49,19 @@ _PATH_COLLECTIONS = (
 
 _DEBUG = bool(os.environ.get("QCB_DEBUG"))
 
+# Replica: where each geometry-nodes modifier's disk bake is on THIS machine,
+# by (object identity, modifier name). A tier-2 resend of the object arrives
+# with an EMPTY bake_directory (libraries.write drops the relative folder -
+# probed 2026-11-19), and an object with bake nodes is resent on every bare
+# geometry update, so without this the bake was lost again moments after the
+# project loaded. Refilled at every bootstrap.
+_bake_dirs: dict[tuple[str, str], str] = {}
+
+
+def _bake_key(obj, modifier) -> tuple[str, str]:
+    return (str(obj.get("qcbridge_uuid") or obj.name), modifier.name)
+
+
 last_unmapped: list[str] = []   # "Type:name:path" of what the last apply_mainfile could not place
 
 
@@ -153,6 +166,15 @@ def localize_object_paths(objects, local_dir: str, mappings) -> tuple[int, int, 
     rebaked = []       # geometry-nodes modifiers whose bake folder was repointed
     for obj in objects:
         try:
+            # an arrival that lost its bake folder gets back the one this machine had for it
+            for m in obj.modifiers:
+                if m.type == "NODES" and len(m.bakes) and not m.bake_directory and m.bake_target == "DISK":
+                    kept = _bake_dirs.get(_bake_key(obj, m))
+                    if kept and os.path.isdir(kept):
+                        m.bake_directory = kept
+                        fixed += 1
+                        rebaked.append(m)
+                        timeline.mark("bake.dir_restored", object=obj.name[:40], modifier=m.name[:40])
             pairs = list(_iter_object_paths(obj))
         except ReferenceError:
             continue
@@ -224,6 +246,20 @@ def localize_object_paths(objects, local_dir: str, mappings) -> tuple[int, int, 
     # the object, toggling the modifier, the bake target and a same-value
     # group assignment all leave it unbaked; off-and-on reads the bake at
     # once and keeps the modifier's inputs and bake ids.
+    for obj in objects:
+        try:
+            for m in obj.modifiers:
+                if m.type == "NODES" and len(m.bakes) and m.bake_directory and not m.bake_directory.startswith("//"):
+                    key = _bake_key(obj, m)
+                    if _bake_dirs.get(key) != m.bake_directory:
+                        # (said once per folder: what this machine found there - the answer to
+                        # "why is the cache not used here")
+                        found = os.path.isdir(m.bake_directory)
+                        timeline.mark("bake.dir", object=obj.name[:40], modifier=m.name[:40], found=found,
+                                      files=(sum(len(f) for _, _, f in os.walk(m.bake_directory)) if found else 0))
+                    _bake_dirs[key] = m.bake_directory
+        except ReferenceError:
+            continue
     for m in rebaked:
         try:
             group = m.node_group
@@ -253,6 +289,7 @@ def apply_mainfile(
     path = Path(tempfile.gettempdir()) / f"qcb-in-{blob_tag}.blend"
     path.write_bytes(data)
     last_unmapped.clear()
+    _bake_dirs.clear()
     t_open = time.monotonic()
     try:
         bpy.ops.wm.open_mainfile(filepath=str(path), load_ui=False)
