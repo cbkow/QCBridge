@@ -1,15 +1,15 @@
 //! The icons, embedded: QCView's "Q" glyph in mid grey (tray) and near
 //! white on the dark square (window and app), rendered by
-//! `tools/icons` into `assets/icons/` (decided 2026-09-24). The tray's
-//! dot, lower-left, says how the agent stands.
+//! `tools/icons` into `assets/icons/` (decided 2026-09-24). The tray icon
+//! carries NO status dot (the owner, 2026-11-19: the revised QB mark fills the
+//! icon and a dot covers part of it wherever it sits - "maybe the dot is not
+//! needed and we just have status in the menu"): how the agent stands is the
+//! menu's first line and the tooltip.
 
 pub const TRAY_PLAIN: &[u8] = include_bytes!("../assets/icons/tray-plain-64.png");
-pub const TRAY_LIVE: &[u8] = include_bytes!("../assets/icons/tray-live-64.png");
-pub const TRAY_WAIT: &[u8] = include_bytes!("../assets/icons/tray-wait-64.png");
-pub const TRAY_OFF: &[u8] = include_bytes!("../assets/icons/tray-off-64.png");
 pub const APP_256: &[u8] = include_bytes!("../assets/icons/app-256.png");
 
-/// What the tray's dot shows.
+/// How the agent stands, as the tray tells it (the menu's status line; once the dot's colour).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrayState {
     /// A session is up.
@@ -22,11 +22,8 @@ pub enum TrayState {
 
 impl TrayState {
     pub fn png(self) -> &'static [u8] {
-        match self {
-            TrayState::Live => TRAY_LIVE,
-            TrayState::Waiting => TRAY_WAIT,
-            TrayState::Off => TRAY_OFF,
-        }
+        let _ = self;   // one picture for every state; the state is said in the menu
+        TRAY_PLAIN
     }
 
     /// From what the tray already knows: pairing first, then the status
@@ -65,7 +62,7 @@ mod tests {
 
     #[test]
     fn embedded_icons_decode_to_64_px_rgba() {
-        for bytes in [TRAY_PLAIN, TRAY_LIVE, TRAY_WAIT, TRAY_OFF] {
+        for bytes in [TRAY_PLAIN] {
             let (rgba, w, h) = rgba(bytes);
             assert_eq!((w, h), (64, 64));
             assert_eq!(rgba.len(), 64 * 64 * 4);

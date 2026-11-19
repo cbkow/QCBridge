@@ -179,13 +179,9 @@ fn main() {
         return;
     }
 
-    // Tray: 32 and 64 px, four states.
-    let dots: [(&str, Option<(u8, u8, u8)>); 4] = [
-        ("plain", None),
-        ("live", Some((0x3d, 0xdc, 0x84))),
-        ("wait", Some((0xf5, 0xa6, 0x23))),
-        ("off", Some((0xe5, 0x48, 0x48))),
-    ];
+    // Tray: 32 and 64 px, the mark alone. (No status dot since 2026-11-19: the revised mark fills the icon; the
+    // state is said in the tray's menu. The dotted candidates are still drawn on the --sheet.)
+    let dots: [(&str, Option<(u8, u8, u8)>); 1] = [("plain", None)];
     for (name, dot) in dots {
         for size in [32u32, 64] {
             save(&tray_icon(&svg, size, &color, dot), &out.join(format!("tray-{name}-{size}.png")));
