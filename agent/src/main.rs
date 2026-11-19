@@ -795,6 +795,10 @@ mod tray {
                         .with_menu(Box::new(menu.clone()))
                         .with_tooltip("QCBridge Agent")
                         .with_icon(icon(qcbridge_agent::icons::TrayState::Waiting))
+                        // macOS: a TEMPLATE image - the system draws it black on a light menu bar and white on
+                        // a dark one, like every other menu bar icon. Possible now that it carries no coloured
+                        // dot (the owner, 2026-11-19). Elsewhere the flag does nothing and the mark stays mid grey.
+                        .with_icon_as_template(cfg!(target_os = "macos"))
                         .build()
                         .expect("tray icon"),
                 );
@@ -804,12 +808,9 @@ mod tray {
                 status_item.set_text(&s);
                 last_status = s;
             }
-            // The dot follows the pairing: green up, amber waiting, red off.
+            // (the icon is one picture for every state since 2026-11-19; the state is the menu's first line)
             let want = qcbridge_agent::icons::TrayState::from_status(agent.role.lock().unwrap().peer_up(), &last_status);
-            if tray_state != Some(want) {
-                if let Some(t) = tray.as_ref() { let _ = t.set_icon(Some(icon(want))); }
-                tray_state = Some(want);
-            }
+            if tray_state != Some(want) { tray_state = Some(want); }
             // These were built once and went stale; a set_config from the
             // addon can change any of them under us, so refresh on the tick.
             let info = info_text();
