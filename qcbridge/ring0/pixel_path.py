@@ -305,13 +305,8 @@ def _supervise_native(cap_cmd_fn, mux_cmd: list[str], log_path: Path) -> None:
                     _status = "streaming (readback) · viewer connected"
                     timeline.mark("pixel.viewer_connected")
             mux_exited_first = _proc.poll() is not None and _cap_proc.poll() is None
-            for child in (_proc, _cap_proc):
-                if child.poll() is None:
-                    child.terminate()
-                    try:
-                        child.wait(timeout=2.0)
-                    except subprocess.TimeoutExpired:
-                        child.kill()
+            # (the helper first, then the mux by itself: see stop())
+            _end_children(_cap_proc, _proc)
             for t in pumps:
                 t.join(timeout=2.0)
         if _stop.is_set():
@@ -411,19 +406,47 @@ def set_external(stop_fn=None, state_fn=None) -> None:
     _external = (stop_fn, state_fn) if stop_fn and state_fn else None
 
 
+_end_lock = threading.Lock()
+
+
+def _end_children(cap, mux) -> None:
+    """End a helper and its mux so that the viewer sees the stream END.
+    Called by stop() and by the supervisor (whichever comes first does the
+    work; the other finds both gone)."""
+    with _end_lock:
+        if cap is not None and cap.poll() is None:
+            cap.terminate()
+            try:
+                cap.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                cap.kill()
+        if mux is not None and mux.poll() is None:
+            try:
+                mux.wait(timeout=2.0)
+                timeline.mark("pixel.mux_closed", how="by itself")
+            except subprocess.TimeoutExpired:
+                timeline.mark("pixel.mux_closed", how="ended by force")
+                mux.terminate()
+                try:
+                    mux.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    mux.kill()
+
+
 def stop() -> None:
     global _thread, _proc, _cap_proc
     if _external is not None:
         _external[0]()
         return
     _stop.set()
-    for child in (_proc, _cap_proc):
-        if child is not None and child.poll() is None:
-            child.terminate()
-            try:
-                child.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                child.kill()
+    # The helper goes first: its end of the pipe closes, the mux reads the end
+    # of its input, writes what it holds and CLOSES the SRT connection, so the
+    # viewer sees the stream end at once. Ending the mux first is a hard kill
+    # on Windows (TerminateProcess): no SRT shutdown is sent and the viewer
+    # sits on a dead connection until SRT's 5 s peer-idle timeout, refusing
+    # the next sender meanwhile (measured 2026-11-19: 5.5 s of frozen picture
+    # per restart). The mux is ended by force only if it has not left by itself.
+    _end_children(_cap_proc, _proc)
     if _thread is not None:
         _thread.join(timeout=5.0)
         _thread = None
