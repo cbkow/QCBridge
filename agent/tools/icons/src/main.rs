@@ -2,8 +2,8 @@
 //! cutout, `qcviewcutout.svg` in QCView-Player), kept simple: a mid grey
 //! that reads on a light or a dark menu bar (decided 2026-09-24).
 //!
-//! - tray icons: the glyph alone with a status dot in the lower-LEFT
-//!   corner, away from the magnifier's handle (green = paired, amber =
+//! - tray icons: the glyph alone with a status dot in the lower-RIGHT
+//!   corner, away from the Q's handle (green = paired, amber =
 //!   waiting, red = off/error), plus one without a dot; 32 and 64 px;
 //! - the window/app icon: the glyph on the dark rounded square QCView
 //!   uses, 512 px and the standard sizes; a Windows .ico and, on macOS,
@@ -87,7 +87,9 @@ fn tray_icon(svg: &str, size: u32, color: &str, dot: Option<(u8, u8, u8)>) -> Pi
     over(&mut pm, &g, 0, 0);
     if let Some(rgb) = dot {
         let r = size as f32 * 0.17;
-        let cx = r + 1.0; // lower-left: the handle is at lower-right
+        // lower-RIGHT: the revised mark (2026-11-10) has the Q's handle at the lower left, and the dot must not
+        // cover it (the owner, 2026-11-19). The first mark had its handle at the lower right and the dot left.
+        let cx = size as f32 - r - 1.0;
         let cy = size as f32 - r - 1.0;
         // A dark ring so the dot reads on the glyph and on any bar.
         circle(&mut pm, cx, cy, r + size as f32 * 0.05, DARK_BG);
