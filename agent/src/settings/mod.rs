@@ -11,6 +11,9 @@
 
 mod client;
 mod theme;
+/// The same window on the family's UI kit (`--settings-next`), while it is being ported section by section.
+mod window;
+pub use window::run as run_next;
 
 use crate::config::{self, PathMapping};
 use crate::mounts;

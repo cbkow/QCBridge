@@ -62,6 +62,14 @@ tao = "0.31"
 min-ui = { path = "../../minplatform/crates/min-ui" }
 min-theme = { path = "../../minplatform/crates/min-theme" }
 min-present = { path = "../../minplatform/crates/min-present" }
+# What a window on the kit needs beside it (`--settings-next`, settings/window.rs), at minplatform's own pins:
+# its window layer is winit 0.31 (imported as `winit31`, as in minplatform's apps), the scene is vello's.
+winit31 = { package = "winit", version = "=0.31.0-beta.4", default-features = false }
+vello = "0.11.0"
+peniko = "0.6"
+kurbo = "0.13"
+raw-window-handle = "0.6.2"
+arboard = { version = "3.6.1", default-features = false }
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
 # Native folder and file pickers for every path field.
 rfd = "0.17"

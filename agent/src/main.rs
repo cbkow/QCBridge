@@ -32,7 +32,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const USAGE: &str = "\
 qcbridge-agent [--config PATH] [--no-tray] [--role host|replica] [--listen IP:PORT]
                [--peer IP:PORT] [--token T] [--local-port N] [--exit-with-addon]
-               [--settings] [--version]";
+               [--settings] [--settings-next] [--version]";
 
 /// Host-role observer: no Blender to manage. Pins the replica certificate
 /// on first successful connect (trust on first use) and tells the addon.
@@ -371,6 +371,16 @@ fn main() {
         // as a control client, so no event loop is shared with the tray.
         let cfg_path: std::path::PathBuf = args.get("config").map(Into::into).unwrap_or_else(config::config_path);
         if let Err(e) = qcbridge_agent::settings::run(cfg_path) {
+            log!("[settings] {e:#}");
+            platform::fatal_dialog("QCBridge Agent settings", &format!("{e:#}"));
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.flag("settings-next") {
+        // The same window on the family's UI kit (settings/window.rs), beside the egui one until it has every section.
+        let cfg_path: std::path::PathBuf = args.get("config").map(Into::into).unwrap_or_else(config::config_path);
+        if let Err(e) = qcbridge_agent::settings::run_next(cfg_path) {
             log!("[settings] {e:#}");
             platform::fatal_dialog("QCBridge Agent settings", &format!("{e:#}"));
             std::process::exit(1);
