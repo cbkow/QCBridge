@@ -378,6 +378,15 @@ def _start_host(prefs) -> None:
             # Main thread (a timer): the secret as of now, so a slow attach
             # or a token set meanwhile is picked up by the next hello.
             hello_secret, _ = _secrets(prefs, transport)
+            # In agent mode the secret comes with the agent's attach reply. A
+            # hello sent before it is in carries an empty one, is refused as a
+            # "token mismatch" and costs the 2 s denial pause (seen 2026-11-09
+            # and 2026-11-19). Wait for it - a few seconds at most, then send
+            # anyway so that a missing token is still reported as what it is.
+            t0 = pending.setdefault("t0", now)
+            if not hello_secret and getattr(transport, "agent_mode", False) and now - t0 < 3.0:
+                timeline.mark_changed("handshake.waiting_secret", waiting=True)
+                return 0.1
             colour_state.refresh("HOST")  # main thread: our colour state as of now
             hello = protocol.make_hello(
                 hello_secret, state["epoch"], bpy.app.version_string,
@@ -425,7 +434,14 @@ def _start_host(prefs) -> None:
             state["note"] = f"denied: {reply.get('reason', '')}"
             timeline.mark("handshake.denied", reason=reply.get("reason", ""))
             pending["req"] = None
-            return _HANDSHAKE_RETRY  # denials can be fixed live
+            # A replica that is still starting (its own secret not in yet), and
+            # the FIRST token mismatch of a session - which has been that same
+            # race every time it was seen - are asked again at once. A second
+            # mismatch is a real one: the slow pace, so it can be fixed live.
+            reason = reply.get("reason", "")
+            early = reason == "replica starting" or (reason == "token mismatch" and not pending.get("denied_once"))
+            pending["denied_once"] = pending.get("denied_once") or reason == "token mismatch"
+            return 0.4 if early else _HANDSHAKE_RETRY  # denials can be fixed live
         if now - pending["sent_at"] > _HANDSHAKE_TIMEOUT:
             transport.cancel_request(pending["req"])
             pending["req"] = None
@@ -608,8 +624,15 @@ def _start_replica(prefs) -> None:
 
     def _handler(msg: dict) -> dict:  # IO thread: strings only, no bpy
         if msg.get("kind") == "hello":
+            if getattr(transport, "agent_mode", False) and _agent_secrets(transport) is None:
+                # the agent's attach reply (with the secret) is not in yet: say so, not "token mismatch"
+                timeline.mark("hello.not_ready")
+                return {"kind": "hello_reply", "ok": False, "reason": "replica starting"}
             hello_secret, _ = _secrets(None, transport, fallback_token)
             ok, reason = protocol.check_hello(msg, hello_secret)
+            if not ok:
+                timeline.mark("hello.denied", reason=reason, have_secret=bool(hello_secret),
+                              hello_has_secret=bool(msg.get("token")))
             if ok:
                 # The host's table rides in the hello: this machine's rows
                 # first, the host's rows it lacks after them.
@@ -782,6 +805,12 @@ def _start_replica(prefs) -> None:
         # read when _start_pixel_path spawns it.
         engine_qcb.start(stream_params.width, shot_fn=replica_apply.shot_mode_on,
                          retire_cb=pixel_path.restart_ring)
+    if getattr(transport, "agent_mode", False) and getattr(prefs, "viewer_push", True):
+        # The host's hello says where its viewer listens, and it is on its way
+        # (the agent holds it for a Blender that is launching). A start made
+        # before it listens for a viewer that will never call and is restarted
+        # a moment later. Wait for the hello - or 4 s, then start as before.
+        state["pixel_hold_until"] = time.monotonic() + 4.0
     _start_pixel_path(prefs)
 
     # The host's session, as the agent reports it (2026-09-25): when it ends
