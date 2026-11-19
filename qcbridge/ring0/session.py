@@ -955,7 +955,9 @@ def _start_pixel_path(prefs, restart: bool = False) -> None:
     it runs off the main thread — house rule: the main thread never waits."""
     if not getattr(prefs, "enable_stream", True):
         return
-    if state.get("role") == "REPLICA" and time.monotonic() < state.get("pixel_hold_until", 0.0):
+    # (no test of the role: the hold is only ever set by a replica's hello handler, and the role is not
+    # written yet when a replica makes its first start - which slipped through, 2026-11-19)
+    if time.monotonic() < state.get("pixel_hold_until", 0.0):
         state["pixel_deferred"] = True
         timeline.mark("pixel.deferred", restart=restart)
         return

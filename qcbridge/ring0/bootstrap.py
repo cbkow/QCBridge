@@ -72,6 +72,14 @@ def localize_paths(datablocks, local_dir: str, mappings) -> tuple[int, int, int]
         filepath = getattr(db, "filepath", None)
         if not filepath or getattr(db, "packed_file", None) or filepath.startswith("<"):
             continue  # empty, packed, or Blender's own "<builtin>" font
+        if isinstance(db, bpy.types.Library) and "/datafiles/assets/" in filepath.replace("\\", "/"):
+            # Blender's own bundled asset libraries (Essentials: the dynamics,
+            # hair and geometry-nodes assets). The stored path is the install
+            # folder of whichever machine saved the file; every Blender finds
+            # its own copy at load. Rewriting it against the project folder
+            # made a path that exists nowhere and a failed reload - six errors
+            # on every load of a file using them (found 2026-11-19).
+            continue
         new = None
         if filepath.startswith("//"):
             if local_dir:
@@ -142,6 +150,7 @@ def localize_object_paths(objects, local_dir: str, mappings) -> tuple[int, int, 
     the host wants judged (measured 2026-09-23, run_smoke_cache)."""
     fixed = unmapped = errors = 0
     rescanned = False  # kept for readability of the branch above
+    rebaked = []       # geometry-nodes modifiers whose bake folder was repointed
     for obj in objects:
         try:
             pairs = list(_iter_object_paths(obj))
@@ -196,10 +205,35 @@ def localize_object_paths(objects, local_dir: str, mappings) -> tuple[int, int, 
                 if new and new != filepath:
                     setattr(struct, attr, new)
                     fixed += 1
+                    if attr in ("bake_directory", "directory"):
+                        owner = struct if attr == "bake_directory" else next(
+                            (m for m in obj.modifiers if m.type == "NODES" and any(b == struct for b in m.bakes)), None)
+                        if owner is not None and owner not in rebaked:
+                            rebaked.append(owner)
             except Exception as exc:
                 errors += 1
                 if _DEBUG:
                     print(f"qcb path FAIL {obj.name}.{attr}: {exc!r}", flush=True)
+    # A bake folder repointed AFTER the file was loaded is not read: Blender
+    # 5.3 looked for the bake when it first evaluated the modifier (against
+    # the temp copy's own folder, where there is none) and keeps simulating
+    # live until its simulation state is reset - by a visit to the start
+    # frame, or by this: the node group taken off and put back. Probed
+    # 2026-11-19 on the owner's cloth (a simulation zone inside a linked
+    # group, disk bake, relative folder): assigning the path alone, tagging
+    # the object, toggling the modifier, the bake target and a same-value
+    # group assignment all leave it unbaked; off-and-on reads the bake at
+    # once and keeps the modifier's inputs and bake ids.
+    for m in rebaked:
+        try:
+            group = m.node_group
+            if group is not None:
+                m.node_group = None
+                m.node_group = group
+        except Exception as exc:
+            errors += 1
+            if _DEBUG:
+                print(f"qcb bake reset FAIL {m.name}: {exc!r}", flush=True)
     del rescanned  # no reseek: the next evaluation reads the frames as they are
     return fixed, unmapped, errors
 
