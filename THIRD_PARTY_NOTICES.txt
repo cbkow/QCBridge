@@ -11,12 +11,14 @@ pyzmq — BSD-3-Clause
   The pyzmq binary wheels statically bundle libzmq (ZeroMQ), licensed
   MPL-2.0: https://github.com/zeromq/libzmq — https://www.mozilla.org/MPL/2.0/
 
-2. Fonts embedded in the agent's settings window (agent/assets/fonts/)
-----------------------------------------------------------------------
-Inter — SIL Open Font License 1.1
-  https://rsms.me/inter/ — License text: agent/assets/fonts/Inter-LICENSE.txt
-JetBrains Mono — SIL Open Font License 1.1
-  https://www.jetbrains.com/lp/mono/ — License text: agent/assets/fonts/JetBrainsMono-LICENSE.txt
+2. The agent's settings window
+------------------------------
+The window is built on the UI kit of the minplatform project (min-ui,
+min-theme, min-present) — GPL-3.0-or-later
+  https://github.com/cbkow/minplatform
+Fonts embedded with that kit:
+Geist and Geist Mono — SIL Open Font License 1.1
+  https://vercel.com/font — https://openfontlicense.org
 Phosphor Icons (icon font, the subset QCView ships) — MIT
   https://phosphoricons.com — License text: agent/assets/fonts/Phosphor-LICENSE.txt
 
