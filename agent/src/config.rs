@@ -102,7 +102,9 @@ impl Default for Config {
             kiosk: true,
             replica_resolution: "1920x1080".into(),
             replica_backing_scale: 0.0,
-            idle_secs: 20,
+            // (was 20: the replica closed Blender between two looks at a shot, and the next start paid a cold
+            // launch - 7.4 s measured 2026-11-19)
+            idle_secs: 300,
             tray: true,
             name: String::new(),
             discovery: "direct".into(),
@@ -118,10 +120,37 @@ fn default_blender_path() -> String {
     if cfg!(target_os = "macos") {
         "/Applications/Blender.app/Contents/MacOS/Blender".into()
     } else if cfg!(windows) {
-        r"C:\Program Files\Blender Foundation\Blender 5.2\blender.exe".into()
+        // The newest Blender this machine has; the name of a version only when there is none to look at.
+        newest_blender(std::path::Path::new(BLENDER_HOME_WIN))
+            .unwrap_or_else(|| r"C:\Program Files\Blender Foundation\Blender 5.3\blender.exe".into())
     } else {
         "blender".into()
     }
+}
+
+pub const BLENDER_HOME_WIN: &str = r"C:\Program Files\Blender Foundation";
+
+/// The newest Blender under Windows' install folder: `<home>\Blender <major>.<minor>\blender.exe`, the highest
+/// version that has its executable. An installer names the folder after the version, so a path saved with one
+/// version is dead after the next upgrade (the owner's replica, 2026-11-19: 5.2 was gone, 5.3 was there).
+pub fn newest_blender(home: &std::path::Path) -> Option<String> {
+    let mut best: Option<((u32, u32), std::path::PathBuf)> = None;
+    for e in std::fs::read_dir(home).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(v) = name.strip_prefix("Blender ") else { continue };
+        let mut it = v.trim().split('.');
+        let (Some(a), Some(b)) = (it.next().and_then(|x| x.parse::<u32>().ok()), it.next().and_then(|x| x.parse::<u32>().ok())) else { continue };
+        let exe = e.path().join(if cfg!(windows) { "blender.exe" } else { "blender" });
+        if exe.is_file() && best.as_ref().is_none_or(|(k, _)| (a, b) > *k) { best = Some(((a, b), exe)); }
+    }
+    best.map(|(_, p)| p.to_string_lossy().into_owned())
+}
+
+/// The Blender to launch: the configured one when it is there; when it is NOT, the newest installed one (Windows),
+/// with a word for the log. `None` = use the configured path as it is.
+pub fn blender_fallback(configured: &str) -> Option<String> {
+    if !cfg!(windows) || configured.trim().is_empty() || std::path::Path::new(configured).is_file() { return None }
+    newest_blender(std::path::Path::new(BLENDER_HOME_WIN))
 }
 
 pub const DISCOVERY_MODES: &[&str] = &["off", "direct", "discoverable"];
@@ -595,6 +624,18 @@ impl SharedConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_newest_blender_with_an_executable_wins() {
+        let d = std::env::temp_dir().join(format!("qcb-blender-home-{}", std::process::id()));
+        let exe = if cfg!(windows) { "blender.exe" } else { "blender" };
+        for (v, has) in [("Blender 5.2", true), ("Blender 5.10", true), ("Blender 5.3", true), ("Blender 6.0", false), ("Other 9.9", true)] {
+            std::fs::create_dir_all(d.join(v)).unwrap(); if has { std::fs::write(d.join(v).join(exe), b"").unwrap(); } }
+        let got = super::newest_blender(&d).unwrap();
+        assert!(got.contains("Blender 5.10"), "{got}");
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(super::newest_blender(&d), None);
+    }
+
     use super::*;
 
     /// The bug this type exists to prevent: the config used to be cloned per

@@ -139,6 +139,11 @@ impl Lifecycle {
             self.set_status("host in session (Blender supervision off)");
             return;
         }
+        // the configured Blender is gone (an upgrade names a new folder): the newest one installed is launched
+        let path = match crate::config::blender_fallback(&path) {
+            Some(found) => { crate::log!("[lifecycle] {path} is not there: launching the newest Blender found, {found}"); found }
+            None => path,
+        };
         // Blender's console output goes to blender.log beside agent.toml,
         // one file per launch, instead of the agent's stderr — which on
         // Windows no longer exists. No console window of its own either.
