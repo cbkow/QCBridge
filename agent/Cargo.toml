@@ -58,6 +58,10 @@ tao = "0.31"
 # The settings window (`--settings`): a separate process that attaches to
 # the agent as a control client, so the tray's tao loop and egui's winit
 # loop never share a thread. glow, not wgpu: smaller, and this is a form.
+# the family's UI kit (minplatform, GPL-3.0-or-later): the settings window is built on it (2026-11-19)
+min-ui = { path = "../../minplatform/crates/min-ui" }
+min-theme = { path = "../../minplatform/crates/min-theme" }
+min-present = { path = "../../minplatform/crates/min-present" }
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
 # Native folder and file pickers for every path field.
 rfd = "0.17"
