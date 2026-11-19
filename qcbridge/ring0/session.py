@@ -55,6 +55,18 @@ def _agent_cert_dir() -> str:
 
 _HANDSHAKE_TIMEOUT = 8.0   # a replica still loading a file answers late; 3 s made a second hello (2026-10-28)
 _HANDSHAKE_RETRY = 2.0
+# A hello that TIMED OUT is sent again at once: the replica's agent holds a
+# hello for a Blender that is still launching, so the wait is the launch, and
+# a 2 s pause after the timeout only added to it (measured 2026-11-19: the
+# replica was ready 0.5 s after the timeout and waited 2 s more for the retry).
+_HANDSHAKE_RESEND = 0.25
+# Replica: after a hello that opens a new session a project is on its way. The
+# pixel path is not (re)started inside this window: the re-aim at the host's
+# viewer, the loaded file's working space and the first start used to be three
+# starts in a few seconds, each one a broken connection for the viewer
+# (measured 2026-11-19: four spawns in 7 s). They are folded into ONE start
+# when the project has loaded - or when the window ends, if none came.
+_PIXEL_HOLD = 10.0
 
 
 def _emergency_cleanup() -> None:
@@ -208,6 +220,9 @@ def start(prefs) -> str:
     state["paused"] = False
     state["peer_epoch"] = None
     state["prefs"] = prefs
+    state["pixel_hold_until"] = 0.0
+    state["pixel_deferred"] = False
+    state["pixel_again"] = False
     if prefs.role == "HOST":
         _start_host(prefs)
     else:
@@ -414,9 +429,15 @@ def _start_host(prefs) -> None:
         if now - pending["sent_at"] > _HANDSHAKE_TIMEOUT:
             transport.cancel_request(pending["req"])
             pending["req"] = None
-            state["note"] = address_error or "replica unreachable — retrying"
-            timeline.mark("handshake.timeout")
-            return _HANDSHAKE_RETRY
+            # The link to the other machine's agent is up and nothing answers:
+            # its Blender is not there (yet) - still launching, or it could
+            # not be started. "Unreachable" is the wrong word for that.
+            waiting = getattr(transport, "_link_up", False)
+            state["note"] = address_error or (
+                "waiting for Blender on the other machine — check its agent if this stays"
+                if waiting else "replica unreachable — retrying")
+            timeline.mark("handshake.timeout", link_up=bool(waiting))
+            return _HANDSHAKE_RESEND
         return 0.25
 
     def _arm_handshake(note: str, new_epoch: bool) -> None:
@@ -598,6 +619,8 @@ def _start_replica(prefs) -> None:
                 state["host_mappings"] = len(received)
                 if state["peer_epoch"] != msg.get("epoch"):
                     replica_apply.notify_new_session(msg.get("seq", 0), msg.get("seq_fast", 0))
+                    state["pixel_hold_until"] = time.monotonic() + _PIXEL_HOLD
+                    timeline.mark("pixel.hold", secs=_PIXEL_HOLD)
                 state["peer_epoch"] = msg.get("epoch")
                 state["peer_addon"] = msg.get("addon", "")
                 state["peer_cm"] = msg.get("cm") or {}
@@ -725,6 +748,13 @@ def _start_replica(prefs) -> None:
         if (state.get("viewer") or {}).get("enabled") and addr_now and addr_now != state.get("viewer_addr"):
             state["viewer_addr"] = addr_now
             state["viewer_pending"] = True
+        # A start put off by the hold (see _PIXEL_HOLD) and no project came:
+        # the window is over, start now.
+        if state.get("pixel_deferred") and time.monotonic() >= state.get("pixel_hold_until", 0.0) \
+                and not replica_apply.applying():
+            state["pixel_deferred"] = False
+            timeline.mark("pixel.hold_over", why="no project within the window")
+            _start_pixel_path(prefs, restart=True)
         if state.get("viewer_pending"):
             state["viewer_pending"] = False
             url = _replica_srt_url(prefs)
@@ -925,7 +955,16 @@ def _start_pixel_path(prefs, restart: bool = False) -> None:
     it runs off the main thread — house rule: the main thread never waits."""
     if not getattr(prefs, "enable_stream", True):
         return
+    if state.get("role") == "REPLICA" and time.monotonic() < state.get("pixel_hold_until", 0.0):
+        state["pixel_deferred"] = True
+        timeline.mark("pixel.deferred", restart=restart)
+        return
     if state.get("pixel_resolving"):
+        # A start is being made on its thread. This request used to be dropped
+        # without a word - a re-aim lost that way left the mux listening while
+        # the viewer listened too. It is made again when that start is done.
+        state["pixel_again"] = True
+        timeline.mark("pixel.start_queued", restart=restart)
         return
     state["pixel_resolving"] = True
     timeline.mark("pixel.start_requested", source=_pixel_source(prefs), ring=engine_qcb.ring_name(),
@@ -951,6 +990,14 @@ def _start_pixel_path(prefs, restart: bool = False) -> None:
             pixel_path.start(ffmpeg, args[1], args[2], params=args[3], source=args[4], ring_name=args[5])
         finally:
             state["pixel_resolving"] = False
+            if state.get("pixel_again"):
+                state["pixel_again"] = False
+                if state.get("transport") is transport:
+                    def _again():
+                        if state.get("transport") is transport and state.get("prefs") is not None:
+                            _start_pixel_path(state["prefs"], restart=True)
+                        return None
+                    bpy.app.timers.register(_again, first_interval=0.0)   # bpy reads belong to the main thread
 
     import threading
 
@@ -1105,8 +1152,13 @@ def on_project_loaded() -> None:
                   objects=len(bpy.data.objects), libraries=len(bpy.data.libraries), images=len(bpy.data.images),
                   ws=((state.get("cm") or {}).get("working") or {}).get("name"),
                   ws_source=((state.get("cm") or {}).get("working") or {}).get("source"))
+    # The hold ends here: whatever was put off (a re-aim, a first start) and
+    # the loaded file's working space become one start.
+    state["pixel_hold_until"] = 0.0
+    deferred = bool(state.get("pixel_deferred"))
+    state["pixel_deferred"] = False
     if not _follow_working(prefs):
-        _start_pixel_path(prefs)
+        _start_pixel_path(prefs, restart=deferred)
 
 
 def viewer_url() -> str:
