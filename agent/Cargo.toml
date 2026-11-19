@@ -56,13 +56,13 @@ tray-icon = "0.20"
 muda = "0.16"
 tao = "0.31"
 # The settings window (`--settings`): a separate process that attaches to
-# the agent as a control client, so the tray's tao loop and egui's winit
-# loop never share a thread. glow, not wgpu: smaller, and this is a form.
+# the agent as a control client, so the tray's tao loop and the window's
+# winit loop never share a thread.
 # the family's UI kit (minplatform, GPL-3.0-or-later): the settings window is built on it (2026-11-19)
 min-ui = { path = "../../minplatform/crates/min-ui" }
 min-theme = { path = "../../minplatform/crates/min-theme" }
 min-present = { path = "../../minplatform/crates/min-present" }
-# What a window on the kit needs beside it (`--settings-next`, settings/window.rs), at minplatform's own pins:
+# What a window on the kit needs beside it (settings/window.rs), at minplatform's own pins:
 # its window layer is winit 0.31 (imported as `winit31`, as in minplatform's apps), the scene is vello's.
 winit31 = { package = "winit", version = "=0.31.0-beta.4", default-features = false }
 vello = "0.11.0"
@@ -70,7 +70,6 @@ peniko = "0.6"
 kurbo = "0.13"
 raw-window-handle = "0.6.2"
 arboard = { version = "3.6.1", default-features = false }
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
 # Native folder and file pickers for every path field.
 rfd = "0.17"
 # The embedded icons (assets/icons, PNG) for the tray and the window.
@@ -103,7 +102,6 @@ windows-sys = { version = "0.61", features = [
 # token. 0.10 is the copy tao/cocoa already bring in; adds no packages.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
-winit = { version = "0.30", default-features = false }  # the activation policy of the settings window (same winit eframe uses)
 
 [profile.release]
 debug = 1

@@ -22,8 +22,9 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 
 pub const T_CONTROL: u8 = 0x01;
@@ -38,8 +39,38 @@ pub const T_EVENT: u8 = 0x20;
 const MAX_FRAME: usize = 256 << 20;
 
 pub enum Out {
-    Frame(u8, Bytes),
+    /// A frame for the addon, and when it was queued.
+    Frame(u8, Bytes, Instant),
     Wake,
+}
+
+/// How long a control frame may have waited for an addon and still be
+/// delivered. A cold launch of the replica's Blender takes about 8 s and the
+/// host resends a hello that timed out about every 8 s: a hello sent while
+/// Blender is still launching is well inside this when the addon attaches.
+pub const STALE_AFTER: Duration = Duration::from_secs(20);
+
+/// Whether a queued frame is dropped instead of written (2026-11-19).
+///
+/// Frames from the network queue until an addon attaches. A replica whose
+/// Blender could not start for several minutes got dozens of old hellos and
+/// goodbyes at once when it finally attached, in arrival order, long after
+/// they meant anything. So: a frame that waited for the addon it is written
+/// to (`waited_for_attach`: it was queued before that addon attached) is
+/// dropped when it is a CONTROL frame older than `STALE_AFTER`.
+///
+/// Only CONTROL. It is the lane of the session's conversation (hello,
+/// goodbye, pings, requests and their answers), which the host starts again
+/// with a fresh hello. The others are left alone, however old: COLD and FAST
+/// carry the scene itself (a missing blob or delta is a replica that differs
+/// from the host until a resync), COLD_ACK and FAST_ACK return credits the
+/// addon counts, HOT is conflated per key and is the latest value by
+/// construction, and EVENT never waits for an addon.
+///
+/// A frame queued while its addon was already attached is never dropped,
+/// whatever its age: a slow addon is back-pressure, not staleness.
+pub fn stale(kind: u8, queued_at: Instant, now: Instant, waited_for_attach: bool) -> bool {
+    waited_for_attach && kind == T_CONTROL && now.saturating_duration_since(queued_at) > STALE_AFTER
 }
 
 /// Agent -> addon side of the link.
@@ -55,12 +86,17 @@ pub struct Link {
     hot_dirty: AtomicBool,
     sink: Mutex<Option<TcpStream>>,
     sink_cv: Condvar,
+    /// When the addon that is attached now attached: a frame queued before
+    /// that waited for it (see `stale`).
+    attached_at: Mutex<Option<Instant>>,
+    /// Control frames dropped as stale since the writer last said so.
+    stale_dropped: AtomicU64,
     pub attached: AtomicBool,
     /// Control clients (the settings window, since 2026-09-24): they get
     /// every event and may send commands, and carry no lanes. Any number,
     /// beside the one addon.
     aux: Mutex<Vec<(u64, TcpStream)>>,
-    aux_seq: std::sync::atomic::AtomicU64,
+    aux_seq: AtomicU64,
 }
 
 impl Link {
@@ -72,9 +108,11 @@ impl Link {
             hot_dirty: AtomicBool::new(false),
             sink: Mutex::new(None),
             sink_cv: Condvar::new(),
+            attached_at: Mutex::new(None),
+            stale_dropped: AtomicU64::new(0),
             attached: AtomicBool::new(false),
             aux: Mutex::new(Vec::new()),
-            aux_seq: std::sync::atomic::AtomicU64::new(1),
+            aux_seq: AtomicU64::new(1),
         }
     }
 
@@ -103,20 +141,28 @@ impl Link {
     }
 
     pub async fn frame(&self, kind: u8, body: Bytes) {
+        let item = Out::Frame(kind, body, Instant::now());
         if Self::is_prio(kind) {
-            let _ = self.prio_tx.send(Out::Frame(kind, body)).await;
+            let _ = self.prio_tx.send(item).await;
             let _ = self.tx.try_send(Out::Wake);
         } else {
-            let _ = self.tx.send(Out::Frame(kind, body)).await;
+            let _ = self.tx.send(item).await;
         }
     }
 
     pub fn frame_blocking(&self, kind: u8, body: Bytes) {
+        self.frame_blocking_at(kind, body, Instant::now());
+    }
+
+    /// `frame_blocking` with the time of queuing given (the tests queue a
+    /// frame as if long ago).
+    fn frame_blocking_at(&self, kind: u8, body: Bytes, queued_at: Instant) {
+        let item = Out::Frame(kind, body, queued_at);
         if Self::is_prio(kind) {
-            let _ = self.prio_tx.blocking_send(Out::Frame(kind, body));
+            let _ = self.prio_tx.blocking_send(item);
             let _ = self.tx.try_send(Out::Wake);
         } else {
-            let _ = self.tx.blocking_send(Out::Frame(kind, body));
+            let _ = self.tx.blocking_send(item);
         }
     }
 
@@ -130,7 +176,7 @@ impl Link {
 
     /// Non-blocking (safe from async tasks); drops the event if the queue is full.
     pub fn event_try(&self, v: Value) {
-        let _ = self.prio_tx.try_send(Out::Frame(T_EVENT, Bytes::from(v.to_string())));
+        let _ = self.prio_tx.try_send(Out::Frame(T_EVENT, Bytes::from(v.to_string()), Instant::now()));
         let _ = self.tx.try_send(Out::Wake);
     }
 
@@ -168,16 +214,24 @@ impl Link {
     fn set_sink(&self, stream: Option<TcpStream>) {
         let mut sink = self.sink.lock().unwrap();
         *sink = stream;
+        *self.attached_at.lock().unwrap() = sink.is_some().then(Instant::now);
         self.attached.store(sink.is_some(), Relaxed);
         self.sink_cv.notify_all();
     }
 
     /// Blocks until an addon is attached, then writes. Returns false when the
     /// write failed (the addon went away); the frame is lost, like a socket.
-    fn write_when_attached(&self, kind: u8, body: &[u8]) -> bool {
+    /// A control frame that waited too long for this addon is not written
+    /// (`stale`); it is counted, and the writer says how many.
+    fn write_when_attached(&self, kind: u8, body: &[u8], queued_at: Instant) -> bool {
         let mut sink = self.sink.lock().unwrap();
         while sink.is_none() {
             sink = self.sink_cv.wait(sink).unwrap();
+        }
+        let waited = self.attached_at.lock().unwrap().is_none_or(|at| queued_at < at);
+        if stale(kind, queued_at, Instant::now(), waited) {
+            self.stale_dropped.fetch_add(1, Relaxed);
+            return true;
         }
         let s = sink.as_mut().unwrap();
         let ok = write_frame(s, kind, body).is_ok();
@@ -205,14 +259,18 @@ pub fn writer_thread(link: Arc<Link>, mut rx: mpsc::Receiver<Out>, mut prio_rx: 
     while let Some(item) = rx.blocking_recv() {
         // Priority frames first, always: whatever woke us, a queued pong,
         // ack or event goes out before the next cold chunk.
-        while let Ok(Out::Frame(kind, body)) = prio_rx.try_recv() {
-            if kind == T_EVENT { link.write_event_now(&body) } else { link.write_when_attached(kind, &body); }
+        while let Ok(Out::Frame(kind, body, at)) = prio_rx.try_recv() {
+            if kind == T_EVENT { link.write_event_now(&body) } else { link.write_when_attached(kind, &body, at); }
         }
         match item {
-            Out::Frame(kind, body) => {
-                if kind == T_EVENT { link.write_event_now(&body) } else { link.write_when_attached(kind, &body); }
+            Out::Frame(kind, body, at) => {
+                if kind == T_EVENT { link.write_event_now(&body) } else { link.write_when_attached(kind, &body, at); }
             }
             Out::Wake => {}
+        }
+        let dropped = link.stale_dropped.swap(0, Relaxed);
+        if dropped > 0 {
+            crate::log!("[link] {dropped} control frame(s) dropped: queued more than {} s before the addon attached", STALE_AFTER.as_secs());
         }
         if link.hot_dirty.swap(false, Relaxed) {
             let drained: Vec<Bytes> = link.hot.lock().unwrap().drain().map(|(_, v)| v).collect();
@@ -221,7 +279,7 @@ pub fn writer_thread(link: Arc<Link>, mut rx: mpsc::Receiver<Out>, mut prio_rx: 
                     link.hot_dirty.store(true, Relaxed); // keep for the next addon
                     break;
                 }
-                link.write_when_attached(T_HOT, &body);
+                link.write_when_attached(T_HOT, &body, Instant::now());
             }
         }
         link.flush();
@@ -390,5 +448,84 @@ pub fn serve_local(
             link.set_sink(None);
             on_detach();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ago(secs: u64) -> (Instant, Instant) {
+        // (a clock that has not run that long yet: count forward instead)
+        let base = Instant::now();
+        (base, base + Duration::from_secs(secs))
+    }
+
+    #[test]
+    fn a_control_frame_that_waited_too_long_for_an_addon_is_stale() {
+        let (queued, now) = ago(21);
+        assert!(stale(T_CONTROL, queued, now, true));
+        let (queued, now) = ago(600);
+        assert!(stale(T_CONTROL, queued, now, true));
+    }
+
+    #[test]
+    fn a_hello_sent_while_blender_launches_is_still_delivered() {
+        // a cold launch is about 8 s; the host resends about every 8 s
+        for secs in [0, 8, 16, 20] {
+            let (queued, now) = ago(secs);
+            assert!(!stale(T_CONTROL, queued, now, true), "{secs} s");
+        }
+    }
+
+    #[test]
+    fn a_frame_for_an_addon_that_was_already_attached_is_never_stale() {
+        let (queued, now) = ago(3600);
+        assert!(!stale(T_CONTROL, queued, now, false));
+    }
+
+    #[test]
+    fn only_the_control_lane_is_dropped() {
+        let (queued, now) = ago(3600);
+        for kind in [T_HOT, T_COLD, T_COLD_ACK, T_FAST, T_FAST_ACK, T_EVENT] {
+            assert!(!stale(kind, queued, now, true), "{kind:#x}");
+        }
+    }
+
+    /// The writer itself, over a loopback socket: of what queued before the
+    /// addon attached, the old control frame is gone, the fresh one and the
+    /// old fast-lane frame arrive, in order; and what is queued after the
+    /// attach arrives as ever.
+    #[test]
+    fn the_writer_drops_old_control_frames_and_nothing_else() {
+        let Some(long_ago) = Instant::now().checked_sub(Duration::from_secs(120)) else { return };
+        let (tx, rx) = mpsc::channel(16);
+        let (prio_tx, prio_rx) = mpsc::channel(16);
+        let link = Arc::new(Link::new(tx, prio_tx));
+        {
+            let link = link.clone();
+            std::thread::spawn(move || writer_thread(link, rx, prio_rx));
+        }
+        link.frame_blocking_at(T_CONTROL, Bytes::from_static(b"old hello"), long_ago);
+        link.frame_blocking_at(T_FAST, Bytes::from_static(b"old delta"), long_ago);
+        link.frame_blocking(T_CONTROL, Bytes::from_static(b"fresh hello"));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let ours = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut theirs, _) = listener.accept().unwrap();
+        theirs.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        link.set_sink(Some(ours));
+        let mut read = |r: &mut TcpStream| {
+            let mut head = [0u8; 5];
+            r.read_exact(&mut head).unwrap();
+            let mut body = vec![0u8; u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize - 1];
+            r.read_exact(&mut body).unwrap();
+            (head[4], body)
+        };
+        assert_eq!(read(&mut theirs), (T_FAST, b"old delta".to_vec()));
+        assert_eq!(read(&mut theirs), (T_CONTROL, b"fresh hello".to_vec()));
+        // queued with the addon attached: written as ever
+        link.frame_blocking(T_CONTROL, Bytes::from_static(b"after"));
+        assert_eq!(read(&mut theirs), (T_CONTROL, b"after".to_vec()));
     }
 }

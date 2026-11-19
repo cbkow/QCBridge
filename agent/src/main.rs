@@ -141,10 +141,36 @@ impl RoleRuntime {
 
 /// Build the runtime for the role in the config. Registers the local socket
 /// under that role in agent.json, so the addon of the new role finds it.
+///
+/// The registration comes FIRST and stays whatever becomes of the rest
+/// (2026-11-19): the local socket is the agent's, not the role's. It used
+/// to be written last, so a replica told to listen on an address this
+/// machine cannot bind was left running and unregistered - a settings
+/// window started after that said "the agent is not running", and the
+/// address could not be put right from it. A runtime that fails half-built
+/// is taken down again (its lifecycle task used to be left running).
 fn start_role(agent: &Agent) -> Result<RoleRuntime> {
     let cfg = agent.cfg.snapshot();
-    let role_host = cfg.role == "host";
+    config::write_socket_info(&agent.base, &cfg.role, agent.local_port, &agent.secret)?;
     let mut rt = RoleRuntime::default();
+    match build_role(agent, &cfg, &mut rt) {
+        Ok(()) => Ok(rt),
+        Err(e) => {
+            if let Some(l) = &rt.lifecycle {
+                let _ = l.tx.send(Event::Shutdown);
+            }
+            agent.host_control.set(None);
+            agent.ctx.set_role(agent.ctx.is_host(), Arc::new(session::NoObserver));
+            for t in &rt.tasks {
+                t.abort();
+            }
+            Err(e)
+        }
+    }
+}
+
+fn build_role(agent: &Agent, cfg: &config::Config, rt: &mut RoleRuntime) -> Result<()> {
+    let role_host = cfg.role == "host";
     let observer: Arc<dyn PeerObserver> = if role_host {
         let h = Arc::new(HostObserver {
             status: agent.status.clone(), fingerprint: Mutex::new(None), peer_addr: Mutex::new(None), up: AtomicBool::new(false),
@@ -229,8 +255,7 @@ fn start_role(agent: &Agent) -> Result<RoleRuntime> {
         version: VERSION.to_string(),
         paired,
     })));
-    config::write_socket_info(&agent.base, &cfg.role, agent.local_port, &agent.secret)?;
-    Ok(rt)
+    Ok(())
 }
 
 /// Take a role runtime down: Blender asked to quit, the dial loop idled,
@@ -262,7 +287,10 @@ fn stop_role(agent: &Agent, rt: RoleRuntime, old_role: &str) {
 /// The Send/Receive switch, and a replica's new listen address: rebuild
 /// the role runtime for the config as it now stands. On failure the old
 /// role is restored in the config and rebuilt, and the error goes to the
-/// log and the listeners.
+/// log and the listeners. A listen address that cannot be bound stays in
+/// the config - it is what was asked for - and the status says "no role:
+/// ..."; the agent stays registered (see `start_role`), so the address can
+/// be put right from the settings window.
 fn switch_role(agent: &Agent, old_role: &str) {
     let old = std::mem::take(&mut *agent.role.lock().unwrap());
     stop_role(agent, old, old_role);
@@ -275,6 +303,10 @@ fn switch_role(agent: &Agent, old_role: &str) {
         Err(e) => {
             log!("[agent] could not become {new_role}: {e:#}; staying {old_role}");
             agent.link.event_try(json!({"event": "error", "msg": format!("could not become {new_role}: {e:#}")}));
+            // (the failed start registered the role it could not become)
+            if new_role != old_role {
+                config::remove_socket_info(&agent.base, &new_role);
+            }
             let snapshot = agent.cfg.update(|c| { c.role = old_role.to_string(); c.clone() });
             let _ = config::save(&agent.cfg_path, &snapshot);
             match start_role(agent) {
@@ -366,21 +398,13 @@ fn main() {
         println!("qcbridge-agent {VERSION}\nsource: {SOURCE_URL}\nlicense: GPL-3.0-or-later");
         return;
     }
-    if args.flag("settings") {
+    if args.flag("settings") || args.flag("settings-next") {
         // The window is its own process: it attaches to the running agent
         // as a control client, so no event loop is shared with the tray.
+        // (`--settings-next` named it while it stood beside the egui window
+        // it replaced, 2026-11-19; still taken.)
         let cfg_path: std::path::PathBuf = args.get("config").map(Into::into).unwrap_or_else(config::config_path);
         if let Err(e) = qcbridge_agent::settings::run(cfg_path) {
-            log!("[settings] {e:#}");
-            platform::fatal_dialog("QCBridge Agent settings", &format!("{e:#}"));
-            std::process::exit(1);
-        }
-        return;
-    }
-    if args.flag("settings-next") {
-        // The same window on the family's UI kit (settings/window.rs), beside the egui one until it has every section.
-        let cfg_path: std::path::PathBuf = args.get("config").map(Into::into).unwrap_or_else(config::config_path);
-        if let Err(e) = qcbridge_agent::settings::run_next(cfg_path) {
             log!("[settings] {e:#}");
             platform::fatal_dialog("QCBridge Agent settings", &format!("{e:#}"));
             std::process::exit(1);
@@ -504,7 +528,18 @@ fn run(args: &qcbridge_agent::Args) -> Result<()> {
         role: Mutex::new(RoleRuntime::default()), local_port, secret: secret.clone(), status: status.clone(),
         quit: Arc::new(Notify::new()),
     });
-    *agent.role.lock().unwrap() = start_role(&agent)?;
+    // (the registration itself must succeed: an agent nobody can find is no agent)
+    config::write_socket_info(&agent.base, &cfg.role, agent.local_port, &agent.secret)?;
+    // A role that cannot start does not stop the agent (2026-11-19): it runs
+    // with no role, registered, and says why - a config that holds a listen
+    // address this machine cannot bind must be reachable to be put right.
+    match start_role(&agent) {
+        Ok(rt) => *agent.role.lock().unwrap() = rt,
+        Err(e) => {
+            log!("[agent] no role: {e:#}");
+            *agent.status.lock().unwrap() = format!("no role: {e:#}");
+        }
+    }
 
     // Local socket server.
     {
@@ -704,7 +739,9 @@ mod tray {
         })
     }
 
-    /// The settings window is a second process of this binary.
+    /// The settings window is a second process of this binary. One window
+    /// for a config: when one is open, the new process brings it to the
+    /// front and leaves (settings/window.rs, `one`).
     pub(super) fn open_settings_window(cfg_path: &std::path::Path) {
         if let Ok(exe) = std::env::current_exe() {
             let mut cmd = std::process::Command::new(exe);
@@ -790,7 +827,7 @@ mod tray {
         // 0.2.0 build showed both a menu-bar icon and a Dock icon). Accessory
         // is the menu-bar app the plist asks for; the second call keeps a
         // login-item launch from taking focus off whatever is in front.
-        // The settings window's winit loop already does the same (settings/mod.rs).
+        // The settings window's winit loop does the same (settings/window.rs).
         #[cfg(target_os = "macos")]
         {
             use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};

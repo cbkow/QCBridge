@@ -1,15 +1,16 @@
-//! The settings window on the family's UI kit (`qcbridge-agent --settings-next`): min-ui's widgets and min-theme's
+//! The settings window on the family's UI kit (`qcbridge-agent --settings`): min-ui's widgets and min-theme's
 //! tokens over min-present, as minplatform's applications are built (the model is minRender's `shell.rs`, `ui.rs`
-//! and `settings.rs`). It is the egui window of `mod.rs` ported section by section, and stands beside it until it
-//! is ruled to replace it; what it is to the agent is unchanged: a second process attached as a control client,
-//! every value shown is the agent's, a field commits through `set_config` and the `config` event that answers is
-//! what the field then shows. (The path mapping table alone keeps its own model: edited here, sent on Apply.)
+//! and `settings.rs`). It was ported section by section from the egui window it replaced; what it is to the agent
+//! is unchanged: a second process attached as a control client, every value shown is the agent's, a field commits
+//! through `set_config` and the `config` event that answers is what the field then shows. (The path mapping table
+//! alone keeps its own model: edited here, sent on Apply.)
 //!
 //! Step 1 (2026-11-19): the window itself, the header, the "agent is not running" state, the card "This machine".
 //! Step 2 (2026-11-19): Pairing, Shared storage, Stream, Diagnostics; one window for a config; the owner's changes
 //! to the egui window's content - a mapping row that cannot be right is flagged, the wire-rate cap is gone (unused
 //! since the quinn port), the Stream card only says where the stream is set, Diagnostics opens the log and keeps
 //! the last problem.
+//! Step 3 (2026-11-19): it is the settings window (`--settings`; `--settings-next` is still taken); egui is gone.
 
 use super::client::{self, Client};
 use crate::config::{self, PathMapping};
@@ -74,7 +75,7 @@ pub fn run(cfg_path: PathBuf) -> Result<()> {
         return Ok(());
     }
     let mut builder = EventLoop::builder();
-    // macOS: the window belongs to a menu-bar app, as the egui window does (mod.rs): Accessory keeps it out of the
+    // macOS: the window belongs to a menu-bar app, as the egui window before it was: Accessory keeps it out of the
     // Dock while it still comes to the front. A picture (`--shot`) is taken without taking the front.
     #[cfg(target_os = "macos")]
     {
@@ -465,6 +466,24 @@ fn ago(since: Instant) -> String {
     } else {
         format!("{} {}", s / 3600, tr("h ago"))
     }
+}
+
+/// The system opens a folder in its file manager, and a file with what it has for it.
+fn open_in_system(path: &Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+/// A picture of the window as a PNG file (`--shot`).
+fn write_png(path: &Path, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
+    let mut e = png::Encoder::new(std::io::BufWriter::new(std::fs::File::create(path)?), w, h);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    e.write_header().and_then(|mut wr| wr.write_image_data(rgba)).map_err(std::io::Error::other)
 }
 
 // ------------------------------------------------------------ the window ----
@@ -1172,10 +1191,10 @@ impl Ui {
 
         // -- Diagnostics (the system opens a folder, and a file with what it has for it)
         if self.open_folder.event(e, now).0 {
-            super::open_folder(&self.agent.base);
+            open_in_system(&self.agent.base);
         }
         if self.open_log.event(e, now).0 {
-            super::open_folder(&self.agent.base.join("agent.log"));
+            open_in_system(&self.agent.base.join("agent.log"));
         }
     }
 
@@ -1532,7 +1551,7 @@ impl Ui {
                         let rgba: Vec<u8> = (0..(pw * ph) as usize)
                             .flat_map(|i| [oetf(px[i * 4]), oetf(px[i * 4 + 1]), oetf(px[i * 4 + 2]), 255])
                             .collect();
-                        match super::write_png(&path, pw, ph, &rgba) {
+                        match write_png(&path, pw, ph, &rgba) {
                             Ok(()) => 0,
                             Err(e) => {
                                 eprintln!("shot: {e}");
